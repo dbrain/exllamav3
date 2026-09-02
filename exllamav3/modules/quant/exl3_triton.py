@@ -442,6 +442,49 @@ def _m1_split_reduce_had(
 # ---------------------------------------------------------------------------
 
 
+_DEV_CACHE = {}
+
+
+def _dev_caps(device = None):
+    """(cu_count, wave_size, is_amd) for the active device, cached.
+
+    The decode pools below were measured on an RX 7900 XTX: 48 CUs, and Triton
+    num_warps counted in 32-wide waves. Both assumptions break on other parts —
+    notably RDNA3.5 APUs (gfx1150: 8 WGPs, wave64), where a num_warps that is
+    nominally 4 is 256 lanes and starves occupancy.
+    """
+    idx = torch.cuda.current_device() if device is None else device
+    if idx not in _DEV_CACHE:
+        p = torch.cuda.get_device_properties(idx)
+        is_amd = torch.version.hip is not None
+        wave = getattr(p, "warp_size", None) or (64 if is_amd else 32)
+        _DEV_CACHE[idx] = (p.multi_processor_count, wave, is_amd)
+    return _DEV_CACHE[idx]
+
+
+def _prefer_warps(configs):
+    """Narrow the CTAs on parts with few CUs.
+
+    Warps per CTA trades latency hiding within a CTA against how many CTAs stay
+    resident per CU. The pools pick num_warps=4/8 because 48 CUs give the XTX
+    plenty of CTAs from N-tiling alone. A part with a handful of CUs is the
+    other way round: it needs narrow CTAs to keep several resident.
+
+    Measured on gfx1150 (8 WGPs), 1x4096x12288 bits=4, both hadamards:
+    num_warps=2 takes the top five results outright — 67.6 GB/s at
+    BLOCK_N=32/BLOCK_K=128 — against 45-58 for the pools' native nw=4/8.
+    num_warps=1 collapses to 6.8, so this is an occupancy optimum, not
+    "narrower is better".
+
+    Note RDNA runs wave32, so this is not a wave64 lane-count correction.
+    """
+    cu, wave, is_amd = _dev_caps()
+    if cu > 16:
+        return configs
+    want = [c for c in configs if c.num_warps == 2]
+    return want if want else configs
+
+
 def _exl3_gemm_early_prune(configs, named_args, **kwargs):
     """Restrict the config set per invocation:
     - Other bit widths run the generic tl.gather path, where this Triton
@@ -499,6 +542,13 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
                 # BN64/BK128 203 GB/s; (bits=2, N=4096): 114 vs 34 GB/s; at
                 # the huge lm_head N=248320 (bits=6) BN64/BK128 wins (685 vs
                 # 667), so the large-N pool keeps it.
+                cu, wave, is_amd = _dev_caps()
+                # The pools below bucket by "CTAs per wave" against the XTX's 48
+                # CUs. A part with far fewer CUs is never CTA-starved at these N,
+                # so the narrow deep-K tiles that win there also win at large N;
+                # (32,128) measured 67.6 GB/s vs 65.5 for the (32,256) pick on
+                # gfx1150 at 1x4096x12288, and is pruned out entirely below.
+                low_cu = cu <= 16
                 if bits == 4:
                     if n <= 32768 and n % 256 == 0 and k % 256 == 0 and k // 16 >= 256:
                         # Split-K-eligible bits=4 shape (see _m1_splitk_plan):
@@ -508,6 +558,8 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
                         # tiles; g/u N=17408 S=4: BN64/BK256 378 vs 354-358
                         # for BN128).
                         pool = ((32, 256), (64, 256))
+                        if low_cu:
+                            pool += ((32, 128),)
                     elif n <= 8192:
                         pool = ((32, 128), (32, 256), (64, 128))
                     else:
@@ -523,7 +575,7 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
                     pool = ((64, 128), (32, 128))
                 out = [c for c in out
                        if (c.kwargs["BLOCK_N"], c.kwargs["BLOCK_K"]) in pool]
-                return out if out else configs
+                return _prefer_warps(out) if out else configs
         else:
             # bits=3 run-funnel decode: BLOCK_N=128 tiles collapse to the old
             # per-code path's rate (measured 229 GB/s at 1x5120x248320 vs 477+
@@ -574,6 +626,12 @@ def _exl3_gemm_configs():
         # M == 1 (decode GEMV), small-N pool (CTA-starved shapes)
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 128, "GROUP_M": 1}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 256, "GROUP_M": 1}, num_warps=4, num_stages=3),
+        # wave64 twins of the two decode tiles above. On a 64-wide wave these
+        # are the same 128 lanes the nw=4 entries give a wave32 part, and
+        # _prefer_warps selects between them by device. Measured on gfx1150,
+        # 1x4096x12288 bits=4: 67.6 and 65.5 GB/s, vs 45.7 for the stock pick.
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 128, "GROUP_M": 1}, num_warps=2, num_stages=3),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 256, "GROUP_M": 1}, num_warps=2, num_stages=2),
         # M == 1, large-N pool
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 1}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 1}, num_warps=8, num_stages=3),
@@ -597,6 +655,17 @@ def _exl3_gemm_configs():
 
 
 _PRUNE = {"early_config_prune": _exl3_gemm_early_prune}
+
+# Triton's defaults (25 ms warmup / 100 ms rep) assume the clock is stable by
+# the time a candidate is timed. On a part that shares its power budget with
+# the CPU the autotune pass runs entirely on the ramp, so the winner is decided
+# at a clock nobody infers at: on gfx1150 the stock pass picked a config that
+# sustains 45.7 GB/s out of a pool whose best member sustains 65.5. Timing each
+# candidate for longer costs a one-off second per shape and removes the whole
+# 1.43x. torch.version.hip is a build property, so reading it here does not
+# initialize a device.
+_AT_WARMUP = int(os.environ.get("EXL3_AUTOTUNE_WARMUP", "200" if torch.version.hip else "25"))
+_AT_REP = int(os.environ.get("EXL3_AUTOTUNE_REP", "500" if torch.version.hip else "100"))
 
 
 @triton.jit
@@ -668,7 +737,7 @@ def _decode_u16(w_u32, CB: tl.constexpr):
         return h * k_inv_h + k_bias_h
 
 
-@triton.autotune(configs=_exl3_gemm_configs(), key=["M", "N", "K_dim", "K_BITS", "N_PACKED", "CB"], prune_configs_by=_PRUNE)
+@triton.autotune(configs=_exl3_gemm_configs(), key=["M", "N", "K_dim", "K_BITS", "N_PACKED", "CB"], prune_configs_by=_PRUNE, warmup=_AT_WARMUP, rep=_AT_REP)
 @triton.jit
 def _fused_dequant_gemm_kernel(
     x_ptr, y_ptr,
