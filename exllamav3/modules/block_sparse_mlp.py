@@ -20,6 +20,22 @@ TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
+# quant/exl3_gemm.cu and quant/exl3_moe.cu are excluded from the ROCm build
+# (exllamav3_ext/build_config.py), so every mgemm/fused expert path is unreachable there
+# and the dense per-expert loop drives the same LinearEXL3 modules instead.
+_HAS_MGEMM = hasattr(ext, "exl3_mgemm")
+_HAS_MOE = hasattr(ext, "exl3_moe")
+
+
+def _supports_quant_paths(is_quantized, gated, activation_fn, gates, ups, downs) -> bool:
+    return (
+        _HAS_MGEMM and
+        is_quantized and
+        (activation_fn in ("silu", "gelu") if gated else activation_fn == "relu2") and
+        all(l.inner.bias is None for l in gates + ups + downs) and
+        all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in downs)
+    )
+
 # Score activations for the nogroup routing kernels (must match routing.cu)
 ROUTING_ACT_SIGMOID = 0
 ROUTING_ACT_SQRTSP = 1
@@ -656,11 +672,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
-        self.support_quant_paths = (
-            self.is_quantized and
-            (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
-            all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
-            all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
+        self.support_quant_paths = _supports_quant_paths(
+            self.is_quantized, self.gated, self.activation_fn,
+            self.gates, self.ups, self.downs,
         )
 
         # The BC bsz-1 graph additionally supports the gpt-oss activation, per-expert biases
@@ -696,10 +710,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.support_fused = (
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
                 self.support_quant_paths and
-                # exl3_moe.cu is excluded from the ROCm build (exllamav3_ext/build_config.py),
-                # so the fused path has no kernel to call. Falls back to the per-expert
-                # index_select loop, which drives the same LinearEXL3 modules.
-                hasattr(ext, "exl3_moe")
+                _HAS_MOE
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
