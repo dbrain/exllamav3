@@ -316,6 +316,23 @@ def _decode_lut(cb: int, device) -> torch.Tensor:
 _SPLITK_BUFS: dict = {}
 
 
+def _m_bucket(M: int) -> int:
+    """Autotune key for the row count.
+
+    M is data-dependent on the MoE per-expert path: with the fused exl3_moe kernel
+    unavailable (ROCm), block_sparse_mlp falls back to an index_select loop that
+    calls each expert with however many tokens routed to it, so nearly every expert
+    presents a different M and mints a fresh autotune entry. Measured on a
+    35B-A3B load: 155 autotune passes over 5 modules, 1276 s of a 1277 s load.
+
+    Bucketing to powers of two collapses that to at most one entry per octave while
+    keeping M == 1 (the GEMV fast path, which has its own config pool) distinct.
+    """
+    if M <= 1:
+        return 1
+    return 1 << (M - 1).bit_length()
+
+
 def _m1_splitk_plan(M: int, N: int, K_dim: int, K_bits: int) -> int:
     """Number of K-splits for an M == 1 invocation, or 1 (classic path).
 
@@ -737,7 +754,7 @@ def _decode_u16(w_u32, CB: tl.constexpr):
         return h * k_inv_h + k_bias_h
 
 
-@triton.autotune(configs=_exl3_gemm_configs(), key=["M", "N", "K_dim", "K_BITS", "N_PACKED", "CB"], prune_configs_by=_PRUNE, warmup=_AT_WARMUP, rep=_AT_REP)
+@triton.autotune(configs=_exl3_gemm_configs(), key=["M_BUCKET", "N", "K_dim", "K_BITS", "N_PACKED", "CB"], prune_configs_by=_PRUNE, warmup=_AT_WARMUP, rep=_AT_REP)
 @triton.jit
 def _fused_dequant_gemm_kernel(
     x_ptr, y_ptr,
@@ -745,6 +762,7 @@ def _fused_dequant_gemm_kernel(
     perm_i_ptr,
     mrow_ptr,
     M, N, K_dim,
+    M_BUCKET,          # autotune key only (see _m_bucket); unused in the body
     stride_xm, stride_xk,
     stride_tk, stride_tn,
     stride_ym, stride_yn,
@@ -1485,6 +1503,7 @@ def exl3_gemm_triton(
         perm_i,
         _get_m_row_offsets(K_bits, x.device) if K_bits in _M_ROW_OFFSETS else perm_i,
         M, N, K_dim,
+        _m_bucket(M),
         x.stride(0), x.stride(1),
         trellis.stride(0), trellis.stride(1),
         y.stride(0), y.stride(1),
