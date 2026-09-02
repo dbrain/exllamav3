@@ -96,12 +96,21 @@ def mul_sigmoid_broadcast_(o: torch.Tensor, g: torch.Tensor) -> None:
 def mul_softplus_broadcast_(o: torch.Tensor, g: torch.Tensor) -> None:
     o.mul_(F.softplus(g.float(), threshold = 11).to(o.dtype))
 
-def add_sigmoid_gate(g: torch.Tensor, o: torch.Tensor) -> None:
-    o.add_(g).mul_(torch.sigmoid(o))
+def add_sigmoid_gate(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> None:
+    # add_sigmoid_kernel_f: z += x * sigmoid(y), with y a per-row gate scalar
+    # (size(-1) == 1) broadcast across the row. Accumulates into z; does not
+    # overwrite it.
+    z.add_(x * torch.sigmoid(y.float()))
 
-def add_sigmoid_gate_proj(x: torch.Tensor, g: torch.Tensor, o: torch.Tensor) -> None:
-    o.copy_(x + g)
-    o.mul_(torch.sigmoid(o))
+def add_sigmoid_gate_proj(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    z: torch.Tensor,
+    w: torch.Tensor,
+) -> None:
+    # add_sigmoid_proj_kernel_f: the gate projection is folded in, so
+    # z += x * sigmoid(y @ w) with w of shape (dim, 1). Accumulates into z.
+    z.add_(x * torch.sigmoid(torch.matmul(y.float(), w.float())))
 
 
 # -- Attention helpers (activation.cu) ----------------------------------------
