@@ -202,6 +202,7 @@ if torch.version.hip:
         'add_sigmoid_gate', 'add_sigmoid_gate_proj', 'deinterleave_qg',
         'rms_norm', 'rms_norm_res_in', 'gated_rms_norm',
         'softcap',
+        'routing_std', 'routing_ds3_nogroup', 'routing_sel_norm',
     ]:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, getattr(_fb, _name))

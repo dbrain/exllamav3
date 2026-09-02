@@ -118,7 +118,11 @@ class HyperConnection(Module):
         (both block consumers cast it immediately); the torch fallback keeps fp32."""
         hc = self.hc_mult
         b, s, H, D = streams.shape
-        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous():
+        # hc_mix.cu is excluded from the ROCm build (see exllamav3_ext/build_config.py), so
+        # gate on the kernel existing, not just on the shape/dtype it wants. The torch path
+        # below is the fallback.
+        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous() \
+                and hasattr(ext, "hc_mix"):
             R = b * s
             st = streams.view(R, H, D)
             chunks = ext.hc_mix_num_chunks(R, H * D)

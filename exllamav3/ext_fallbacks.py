@@ -221,3 +221,104 @@ class _BCNone:
     __slots__ = ()
     def __call__(self, *args: Any, **kwargs: Any) -> None:
         return None
+
+
+# -- MoE routing (routing.cu) -------------------------------------------------
+#
+# Semantics transcribed from exllamav3_ext/routing.cu. The CUDA kernels fuse the
+# router GEMV, the score activation, the top-k selection and the renormalization;
+# here they are separate ops with the same observable result. `scores` is an output
+# buffer in every case (it receives the raw router logits), and topk_indices /
+# topk_weights / weights are preallocated and written in place.
+
+ROUTING_ACT_SIGMOID = 0
+ROUTING_ACT_SQRTSP = 1
+
+
+def _routing_act(x: torch.Tensor, act_fn: int) -> torch.Tensor:
+    # routing_act<ACT> in routing.cu: sqrt(softplus(x)) with torch's threshold=20
+    # semantics, or a numerically stable sigmoid.
+    if act_fn == ROUTING_ACT_SQRTSP:
+        return torch.sqrt(F.softplus(x, beta = 1.0, threshold = 20.0))
+    return torch.sigmoid(x)
+
+
+def _routing_gemv(
+    hidden: torch.Tensor,
+    gate: torch.Tensor,
+    scores: torch.Tensor,
+) -> torch.Tensor:
+    # routing_gemv: scores <- hidden @ gate, gate is (hidden_dim, num_experts).
+    # Accumulate in fp32 and round once, matching the kernel's fp32 accumulator.
+    h = hidden.view(-1, hidden.shape[-1])
+    logits = torch.matmul(h.float(), gate.float())
+    scores.copy_(logits.to(scores.dtype))
+    return logits
+
+
+def routing_std(
+    hidden: torch.Tensor,
+    gate: torch.Tensor,
+    scores: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    per_expert_scale: torch.Tensor | None,
+    gate_t: torch.Tensor | None,
+    bias: torch.Tensor | None,
+) -> None:
+    logits = _routing_gemv(hidden, gate, scores)
+    if bias is not None:
+        # Router bias (gpt-oss): biased logits drive both selection and the softmax
+        logits = logits + bias.view(1, -1).float()
+    k = topk_indices.shape[1]
+    top_v, top_i = torch.topk(logits, k, dim = -1)
+    # The kernel computes exp(logit - max_over_all_experts) and normalizes over the
+    # selected k. The global max is always inside the top-k, so this is a softmax
+    # over the selected logits. (The kernel's +1e-20 guard is below fp16 resolution.)
+    w = torch.softmax(top_v, dim = -1)
+    if per_expert_scale is not None:
+        w = w * per_expert_scale.float()[top_i]
+    topk_indices.copy_(top_i.to(torch.long))
+    topk_weights.copy_(w.to(topk_weights.dtype))
+
+
+def routing_ds3_nogroup(
+    hidden: torch.Tensor,
+    gate: torch.Tensor,
+    scores: torch.Tensor,
+    bias: torch.Tensor | None,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    scaling_factor: float,
+    gate_t: torch.Tensor | None,
+    act_fn: int,
+) -> None:
+    logits = _routing_gemv(hidden, gate, scores)
+    o_all = _routing_act(logits, act_fn)
+    # DS3 aux-loss-free bias steers *selection* only; the emitted weight is the
+    # activated unbiased score. (The kernel's `v -= min(v)` shift only exists to keep
+    # the radix sort on positive floats and does not affect ordering.)
+    sel = o_all if bias is None else o_all + bias.view(1, -1).float()
+    k = topk_indices.shape[1]
+    _, top_i = torch.topk(sel, k, dim = -1)
+    o = o_all.gather(-1, top_i)
+    o = o * (scaling_factor / (o.sum(dim = -1, keepdim = True) + 1e-20))
+    topk_indices.copy_(top_i.to(torch.long))
+    topk_weights.copy_(o.to(topk_weights.dtype))
+
+
+def routing_sel_norm(
+    hidden: torch.Tensor,
+    gate: torch.Tensor,
+    scores: torch.Tensor,
+    selected: torch.Tensor,
+    weights: torch.Tensor,
+    scaling_factor: float,
+    gate_t: torch.Tensor | None,
+    act_fn: int,
+) -> None:
+    # Experts are chosen upstream (hash routing); this only scores and renormalizes.
+    logits = _routing_gemv(hidden, gate, scores)
+    o = _routing_act(logits.gather(-1, selected.long()), act_fn)
+    o = o * (scaling_factor / (o.sum(dim = -1, keepdim = True) + 1e-20))
+    weights.copy_(o.to(weights.dtype))

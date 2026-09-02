@@ -793,7 +793,11 @@ class BlockSparseMLP(Module):
             )
             self.support_fused = (
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
-                self.support_quant_paths
+                self.support_quant_paths and
+                # exl3_moe.cu is excluded from the ROCm build (exllamav3_ext/build_config.py),
+                # so the fused path has no kernel to call. Falls back to the per-expert
+                # index_select loop, which drives the same LinearEXL3 modules.
+                hasattr(ext, "exl3_moe")
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
