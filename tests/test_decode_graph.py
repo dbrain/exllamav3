@@ -1,7 +1,7 @@
-"""Eligibility gates for whole-step decode graph capture (graph_decode.py).
+"""Span layout and eligibility gates for decode graph capture (graph_decode.py).
 
-Pure gate logic: no model load, no GPU. The capture path itself is validated by
-running a model, since bit-identity against the eager path is the real gate.
+Pure planning logic: no model load, no GPU. The capture path itself is
+validated by running a model, since matching the eager path is the real gate.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,31 +31,80 @@ class FakeModel:
 
 
 def _emb():  return FakeMod("Embedding", "emb", {"prefer_cpu": True}, device = "cpu")
-def _blk(inner = ()): return FakeMod("TransformerBlock", "blk", {}, subs = inner)
+def _blk(inner = (), key = "blk"): return FakeMod("TransformerBlock", key, {}, subs = inner)
 def _head(): return FakeMod("Linear", "lm_head", {"logits_output": True})
+def _moe(key = "blk.mlp"): return FakeMod("BlockSparseMLP", key)
+def _gdn(key = "blk.linear_attn"):
+    return FakeMod("GatedDeltaNet", key, {"recurrent_cache": True})
+def _ple(): return FakeMod("PLELayer", "ple", {"recurrent_cache": True})
 
-
-@pytest.mark.parametrize("name,mods,want_ok,want_reason", [
-    ("dense", [_emb(), _blk(), _blk(), _head()], True, "capturing modules"),
-    # MoE: the ROCm expert loop host-syncs (bincount / tolist / range(num_ex))
-    ("moe", [_emb(), _blk([FakeMod("BlockSparseMLP", "blk.mlp")]), _head()],
-     False, "BlockSparseMLP"),
-    # ...and can opt itself in from its own file once that loop is static
-    ("moe_opt_in", [_emb(), _blk([FakeMod("BlockSparseMLP", "blk.mlp",
-                                          {"graph_capturable": True})]), _head()],
-     True, "capturing modules"),
-    ("recurrent", [_emb(), _blk([FakeMod("Mamba2", "blk.ssm", {"recurrent_cache": True})]), _head()],
-     False, "Mamba2"),
-    ("qsa", [_emb(), _blk([FakeMod("QSAIndexer", "blk.qsa")]), _head()], False, "QSAIndexer"),
-    ("cpu_interior", [_emb(), _blk(), FakeMod("MLP", "cpu_mlp", {"prefer_cpu": True}), _head()],
-     False, "interior"),
-    ("multi_device", [_emb(), _blk(), FakeMod("TransformerBlock", "b2", {}, device = "cuda:1"), _head()],
-     False, "across devices"),
-])
-def test_model_eligibility(name, mods, want_ok, want_reason):
+def _plan(mods):
     g = gd.DecodeGraphs(FakeModel(mods))
-    assert g.eligible() is want_ok, g._reason
-    assert want_reason in g._reason
+    ok = g.eligible()
+    return g, ok, (g.layout or [])
+
+def _spans(layout):
+    """Readable form: ('G'|'e', start, end)."""
+    return [("G" if c else "e", s, e) for c, s, e, _ in layout]
+
+
+# --------------------------------------------------------------- eligibility
+
+def test_dense_is_one_span_after_the_cpu_embedding():
+    g, ok, layout = _plan([_emb(), _blk(), _blk(), _head()])
+    assert ok
+    assert _spans(layout) == [("e", 0, 1), ("G", 1, 4)]
+
+
+def test_moe_blocks_become_eager_leaving_only_the_head():
+    """Every block host-syncs, so only the trailing norm/head span is captured.
+    Correct, but nearly worthless -- the MoE work is what unlocks these models."""
+    g, ok, layout = _plan([_emb(), _blk([_moe()]), _blk([_moe()]), _head()])
+    assert ok
+    assert _spans(layout) == [("e", 0, 3), ("G", 3, 4)]
+
+
+def test_nothing_capturable_is_rejected():
+    g, ok, _ = _plan([_emb(), _blk([_moe()]), _ple()])
+    assert not ok
+    assert "no capturable span" in g._reason
+
+
+@pytest.mark.parametrize("name,mods,want", [
+    # PLE island in the middle -- the Flash-Next shape (ple_layer_ids = [2])
+    ("gap_in_middle", [_emb(), _blk(), _ple(), _blk(), _head()],
+     [("e", 0, 1), ("G", 1, 2), ("e", 2, 3), ("G", 3, 5)]),
+    # gap immediately at the first capturable module
+    ("gap_at_front", [_emb(), _ple(), _blk(), _blk(), _head()],
+     [("e", 0, 2), ("G", 2, 5)]),
+    # gap at the very end
+    ("gap_at_end", [_emb(), _blk(), _blk(), _ple()],
+     [("e", 0, 1), ("G", 1, 3), ("e", 3, 4)]),
+    # two gaps -> three captured spans
+    ("two_gaps", [_emb(), _blk(), _ple(), _blk(), _ple(), _blk(), _head()],
+     [("e", 0, 1), ("G", 1, 2), ("e", 2, 3), ("G", 3, 4), ("e", 4, 5), ("G", 5, 7)]),
+    # adjacent gaps coalesce into one eager span
+    ("adjacent_gaps", [_emb(), _blk(), _ple(), _ple(), _blk(), _head()],
+     [("e", 0, 1), ("G", 1, 2), ("e", 2, 4), ("G", 4, 6)]),
+])
+def test_span_layouts(name, mods, want):
+    g, ok, layout = _plan(mods)
+    assert ok, g._reason
+    assert _spans(layout) == want
+
+
+@pytest.mark.parametrize("name,mods,want_reason", [
+    ("cpu_interior", [_emb(), _blk(), FakeMod("MLP", "cpu_mlp", {"prefer_cpu": True}), _head()],
+     None),   # a CPU module in the interior is just another eager span now
+    ("multi_device", [_emb(), _blk(), FakeMod("TransformerBlock", "b2", {}, device = "cuda:1"), _head()],
+     "across devices"),
+])
+def test_global_rejections(name, mods, want_reason):
+    g, ok, layout = _plan(mods)
+    if want_reason is None:
+        assert ok and _spans(layout) == [("e", 0, 1), ("G", 1, 2), ("e", 2, 3), ("G", 3, 4)]
+    else:
+        assert not ok and want_reason in g._reason
 
 
 def test_tensor_parallel_rejected():
@@ -65,6 +114,44 @@ def test_tensor_parallel_rejected():
     assert not g.eligible()
     assert "tensor-parallel" in g._reason
 
+
+# ------------------------------------------------------- per-module capability
+
+@pytest.mark.parametrize("mod,capturable", [
+    (_blk(), True),
+    (_moe(), False),
+    (_gdn(), True),                                        # validated on 35b-a3b
+    (FakeMod("Mamba2", "ssm", {"recurrent_cache": True}), False),      # untested
+    (FakeMod("SlidingAttention", "swa", {"recurrent_cache": True}), False),
+    (FakeMod("ShortConv", "sc", {"recurrent_cache": True}), False),
+    (_ple(), False),
+    (FakeMod("QSAIndexer", "qsa"), False),
+    # a module can opt itself in from its own file
+    (FakeMod("BlockSparseMLP", "m", {"graph_capturable": True}), True),
+])
+def test_module_capability(mod, capturable):
+    assert gd._module_capturable(mod) is capturable
+
+
+# ------------------------------------------------------------ span exemption
+
+def test_exempt_is_per_span_not_per_model():
+    """A dense span in a hybrid model must still be gated bitwise; only the
+    span holding the non-deterministic recurrent kernel is exempt."""
+    mods = [_emb(), _blk([_gdn()]), _ple(), _blk(), _head()]
+    g, ok, layout = _plan(mods)
+    assert ok
+    by_span = {(s, e): x for c, s, e, x in layout if c}
+    assert by_span[(1, 2)] is True,  "GDN span should be exempt from bitwise verify"
+    assert by_span[(3, 5)] is False, "dense span must still be verified bitwise"
+
+
+def test_dense_model_has_no_exempt_span():
+    _, ok, layout = _plan([_emb(), _blk(), _head()])
+    assert ok and not any(x for c, _, _, x in layout if c)
+
+
+# ---------------------------------------------------------------- call gate
 
 _BT = torch.zeros((1, 16), dtype = torch.int32)
 _CS = torch.zeros(1, dtype = torch.int32)
@@ -99,3 +186,8 @@ def test_signature_ignores_buffer_contents():
     s1 = g._signature(_ID1, _BASE)
     moved = {"block_table": _BT.clone() + 3, "cache_seqlens": _CS.clone() + 977}
     assert g._signature(_ID1, moved) == s1
+
+
+def test_recurrent_state_tensors_empty_for_dense():
+    assert gd._recurrent_state_tensors({}) == []
+    assert gd._recurrent_state_tensors({"recurrent_states": None}) == []
