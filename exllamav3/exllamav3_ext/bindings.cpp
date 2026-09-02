@@ -11,6 +11,8 @@
 // norm.cu builds on ROCm too (ple.cu needs rms_norm), so its declarations are
 // hoisted above the CUDA-only include block.
 #include "norm.cuh"
+#include "ple.cuh"
+#include "ngram.cuh"
 
 #if !defined(USE_ROCM)
 
@@ -66,8 +68,6 @@
 #include "dsv4_compress.cuh"
 #include "dsa_topk.cuh"
 #include "hc_mix.cuh"
-#include "ple.cuh"
-#include "ngram.cuh"
 
 #include "attention.cuh"
 
@@ -117,6 +117,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
 
+    // ple.cu and ngram.cu build on ROCm; Flash-Next (qwen4_exp) needs both
+    m.def("ple_gate", &ple_gate, "ple_gate");
+    m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
+    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
+    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
+    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
+
 #if !defined(USE_ROCM)
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
@@ -129,11 +136,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
     m.def("hc_mix", &hc_mix, "hc_mix");
-    m.def("ple_gate", &ple_gate, "ple_gate");
-    m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
-    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
-    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
-    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
