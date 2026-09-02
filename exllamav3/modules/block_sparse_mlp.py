@@ -26,6 +26,31 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 _HAS_MGEMM = hasattr(ext, "exl3_mgemm")
 _HAS_MOE = hasattr(ext, "exl3_moe")
 
+try:
+    from .quant.exl3_mgemm_triton import _linear_exl3_mgemm_triton, mgemm_prepare
+    _HAS_TRITON_MGEMM = True
+except ImportError:
+    _HAS_TRITON_MGEMM = False
+
+
+def _supports_grouped_mgemm(is_quantized, gated, activation_fn, gates, ups, downs,
+                            num_local_experts, num_experts) -> bool:
+    """Grouped Triton mgemm covers the M == 1 decode case only.
+
+    Requires the whole expert range: a TP or CPU-split shard puts the sentinel
+    value num_local_experts in flat_expert_local for out-of-range picks, and the
+    kernel dereferences ptrs_trellis[eid] unguarded."""
+    return (
+        _HAS_TRITON_MGEMM and
+        not _HAS_MGEMM and
+        is_quantized and
+        gated and activation_fn in ("silu", "gelu") and
+        num_local_experts == num_experts and
+        all(l.inner.bias is None for l in gates + ups + downs) and
+        all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in downs)
+    )
+
+
 
 def _supports_quant_paths(is_quantized, gated, activation_fn, gates, ups, downs) -> bool:
     return (
@@ -321,6 +346,17 @@ def routing_sqrtsp_hash(bsz, cfg, y, params):
 
 
 @dataclass
+class MGemmBuffers:
+    xh_gu: torch.Tensor
+    interm_g: torch.Tensor
+    interm_u: torch.Tensor
+    act: torch.Tensor
+    xh_d: torch.Tensor
+    out: torch.Tensor
+    ids: torch.Tensor
+
+
+@dataclass
 class ExpertsCFG:
     yh: torch.Tensor
     interm_g: torch.Tensor
@@ -593,6 +629,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.is_quantized = False
         self.support_fused = False
         self.support_quant_paths = False
+        self.mgemm_grouped = False
+        self.mgemm_buf = None
         self.multi_gate = None
         self.multi_up = None
         self.multi_down = None
@@ -692,10 +730,19 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             not self.config.infer_params.no_reconstruct
         )
 
+        # Grouped Triton mgemm stands in for the absent CUDA exl3_mgemm at decode:
+        # one launch per projection for the whole routed set instead of one per expert,
+        # and no host round-trip, which is what makes the step graph-capturable
+        self.mgemm_grouped = _supports_grouped_mgemm(
+            self.is_quantized, self.gated, self.activation_fn,
+            self.gates, self.ups, self.downs,
+            self.num_local_experts, self.num_experts,
+        ) and not self.config.infer_params.no_reconstruct
+
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
         # gate pointer tables (never dereferenced, the gate GEMMs are skipped)
-        if (self.support_quant_paths or self.support_bc_bsz1) and not self.config.infer_params.no_reconstruct:
+        if (self.support_quant_paths or self.support_bc_bsz1 or self.mgemm_grouped) and not self.config.infer_params.no_reconstruct:
             self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True) if self.gated else None
             self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
             self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
@@ -772,6 +819,30 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             out_trim = out_trim,
         )
         self.experts_cfg = cfg
+
+        if self.mgemm_grouped:
+            E = self.num_experts_per_tok
+            Hi = self.multi_gate.in_features
+            I = self.multi_gate.out_features
+            Ho = self.multi_down.out_features
+            dev = self.device
+            half = torch.half
+            # Stable addresses: a captured graph replays against these exact buffers
+            self.mgemm_buf = MGemmBuffers(
+                xh_gu = torch.empty((E, 1, Hi), dtype = half, device = dev),
+                interm_g = torch.empty((E, I), dtype = half, device = dev),
+                interm_u = torch.empty((E, I), dtype = half, device = dev),
+                act = torch.empty((E, I), dtype = half, device = dev),
+                xh_d = torch.empty((E, 1, I), dtype = half, device = dev),
+                out = torch.empty((E, Ho), dtype = half, device = dev),
+                ids = torch.empty((E,), dtype = torch.long, device = dev),
+            )
+            self.mgemm_cb = 1 if self.multi_gate.mcg else (2 if self.multi_gate.mul1 else 0)
+            # Triton autotune benchmarks its pool on the first call for a new key and the
+            # perm/mrow tables are built lazily; both must happen outside a graph capture
+            for ml, o in ((self.multi_gate, I), (self.multi_up, I), (self.multi_down, Ho)):
+                mgemm_prepare(E, ml.in_features, o, ml.K, self.mgemm_cb, dev,
+                              ml.ptrs_trellis, ml.ptrs_suh, ml.ptrs_svh)
 
         if (self.support_quant_paths or self.support_bc_bsz1) \
                 and not self.config.infer_params.no_reconstruct:
@@ -979,6 +1050,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.cpu_unload()
         self.bc = None
         self.fused_mode_buffers = None
+        self.mgemm_buf = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -1065,6 +1137,29 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
+
+        # Grouped Triton mgemm (decode). Every routed expert sees the same row and has
+        # exactly one, so no sort/bincount/count readback is needed: the [top_k] expert
+        # list is already what the kernel wants, and it stays on the device
+        elif self.mgemm_grouped and bsz == 1 and self.mgemm_buf is not None:
+            b = self.mgemm_buf
+            b.ids.copy_(selected_experts.view(-1))
+            _linear_exl3_mgemm_triton(
+                y, b.xh_gu, b.interm_g,
+                self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh,
+                self.multi_gate.ptrs_svh, b.ids, self.multi_gate.K, self.mgemm_cb)
+            _linear_exl3_mgemm_triton(
+                y, b.xh_gu, b.interm_u,
+                self.multi_up.ptrs_trellis, self.multi_up.ptrs_suh,
+                self.multi_up.ptrs_svh, b.ids, self.multi_up.K, self.mgemm_cb)
+            self.activation_fn_call(b.interm_g, b.interm_u, b.act, self.act_limit)
+            _linear_exl3_mgemm_triton(
+                b.act, b.xh_d, b.out,
+                self.multi_down.ptrs_trellis, self.multi_down.ptrs_suh,
+                self.multi_down.ptrs_svh, b.ids, self.multi_down.K, self.mgemm_cb)
+            final_hidden_states = torch.sum(
+                b.out.float() * routing_weights.view(-1, 1).float(), dim = 0
+            ).view(x.shape)
 
         # Torch/C++/fused path
         elif (

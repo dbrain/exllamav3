@@ -57,3 +57,42 @@ def test_flags_track_the_actual_build():
     from exllamav3.ext import exllamav3_ext as ext
     assert bsm._HAS_MGEMM == hasattr(ext, "exl3_mgemm")
     assert bsm._HAS_MOE == hasattr(ext, "exl3_moe")
+
+
+# -- grouped Triton mgemm (decode) --------------------------------------------
+
+def _supports_grouped(has_triton = True, has_native = False, **over):
+    kw = dict(is_quantized = True, gated = True, activation_fn = "silu",
+              gates = [_Lin()], ups = [_Lin()], downs = [_Lin()],
+              num_local_experts = 8, num_experts = 8)
+    kw.update(over)
+    prev_t, prev_n = bsm._HAS_TRITON_MGEMM, bsm._HAS_MGEMM
+    bsm._HAS_TRITON_MGEMM, bsm._HAS_MGEMM = has_triton, has_native
+    try:
+        return bsm._supports_grouped_mgemm(**kw)
+    finally:
+        bsm._HAS_TRITON_MGEMM, bsm._HAS_MGEMM = prev_t, prev_n
+
+
+def test_grouped_used_when_native_mgemm_absent():
+    assert _supports_grouped() is True
+
+
+def test_grouped_yields_to_the_native_kernel():
+    assert _supports_grouped(has_native = True) is False
+
+
+def test_grouped_needs_triton_module():
+    assert _supports_grouped(has_triton = False) is False
+
+
+@pytest.mark.parametrize("over", [
+    {"num_local_experts": 4},                     # TP / CPU-split shard: sentinel id would deref
+    {"is_quantized": False},
+    {"gated": False},
+    {"activation_fn": "relu2"},
+    {"ups": [_Lin(bias = object())]},
+    {"downs": [_Lin(trim = True, out_features = 16, out_unpadded = 8)]},
+])
+def test_grouped_rejects_unsupported(over):
+    assert _supports_grouped(**over) is False
