@@ -1,0 +1,622 @@
+"""Grouped (multi-expert) EXL3 Triton GEMM for ROCm / gfx1150.
+
+A standalone replacement for the CUDA-only ``ext.exl3_mgemm`` cooperative
+kernel, covering the decode case (one token, ``M == 1``). Where the CUDA
+kernel is unavailable, block_sparse_mlp falls back to a per-expert Python
+loop of ``had_r_128 -> exl3_gemm -> had_r_128``; at 48 layers x top-k 10 x 3
+linears that is ~4300 launches per token and launch overhead dominates.
+
+At ``bsz == 1`` every routed expert sees the same input row and identical
+shapes, so the routed set is a batched GEMV against E different weight
+matrices. Each expert's trellis is a separate allocation, so the kernels use
+the grouped-GEMM pointer-indirection pattern: an int64 device tensor of
+weight base addresses, loaded per program and cast to a Triton pointer.
+``MultiLinear`` already builds exactly these tables (``ptrs_trellis``,
+``ptrs_suh``, ``ptrs_svh``) on every backend.
+
+Entry points:
+
+    exl3_mgemm_triton(x, ptrs_trellis, expert_ids, y, K_bits, cb)
+        y[e] = dequant(trellis[expert_ids[e]]).T @ x[e]   (one launch)
+
+    had_r_128_mtriton(x, y, ptrs_pre, ptrs_post, expert_ids, scale)
+        grouped row Hadamard with a per-expert scale vector (one launch)
+
+    linear_exl3_mgemm_triton(...)
+        had -> mgemm -> had, three launches for the whole expert set
+
+Device residency / CUDA-graph capture. Nothing in this module reads a device
+tensor's *contents* on the host: ``expert_ids`` is dereferenced only inside the
+kernels, and the grid depends solely on E (= top_k, a Python int from the
+output tensor's shape) and on N. So a routed decode step is fully static and
+capturable, provided the caller:
+  * passes pre-allocated output buffers with stable addresses (use
+    ``_linear_exl3_mgemm_triton``, which allocates nothing);
+  * calls ``mgemm_prepare()`` once per shape BEFORE capture, so Triton's
+    autotune benchmarking and the cached perm/mrow index tensors are done
+    outside the graph;
+  * writes new routing into ``expert_ids`` in place (``copy_``/``index_``) so
+    the captured pointer stays valid; the replayed graph picks up the new
+    experts with no host round-trip.
+
+The M == 1 decode branch tree of the GEMM kernel is lifted verbatim from
+exllamav3's ``_fused_dequant_gemm_kernel`` by ``_gen.py`` (line ranges are
+listed there); only the trellis base pointer and the output row differ. Do
+not hand-edit the region between the BEGIN/END markers -- rerun _gen.py.
+
+M > 1 is NOT implemented: the grouped-tiling problem (per-expert row counts,
+segment offsets) is a different kernel and the win is at decode.
+
+One deliberate deviation from the copied source: the K_BITS==8 M1 output
+permutation is fixed here (see FIXES in _gen.py). exl3_triton.py's version is
+wrong for BLOCK_N > 16 -- so at 8 bpw this module does NOT match the per-expert
+path; it matches ext.reconstruct instead, and the per-expert path does not.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# Helpers copied from exllamav3/modules/quant/exl3_triton.py
+# ---------------------------------------------------------------------------
+
+_RSCALE_128 = 0.088388347648  # 1/sqrt(128), matches the C++ literal
+
+_M_ROW_OFFSETS = {
+    3: [29, 17, 26, 14, 5, 57, 2, 54, 45, 33, 42, 94, 85, 73, 82, 70,
+        23, 11, 20, 8, 63, 51, 60, 48, 39, 91, 36, 88, 79, 67, 76, 64],
+    5: [27, 7, 22, 2, 51, 95, 46, 90, 75, 119, 70, 114, 99, 143, 158, 138,
+        17, 61, 12, 56, 41, 85, 36, 80, 65, 109, 124, 104, 153, 133, 148, 128],
+    7: [25, 61, 18, 54, 33, 69, 90, 126, 105, 141, 98, 134, 177, 213, 170, 206,
+        11, 47, 4, 40, 83, 119, 76, 112, 155, 191, 148, 184, 163, 199, 220, 192],
+}
+_M_ROW_CACHE = {}
+_PERM_CACHE = {}
+_DEV_CACHE = {}
+
+
+def _get_m_row_offsets(K_bits: int, device) -> torch.Tensor:
+    key = (K_bits, str(device))
+    if key not in _M_ROW_CACHE:
+        _M_ROW_CACHE[key] = torch.tensor(
+            _M_ROW_OFFSETS[K_bits], device=device, dtype=torch.int32
+        )
+    return _M_ROW_CACHE[key]
+
+
+def _get_perm_i(device) -> torch.Tensor:
+    key = str(device)
+    if key not in _PERM_CACHE:
+        perm = [0] * 256
+        for t in range(32):
+            r0 = (t % 4) * 2; r1 = r0 + 1; r2 = r0 + 8; r3 = r0 + 9
+            c0 = t // 4; c1 = c0 + 8
+            perm[t * 8 + 0] = r0 * 16 + c0; perm[t * 8 + 1] = r1 * 16 + c0
+            perm[t * 8 + 2] = r2 * 16 + c0; perm[t * 8 + 3] = r3 * 16 + c0
+            perm[t * 8 + 4] = r0 * 16 + c1; perm[t * 8 + 5] = r1 * 16 + c1
+            perm[t * 8 + 6] = r2 * 16 + c1; perm[t * 8 + 7] = r3 * 16 + c1
+        perm_i = [0] * 256
+        for i, p in enumerate(perm):
+            perm_i[p] = i
+        _PERM_CACHE[key] = torch.tensor(perm_i, device=device, dtype=torch.long)
+    return _PERM_CACHE[key]
+
+
+def _dev_caps(device=None):
+    idx = torch.cuda.current_device() if device is None else device
+    if idx not in _DEV_CACHE:
+        p = torch.cuda.get_device_properties(idx)
+        is_amd = torch.version.hip is not None
+        wave = getattr(p, "warp_size", None) or (64 if is_amd else 32)
+        _DEV_CACHE[idx] = (p.multi_processor_count, wave, is_amd)
+    return _DEV_CACHE[idx]
+
+
+@triton.jit
+def _decode_u16(w_u32, CB: tl.constexpr):
+    """Inline arithmetic decode of 16-bit codebook indices (matches
+    decode_3inst in the C++ reference)."""
+    if CB == 0:
+        w_u32 = (w_u32 * 89226354 + 64248484) & 0xFFFFFFFF
+        w_u32 = 0x3b603b60 ^ (w_u32 & 0x8fff8fff)
+    elif CB == 1:
+        w_u32 = (w_u32 * 0xCBAC1FED) & 0xFFFFFFFF
+        w_u32 = 0x3b603b60 ^ (w_u32 & 0x8fff8fff)
+    else:  # CB == 2 (mul1)
+        w_u32 = (w_u32 * 0x83DCD12D) & 0xFFFFFFFF
+        db0 = w_u32 & 0xFF
+        db1 = (w_u32 >> 8) & 0xFF
+        db2 = (w_u32 >> 16) & 0xFF
+        db3 = (w_u32 >> 24) & 0xFF
+        w_u32 = (db0 + db1 + db2 + db3 + 0x6400) & 0xFFFF
+
+    if CB == 0 or CB == 1:
+        lo = w_u32 & 0xFFFF
+        hi = (w_u32 >> 16) & 0xFFFF
+        lo_h = tl.cast(lo.to(tl.int16), tl.float16, bitcast=True)
+        hi_h = tl.cast(hi.to(tl.int16), tl.float16, bitcast=True)
+        return lo_h + hi_h
+    else:
+        sum16 = w_u32 & 0xFFFF
+        h = tl.cast(sum16.to(tl.int16), tl.float16, bitcast=True)
+        k_inv_h = tl.full((1,), 0x1eee, dtype=tl.int16)
+        k_inv_h = tl.cast(k_inv_h, tl.float16, bitcast=True)
+        k_bias_h = tl.full((1,), 0xc931, dtype=tl.int16)
+        k_bias_h = tl.cast(k_bias_h, tl.float16, bitcast=True)
+        return h * k_inv_h + k_bias_h
+
+
+@triton.jit
+def _decode_word_pair(low_u32, high_u32, shift,
+                      SHIFT_FITS_32: tl.constexpr, CB: tl.constexpr):
+    if SHIFT_FITS_32:
+        neg_shift = tl.minimum(32 - shift, 31)
+        windows = ((low_u32 >> shift) | (high_u32 << neg_shift)) & 0xFFFF
+    else:
+        low64 = (low_u32.to(tl.int64) & 0xFFFFFFFF) | ((high_u32.to(tl.int64) & 0xFFFFFFFF) << 32)
+        windows = ((low64 >> shift) & 0xFFFF).to(tl.uint32)
+    return _decode_u16(windows.to(tl.uint32), CB)
+
+
+@triton.jit
+def _funnel6(lo, hi, s):
+    sel = s >= 32
+    s32 = s & 31
+    ns = tl.minimum(32 - s32, 31)
+    base = tl.where(sel[:, None, None], hi[None, :, :], lo[None, :, :])
+    second = tl.where(sel[:, None, None], lo[None, :, :], hi[None, :, :])
+    return ((base >> s32[:, None, None]) | (second << ns[:, None, None])) & 0xFFFF
+
+
+@triton.jit
+def _had_stage(v, BLOCK_R: tl.constexpr, SPAN: tl.constexpr):
+    G: tl.constexpr = 128 // (2 * SPAN)
+    pair = tl.permute(v.reshape(BLOCK_R, G, 2, SPAN), (0, 1, 3, 2))
+    lo, hi = tl.split(pair)
+    pair = tl.join(lo + hi, lo - hi)
+    return tl.permute(pair, (0, 1, 3, 2)).reshape(BLOCK_R, 128)
+
+
+# ---------------------------------------------------------------------------
+# Grouped row Hadamard: one launch for the whole routed expert set
+#
+# Bit-identical to E separate had_r_128_triton calls: the butterfly, the fp32
+# evaluation and the round-to-half ordering are the same expression tree; only
+# the scale vector pointer is fetched indirectly, per expert.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _grouped_had_r_128_kernel(
+    x_ptr, y_ptr, ptrs_scale, expert_ids_ptr,
+    n_rows,
+    stride_xe, stride_xr, stride_ye, stride_yr,
+    r_scale,
+    IO_FP32: tl.constexpr,
+    PRE_SCALED: tl.constexpr,
+    POST_SCALED: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    pid_e = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_c = tl.program_id(2)
+
+    eid = tl.load(expert_ids_ptr + pid_e)
+    s_ptr = tl.cast(tl.load(ptrs_scale + eid), tl.pointer_type(tl.float16))
+
+    xb = x_ptr + pid_e * stride_xe
+    yb = y_ptr + pid_e * stride_ye
+
+    rows = pid_m * BLOCK_R + tl.arange(0, BLOCK_R)
+    mask_r = rows < n_rows
+    col = tl.arange(0, 128)
+
+    x = tl.load(
+        xb + rows[:, None] * stride_xr + (pid_c * 128 + col)[None, :],
+        mask=mask_r[:, None], other=0.0,
+    )
+
+    if PRE_SCALED:
+        pre = tl.load(s_ptr + pid_c * 128 + col)
+        if IO_FP32:
+            x = x * pre.to(tl.float32)
+        else:
+            x = x * pre
+
+    v = x.to(tl.float32)
+    v = _had_stage(v, BLOCK_R, 1)
+    v = _had_stage(v, BLOCK_R, 2)
+    v = _had_stage(v, BLOCK_R, 4)
+    v = _had_stage(v, BLOCK_R, 8)
+    v = _had_stage(v, BLOCK_R, 16)
+    v = _had_stage(v, BLOCK_R, 32)
+    v = _had_stage(v, BLOCK_R, 64)
+    v = v * r_scale
+
+    if POST_SCALED:
+        post = tl.load(s_ptr + pid_c * 128 + col)
+        if IO_FP32:
+            out = v * post.to(tl.float32)
+        else:
+            out = v.to(x_ptr.dtype.element_ty) * post
+    else:
+        out = v
+
+    tl.store(
+        yb + rows[:, None] * stride_yr + (pid_c * 128 + col)[None, :],
+        out.to(y_ptr.dtype.element_ty),
+        mask=mask_r[:, None],
+    )
+
+
+def had_r_128_mtriton(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    ptrs_pre_scale: torch.Tensor | None,
+    ptrs_post_scale: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    scale: float = 1.0,
+) -> None:
+    """Grouped y[e] = (x[e].view(-1, 128) @ H128) * scale_vec[expert_ids[e]].
+
+    ``input`` is [E, rows, cols] or [rows, cols] broadcast across experts (any
+    tensor whose expert stride is 0, e.g. ``x.unsqueeze(0).expand(E, -1, -1)``).
+    ``output`` is [E, rows, cols]. Scale pointer tables are int64 device
+    tensors of ``half`` vector base addresses, as built by MultiLinear.
+    """
+    assert input.dtype == output.dtype
+    assert input.dtype in (torch.half, torch.float)
+    assert (ptrs_pre_scale is None) or (ptrs_post_scale is None)
+    assert output.dim() == 3 and output.shape[-1] % 128 == 0
+    assert input.stride(-1) == 1 and output.stride(-1) == 1
+
+    E, rows, cols = output.shape
+    if input.dim() == 2:
+        input = input.unsqueeze(0).expand(E, -1, -1)
+
+    BLOCK_R = 4
+    grid = (E, triton.cdiv(rows, BLOCK_R), cols // 128)
+    _grouped_had_r_128_kernel[grid](
+        input, output,
+        ptrs_pre_scale if ptrs_pre_scale is not None else ptrs_post_scale,
+        expert_ids,
+        rows,
+        input.stride(0), input.stride(1), output.stride(0), output.stride(1),
+        scale * _RSCALE_128,
+        IO_FP32=input.dtype == torch.float,
+        PRE_SCALED=ptrs_pre_scale is not None,
+        POST_SCALED=ptrs_post_scale is not None,
+        BLOCK_R=BLOCK_R,
+        num_warps=1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Autotune pool
+#
+# Only the M == 1 tiles are relevant. The grouped grid is E x cdiv(N, BLOCK_N)
+# programs, i.e. E times the single-expert grid, so the CTA-starvation that
+# forces narrow tiles on the per-expert path is much weaker here; the pool
+# keeps both the narrow and the wide tiles and lets autotune decide.
+#
+# _prefer_warps mirrors the repo: on parts with few CUs (gfx1150 has 8) narrow
+# CTAs keep more blocks resident. RDNA runs wave32, so num_warps counts 32-lane
+# waves exactly like CUDA -- this is not a wave64 lane-count correction.
+# ---------------------------------------------------------------------------
+
+def _prefer_warps(configs):
+    cu, wave, is_amd = _dev_caps()
+    if cu > 16:
+        return configs
+    want = [c for c in configs if c.num_warps <= 4]
+    return want if want else configs
+
+
+def _mgemm_configs():
+    spec = os.environ.get("TMGEMM_CONFIGS")
+    if spec:
+        # "BN,BK:nw:ns;..." for manual sweeps
+        out = []
+        for part in spec.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            dims, _, rest = part.partition(":")
+            bn, bk = (int(v) for v in dims.split(","))
+            nw = int(rest.split(":")[0]) if rest else 2
+            ns = int(rest.split(":")[1]) if ":" in rest else 3
+            out.append(triton.Config({"BLOCK_N": bn, "BLOCK_K": bk},
+                                     num_warps=nw, num_stages=ns))
+        return out
+    return [
+        triton.Config({"BLOCK_N": 32, "BLOCK_K": 128}, num_warps=2, num_stages=3),
+        triton.Config({"BLOCK_N": 32, "BLOCK_K": 256}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=2, num_stages=3),
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_N": 128, "BLOCK_K": 128}, num_warps=2, num_stages=3),
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=4, num_stages=3),
+        # generic-path / odd-shape fallback, never pruned away
+        triton.Config({"BLOCK_N": 16, "BLOCK_K": 64}, num_warps=2, num_stages=3),
+    ]
+
+
+def _mgemm_prune(configs, named_args, **kwargs):
+    bits = kwargs.get("K_BITS", named_args.get("K_BITS"))
+    n = kwargs.get("N", named_args.get("N"))
+    k = kwargs.get("K_dim", named_args.get("K_dim"))
+    fast_ok = n % 128 == 0 and k % 128 == 0
+
+    out = [c for c in configs
+           if n % c.kwargs["BLOCK_N"] == 0 and k % c.kwargs["BLOCK_K"] == 0]
+    if not out:
+        out = list(configs)
+
+    if fast_ok:
+        # Every width has a gather-free fast path for full tiles; drop the
+        # tiny generic fallback so it can't win a cold-clock autotune pass.
+        wide = [c for c in out if c.kwargs["BLOCK_N"] >= 32]
+        out = wide or out
+        if bits != 4:
+            # Mirror the single-expert pool's BLOCK_N ceiling per width class:
+            # the heavy M1 accumulators (2-4 fp32 tensors of 256*NN elements per
+            # CTA) collapse occupancy at wide BLOCK_N, and those are the tiles
+            # the repo actually measured for these widths.
+            lim = 32 if n <= 16384 else 64
+            narrow = [c for c in out if c.kwargs["BLOCK_N"] <= lim]
+            out = narrow or out
+        if bits == 3:
+            narrow = [c for c in out if c.kwargs["BLOCK_N"] <= 32]
+            out = narrow or out
+    else:
+        # Generic tl.gather path: this Triton build's LLVM aborts on large
+        # gather tiles.
+        small = [c for c in out
+                 if c.kwargs["BLOCK_N"] <= 64 and c.kwargs["BLOCK_K"] <= 64]
+        out = small or out
+
+    return _prefer_warps(out) or configs
+
+
+_PRUNE = {"early_config_prune": _mgemm_prune}
+
+
+# ---------------------------------------------------------------------------
+# Grouped fused dequant + GEMV kernel (M == 1)
+# ---------------------------------------------------------------------------
+
+@triton.autotune(
+    configs=_mgemm_configs(),
+    key=["E_BUCKET", "N", "K_dim", "K_BITS", "N_PACKED", "CB"],
+    prune_configs_by=_PRUNE,
+)
+@triton.jit
+def _grouped_dequant_gemv_kernel(
+    x_ptr, y_ptr,
+    ptrs_trellis,          # [num_experts] int64, trellis base addresses
+    expert_ids_ptr,        # [E] int32/int64, indexes ptrs_trellis
+    perm_i_ptr,
+    mrow_ptr,
+    E, N, K_dim,
+    E_BUCKET,              # autotune key only; unused in the body
+    stride_xe, stride_xk,
+    stride_tk, stride_tn,
+    stride_ye, stride_yn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_BITS: tl.constexpr,
+    N_PACKED: tl.constexpr,
+    CB: tl.constexpr,
+):
+    NK: tl.constexpr = BLOCK_K // 16   # k-sub-tiles per weight tile
+    NN: tl.constexpr = BLOCK_N // 16   # n-sub-tiles per weight tile
+    N_U32: tl.constexpr = K_BITS * 256 // 32
+    SHIFT_FITS_32: tl.constexpr = (K_BITS == 1) | (K_BITS == 2) | (K_BITS == 4)
+
+    # Grid is flat over (expert, n-tile) so the whole routed set is one launch.
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_e = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    # Grouped-GEMM pointer indirection: this program's expert selects a base
+    # address out of the int64 table, which becomes a Triton pointer. The
+    # tensors are separate allocations, so no single strided view spans them.
+    eid = tl.load(expert_ids_ptr + pid_e)
+    tbase = tl.load(ptrs_trellis + eid)
+    tu32_ptr = tl.cast(tbase, tl.pointer_type(tl.uint32))
+
+    # x rows may be shared across experts (stride_xe == 0 for a broadcast view)
+    x_ptr = x_ptr + pid_e * stride_xe
+    y_ptr = y_ptr + pid_e * stride_ye
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    stride_tk_u32 = stride_tk // 2
+    stride_tn_u32 = stride_tn // 2
+    base_n = (pid_n * NN) * stride_tn_u32
+
+    n_k_tiles_total = K_dim // 16
+    k_base = 0
+    n_outer = tl.cdiv(n_k_tiles_total, NK)
+
+# <<<BRANCHES>>>
+
+
+def exl3_mgemm_triton(
+    x: torch.Tensor,
+    ptrs_trellis: torch.Tensor,
+    expert_ids: torch.Tensor,
+    y: torch.Tensor,
+    K_bits: int,
+    cb: int = 0,
+    trellis_sample: torch.Tensor | None = None,
+) -> None:
+    """One-launch grouped EXL3 dequant + GEMV over a routed expert set.
+
+    ``y[e] = dequant(trellis[expert_ids[e]]).T @ x[e]`` for e in [0, E).
+
+    x            [E, K_dim] or [1, K_dim] half; an expert stride of 0
+                 (``x.expand(E, -1)``) broadcasts one decode row to all experts
+    ptrs_trellis [num_experts] int64 device tensor of trellis base addresses
+                 (MultiLinear.ptrs_trellis)
+    expert_ids   [E] int32/int64 device tensor indexing ptrs_trellis
+    y            [E, N] half or float output, written in full
+    K_bits       1..8
+    cb           0 plain / 1 mcg / 2 mul1
+
+    All experts must share shape and bit width (MultiLinear asserts this). The
+    trellis layout is the packed EXL3 one: int16 [K_dim/16, N/16, 16*K_bits],
+    contiguous; strides are derived from the shapes and cross-checked against
+    ``trellis_sample`` when one is supplied.
+    """
+    assert x.dim() == 2 and y.dim() == 2, "exl3_mgemm_triton: M == 1 only"
+    E = y.shape[0]
+    N = y.shape[1]
+    K_dim = x.shape[1]
+    assert x.shape[0] in (E, 1), f"x rows {x.shape[0]} vs E {E}"
+    assert expert_ids.numel() == E
+    assert K_dim % 16 == 0 and N % 16 == 0
+
+    # int16 element strides of the packed trellis
+    stride_tn = 16 * K_bits
+    stride_tk = (N // 16) * stride_tn
+    if trellis_sample is not None:
+        assert tuple(trellis_sample.shape) == (K_dim // 16, N // 16, 16 * K_bits), \
+            f"unexpected trellis shape {tuple(trellis_sample.shape)}"
+        assert trellis_sample.stride(0) == stride_tk and trellis_sample.stride(1) == stride_tn, \
+            "exl3_mgemm_triton: non-contiguous trellis is not supported"
+
+    stride_xe = x.stride(0) if x.shape[0] == E else 0
+    grid = lambda meta: (E * triton.cdiv(N, meta["BLOCK_N"]),)
+    perm_i = _get_perm_i(x.device)
+
+    _grouped_dequant_gemv_kernel[grid](
+        x, y,
+        ptrs_trellis, expert_ids,
+        perm_i,
+        _get_m_row_offsets(K_bits, x.device) if K_bits in _M_ROW_OFFSETS else perm_i,
+        E, N, K_dim,
+        _e_bucket(E),
+        stride_xe, x.stride(1),
+        stride_tk, stride_tn,
+        y.stride(0), y.stride(1),
+        K_BITS=K_bits,
+        N_PACKED=16 * K_bits,
+        CB=cb,
+    )
+
+
+def _e_bucket(E: int) -> int:
+    """Autotune key for the expert count (same idea as exl3_triton._m_bucket).
+
+    The compiled code does not depend on E -- only the grid does -- but the
+    best tile does, so E belongs in the key. Bucketing to powers of two keeps
+    that from minting a fresh autotune entry for every routed-set size.
+    """
+    if E <= 1:
+        return 1
+    return 1 << (E - 1).bit_length()
+
+
+# ---------------------------------------------------------------------------
+# Full grouped linear: had -> mgemm -> had (3 launches for E experts)
+# ---------------------------------------------------------------------------
+
+def _linear_exl3_mgemm_triton(
+    x: torch.Tensor,
+    xh: torch.Tensor,
+    y: torch.Tensor,
+    ptrs_trellis: torch.Tensor,
+    ptrs_suh: torch.Tensor,
+    ptrs_svh: torch.Tensor,
+    expert_ids: torch.Tensor,
+    K_bits: int,
+    cb: int,
+) -> None:
+    """Grouped EXL3 linear into pre-allocated buffers. Allocates nothing.
+
+    Graph-capture entry point: every buffer address is the caller's, the grid
+    is a function of E and N only, and ``expert_ids`` is read on the device.
+
+    x   [1, in_features] (shared decode row) or [E, in_features] half
+    xh  [E, 1, in_features] half workspace
+    y   [E, out_features] half or float, written in full
+    """
+    E, _, in_features = xh.shape
+    out_features = y.shape[1]
+    assert x.dim() == 2 and x.shape[1] == in_features and x.shape[0] in (1, E)
+    assert x.dtype == torch.half and xh.dtype == torch.half
+    assert y.shape[0] == E
+
+    xin = x.unsqueeze(0).expand(E, -1, -1) if x.shape[0] == 1 else x.unsqueeze(1)
+    had_r_128_mtriton(xin, xh, ptrs_suh, None, expert_ids, 1.0)
+    exl3_mgemm_triton(xh.view(E, in_features), ptrs_trellis, expert_ids, y, K_bits, cb)
+    had_r_128_mtriton(y.unsqueeze(1), y.unsqueeze(1), None, ptrs_svh, expert_ids, 1.0)
+
+
+def linear_exl3_mgemm_triton(
+    x: torch.Tensor,
+    ptrs_trellis: torch.Tensor,
+    ptrs_suh: torch.Tensor,
+    ptrs_svh: torch.Tensor,
+    expert_ids: torch.Tensor,
+    K_bits: int,
+    cb: int,
+    in_features: int,
+    out_features: int,
+    xh: torch.Tensor | None = None,
+    y: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.half,
+) -> torch.Tensor:
+    """Allocating convenience wrapper over ``_linear_exl3_mgemm_triton``.
+
+    x is [in_features] or [1, in_features] (shared decode row) or
+    [E, in_features] (per-expert rows, e.g. the down_proj input). Returns
+    [E, out_features]. Pass ``xh``/``y`` to keep it allocation-free.
+    """
+    E = expert_ids.shape[0]
+    x2 = x.view(-1, in_features)
+    if xh is None:
+        xh = torch.empty((E, 1, in_features), dtype=torch.half, device=x.device)
+    if y is None:
+        y = torch.empty((E, out_features), dtype=out_dtype, device=x.device)
+    _linear_exl3_mgemm_triton(x2, xh, y, ptrs_trellis, ptrs_suh, ptrs_svh,
+                              expert_ids, K_bits, cb)
+    return y
+
+
+def mgemm_prepare(
+    E: int,
+    in_features: int,
+    out_features: int,
+    K_bits: int,
+    cb: int,
+    device: torch.device,
+    ptrs_trellis: torch.Tensor,
+    ptrs_suh: torch.Tensor | None = None,
+    ptrs_svh: torch.Tensor | None = None,
+) -> None:
+    """Run every kernel once so nothing is deferred into a CUDA-graph capture.
+
+    Triton autotune benchmarks a config pool on the first call for a new key,
+    and the perm / m-row index tensors are built lazily; both must happen
+    before capture. Safe to call repeatedly.
+    """
+    _get_perm_i(device)
+    if K_bits in _M_ROW_OFFSETS:
+        _get_m_row_offsets(K_bits, device)
+    eids = torch.zeros((E,), dtype=torch.int32, device=device)
+    x = torch.zeros((1, in_features), dtype=torch.half, device=device)
+    xh = torch.zeros((E, 1, in_features), dtype=torch.half, device=device)
+    y = torch.zeros((E, out_features), dtype=torch.half, device=device)
+    if ptrs_suh is not None and ptrs_svh is not None:
+        _linear_exl3_mgemm_triton(x, xh, y, ptrs_trellis, ptrs_suh, ptrs_svh,
+                                  eids, K_bits, cb)
+    else:
+        exl3_mgemm_triton(x, ptrs_trellis, eids, y, K_bits, cb)
+    torch.cuda.synchronize()
