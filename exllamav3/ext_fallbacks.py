@@ -11,11 +11,23 @@ from __future__ import annotations
 
 from typing import Any
 
+import math
+
 import torch
 import torch.nn.functional as F
 
 
 # -- Activation fused ops (activation.cu) -------------------------------------
+
+def _clamp_gated(a, y, act_limit):
+    """act_mul_kernel applies the activation first, then clamps -- the activated
+    gate from above, the up path symmetrically -- and multiplies. Clamping the
+    input instead diverges wherever the activation is not monotone-identity
+    (relu2 squares, so min(relu(x)^2, L) != relu(min(x, L))^2)."""
+    if act_limit == 0.0:
+        return a, y
+    return a.clamp(max = act_limit), y.clamp(min = -act_limit, max = act_limit)
+
 
 def silu_mul(
     x: torch.Tensor,
@@ -23,10 +35,9 @@ def silu_mul(
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    r = F.silu(x) * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    a, y = _clamp_gated(F.silu(x), y, act_limit)
+    z.copy_(a * y)
+
 
 def silu_oai_mul(
     x: torch.Tensor,
@@ -34,11 +45,13 @@ def silu_oai_mul(
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    # OAI variant: silu(x * y) — see activation.cu
-    r = F.silu(x * y)
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    # gpt-oss clamped swiglu: unlike act_mul_kernel this clamps its INPUTS,
+    # alpha = 1.702 inside the sigmoid, +1 on the up path
+    g, u = (x, y) if act_limit == 0.0 else (
+        x.clamp(max = act_limit), y.clamp(min = -act_limit, max = act_limit))
+    gf = g.float()
+    z.copy_(((u.float() + 1.0) * (gf * torch.sigmoid(1.702 * gf))).to(z.dtype))
+
 
 def gelu_mul(
     x: torch.Tensor,
@@ -46,10 +59,9 @@ def gelu_mul(
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    r = F.gelu(x, approximate = "tanh") * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    a, y = _clamp_gated(F.gelu(x, approximate = "tanh"), y, act_limit)
+    z.copy_(a * y)
+
 
 def relu2_mul(
     x: torch.Tensor,
@@ -57,10 +69,9 @@ def relu2_mul(
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    r = torch.square(F.relu(x)) * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    a, y = _clamp_gated(torch.square(F.relu(x)), y, act_limit)
+    z.copy_(a * y)
+
 
 def relu_mul(
     x: torch.Tensor,
@@ -68,21 +79,32 @@ def relu_mul(
     z: torch.Tensor,
     act_limit: float = 0.0,
 ) -> None:
-    r = F.relu(x) * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    a, y = _clamp_gated(F.relu(x), y, act_limit)
+    z.copy_(a * y)
+
+
+def _softplus_alpha(t: torch.Tensor) -> float:
+    # xielu() in activation.cu: CPU scalar tensor, softplus with a >20 shortcut
+    v = float(t.float().reshape(-1)[0])
+    return v if v > 20.0 else math.log1p(math.exp(v))
+
 
 def xielu(
     x: torch.Tensor,
     y: torch.Tensor,
-    z: torch.Tensor,
-    act_limit: float = 0.0,
+    alpha_p: torch.Tensor,
+    alpha_n: torch.Tensor,
 ) -> None:
-    r = (torch.tanh(x.clamp(min = -2.3562, max = 2.3562)) * x) * y
-    if act_limit != 0.0:
-        r = torch.clamp(r, min = -act_limit, max = act_limit)
-    z.copy_(r)
+    ap = _softplus_alpha(alpha_p)
+    an = _softplus_alpha(alpha_n) + 0.5
+    eps = -9.9838e-07          # -1e-6 with BF16 rounding error, as in the kernel
+    beta = 0.5
+    xf = x.float()
+    y.copy_(torch.where(
+        xf > 0,
+        ap * xf * xf + beta * xf,
+        (torch.expm1(xf.clamp(max = eps)) - xf) * an + beta * xf,
+    ).to(y.dtype))
 
 
 # -- In-place gate ops (activation.cu) -----------------------------------------
