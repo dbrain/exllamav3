@@ -99,7 +99,7 @@ void warp_radixsort_posf16(half& key, int& idx, int* src_lane_map)
         int myrank = __popc(active & below);
 
         src_lane_map[dest] = lane_id;
-        __syncwarp(active);
+        __syncwarp();
         int src = src_lane_map[myrank];
 
         ku = __shfl_sync(active, ku, src);
@@ -133,7 +133,7 @@ void warp_radixsort_posf32_pl(float& key, float& payload, int& idx, int* src_lan
         int myrank = __popc(active & below);
 
         src_lane_map[dest] = lane_id;
-        __syncwarp(active);
+        __syncwarp();
         int src = src_lane_map[myrank];
 
         ku = __shfl_sync(active, ku, src);
