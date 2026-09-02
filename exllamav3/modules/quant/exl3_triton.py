@@ -673,16 +673,6 @@ def _exl3_gemm_configs():
 
 _PRUNE = {"early_config_prune": _exl3_gemm_early_prune}
 
-# Triton's defaults (25 ms warmup / 100 ms rep) assume the clock is stable by
-# the time a candidate is timed. On a part that shares its power budget with
-# the CPU the autotune pass runs entirely on the ramp, so the winner is decided
-# at a clock nobody infers at: on gfx1150 the stock pass picked a config that
-# sustains 45.7 GB/s out of a pool whose best member sustains 65.5. Timing each
-# candidate for longer costs a one-off second per shape and removes the whole
-# 1.43x. torch.version.hip is a build property, so reading it here does not
-# initialize a device.
-_AT_WARMUP = int(os.environ.get("EXL3_AUTOTUNE_WARMUP", "200" if torch.version.hip else "25"))
-_AT_REP = int(os.environ.get("EXL3_AUTOTUNE_REP", "500" if torch.version.hip else "100"))
 
 
 @triton.jit
@@ -754,7 +744,7 @@ def _decode_u16(w_u32, CB: tl.constexpr):
         return h * k_inv_h + k_bias_h
 
 
-@triton.autotune(configs=_exl3_gemm_configs(), key=["M_BUCKET", "N", "K_dim", "K_BITS", "N_PACKED", "CB"], prune_configs_by=_PRUNE, warmup=_AT_WARMUP, rep=_AT_REP)
+@triton.autotune(configs=_exl3_gemm_configs(), key=["M_BUCKET", "N", "K_dim", "K_BITS", "N_PACKED", "CB"], prune_configs_by=_PRUNE)
 @triton.jit
 def _fused_dequant_gemm_kernel(
     x_ptr, y_ptr,
