@@ -9,6 +9,7 @@ from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
 from ..cache.recurrent_util import advance_recurrent_states
+from . import graph_decode
 
 class Model(Model_TPMixin, Model_LSMixin):
 
@@ -28,6 +29,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.active_devices = []
         self.output_device = None
         self.cache_weakrefs = {}
+        self.decode_graphs = None
         self.recurrent_state_cls = None
         self.draft_verifier_params = {}
 
@@ -220,6 +222,13 @@ class Model(Model_TPMixin, Model_LSMixin):
             advance_recurrent_states(input_ids, params, self)
             return y
         else:
+            # Whole-step graph replay (EXL3_DECODE_GRAPH=1). Returns None for any
+            # step it cannot capture, which falls through to the eager path below
+            if self.decode_graphs is not None:
+                y = self.decode_graphs.forward(input_ids, params)
+                if y is not None:
+                    advance_recurrent_states(input_ids, params, self)
+                    return y
             y = self.forward_ls(x, params)
             advance_recurrent_states(input_ids, params, self)
             return y
@@ -489,6 +498,11 @@ class Model(Model_TPMixin, Model_LSMixin):
         # idempotent, so already-running workers of other components are unaffected
         for host in getattr(self.config, "moe_cpu_hosts", {}).values():
             host.ensure_started()
+
+        # Opt-in whole-step decode graph capture. Constructed here (not in
+        # __init__) because eligibility depends on the loaded module layout
+        if graph_decode.enabled:
+            self.decode_graphs = graph_decode.DecodeGraphs(self)
 
 
     def get_load_metrics(self):
