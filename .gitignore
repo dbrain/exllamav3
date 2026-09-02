@@ -14,3 +14,6 @@ exllamav3_ext.cpython-*.so
 exllamav3/exllamav3_ext/**/*_hip.*
 exllamav3/exllamav3_ext/**/*.hip
 exllamav3/exllamav3_ext/**/hip_*.*
+# local venv + downloaded test models
+.venv/
+_models/

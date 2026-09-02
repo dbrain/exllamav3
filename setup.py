@@ -23,6 +23,15 @@ extra_cuda_cflags = []
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-O3", "-DUSE_ROCM"]
     extra_cflags += ["-DUSE_ROCM"]
+    # HIP's runtime headers define __noinline__ as an object-like macro. libstdc++ 16
+    # spells an attribute [[__gnu__::__noinline__]] in <format>, and the macro eats the
+    # identifier, so any TU that reaches <format> *after* a HIP header fails to parse
+    # ("expected an identifier for the attribute name"). ATen/hip/HIPContext.h does
+    # exactly that: it pulls hip_runtime_api.h, then ATen/Context.h -> <chrono> ->
+    # <format>. Forcing <format> in ahead of everything is order-independent, the same
+    # reasoning as NOMINMAX below.
+    extra_cflags += ["-include", "format"]
+    extra_cuda_cflags += ["-include", "format"]
 else:
     extra_cuda_cflags += [
         "-lineinfo", "-O3", "--use_fast_math",

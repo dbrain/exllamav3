@@ -96,6 +96,14 @@ else:
     if torch.version.hip:
         extra_cuda_cflags += ["-Ofast", "-DUSE_ROCM", "-Wno-register"]
         extra_cflags += ["-DUSE_ROCM"]
+        # Keep in sync with setup.py: HIP's runtime headers define __noinline__ as an
+        # object-like macro, and libstdc++ 16 spells [[__gnu__::__noinline__]] in
+        # <format>, so any TU reaching <format> after a HIP header fails to parse.
+        # ATen/hip/HIPContext.h does exactly that (hip_runtime_api.h, then
+        # ATen/Context.h -> <chrono> -> <format>). Forcing <format> in first is
+        # order-independent.
+        extra_cflags += ["-include", "format"]
+        extra_cuda_cflags += ["-include", "format"]
     else:
         extra_cuda_cflags += [
             "-lineinfo", "-O3", "--use_fast_math",
