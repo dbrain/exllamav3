@@ -11,6 +11,8 @@
 // norm.cu builds on ROCm too (ple.cu needs rms_norm), so its declarations are
 // hoisted above the CUDA-only include block.
 #include "norm.cuh"
+#include "dsa_topk.cuh"
+#include "hc_mix.cuh"
 #include "ple.cuh"
 #include "ngram.cuh"
 
@@ -66,8 +68,6 @@
 #include "libtorch/dsv4_compressor.h"
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
-#include "dsa_topk.cuh"
-#include "hc_mix.cuh"
 
 #include "attention.cuh"
 
@@ -124,6 +124,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
 
+    // dsa_topk.cu and hc_mix.cu build on ROCm; Flash-Next needs QSA + mHC
+    m.def("dsa_topk", &dsa_topk, "dsa_topk");
+    m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_head", &hc_head, "hc_head");
+    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
+    m.def("hc_apply", &hc_apply, "hc_apply");
+    m.def("gr_mix", &gr_mix, "gr_mix");
+
 #if !defined(USE_ROCM)
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
@@ -134,12 +142,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
-    m.def("dsa_topk", &dsa_topk, "dsa_topk");
-    m.def("hc_mix", &hc_mix, "hc_mix");
-    m.def("hc_head", &hc_head, "hc_head");
-    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
-    m.def("hc_apply", &hc_apply, "hc_apply");
-    m.def("gr_mix", &gr_mix, "gr_mix");
     m.def("routing_std", &routing_std, "routing_std");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 

@@ -8,6 +8,16 @@ from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
 
+# hc_mix.cu is excluded from the ROCm build (exllamav3_ext/build_config.py), so every
+# fused hc_*/gr_* entry point is absent there. Each call site below already carries a
+# torch equivalent, but they were gated on shape and dtype only -- gate on the kernel
+# existing as well and the torch paths take over.
+_HAS_HC_MIX = hasattr(ext, "hc_mix")
+_HAS_HC_APPLY = hasattr(ext, "hc_apply")
+_HAS_HC_HEAD = hasattr(ext, "hc_head")
+_HAS_GR_MIX = hasattr(ext, "gr_mix")
+
+
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
 # the embedding into the streams, each sublayer site mixes them through a HyperConnection
@@ -122,7 +132,7 @@ class HyperConnection(Module):
         # gate on the kernel existing, not just on the shape/dtype it wants. The torch path
         # below is the fallback.
         if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous() \
-                and hasattr(ext, "hc_mix"):
+                and _HAS_HC_MIX:
             R = b * s
             st = streams.view(R, H, D)
             chunks = ext.hc_mix_num_chunks(R, H * D)
@@ -175,7 +185,8 @@ class HyperConnection(Module):
         path: the capture and advance passes forward the SAME stored input states twice."""
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
-        if not converting and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
+        if not converting and _HAS_HC_APPLY \
+                and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
@@ -358,7 +369,7 @@ class GatedResidual(Module):
         post = torch.empty((R, H), dtype = torch.float, device = dev) \
             if self.use_combine else None
 
-        if R <= self.FUSED_MAX_R:
+        if _HAS_GR_MIX and R <= self.FUSED_MAX_R:
             dots = torch.empty((R, self.fn_h.shape[0] + 1, H), dtype = torch.float, device = dev)
             mixed = torch.empty((R, Dh), dtype = torch.half, device = dev)
             ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
@@ -392,7 +403,7 @@ class GatedResidual(Module):
         """Residual update for one sublayer site, in place: x <- x + post (x) y (comb unused).
         Conversion must NOT run the in-place path: the capture and advance passes forward the
         SAME stored input states twice (mHC apply_ has the same guard)."""
-        if "quant_preserve" in params or "capture" in params:
+        if "quant_preserve" in params or "capture" in params or not _HAS_HC_APPLY:
             return x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
         b, s = x.shape[:2]
         y2 = y.reshape(b * s, self.hidden_size)
@@ -552,7 +563,7 @@ class HyperHead(Module):
         if self.mean:
             return x.mean(dim = 2)
         b, s, H, D = x.shape
-        if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
+        if _HAS_HC_HEAD and H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)
             partials = g_tensor_cache.get_bucketed(
