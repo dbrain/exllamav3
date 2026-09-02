@@ -138,17 +138,30 @@ def rms_norm(
     constant_scale: float,
     span_heads: bool,
     add_residual: bool,
+    w_groups: int = 1,
 ) -> None:
+    # norm.cu rms_norm(): span_heads flattens the trailing head dim before norming,
+    # w_groups cycles the weight by row (w += (row % w_groups) * dim), and
+    # add_residual selects RES_POST -- y += norm(x) * w -- rather than overwriting y.
+    if span_heads:
+        x = x.flatten(-2)
+        y = y.flatten(-2)
     xf = x.float()
+    var = xf.pow(2).mean(dim = -1, keepdim = True) + eps
+    out = xf * torch.rsqrt(var)
+    if constant_scale != 1.0:
+        out = out * constant_scale
     if w is not None:
         wf = (w + constant_bias).float() if constant_bias != 0.0 else w.float()
+        if w_groups > 1:
+            rows = out.numel() // out.shape[-1]
+            idx = torch.arange(rows, device = out.device) % w_groups
+            wf = wf.view(w_groups, -1)[idx].view(*out.shape[:-1], -1)
+        out = out * wf
+    if add_residual:
+        y.add_(out.to(y.dtype))
     else:
-        wf = None
-    var = xf.pow(2).mean(dim = -1, keepdim = True) + eps
-    xf = xf * torch.rsqrt(var) * constant_scale
-    if wf is not None:
-        xf = xf * wf
-    y.copy_(xf.to(y.dtype))
+        y.copy_(out.to(y.dtype))
 
 def rms_norm_res_in(
     x: torch.Tensor,
@@ -208,10 +221,15 @@ def gated_rms_norm(
 
 # -- Softcap (softcap.cu) ------------------------------------------------------
 
-def softcap(x: torch.Tensor, cap: float) -> torch.Tensor:
-    if cap == 0.0:
-        return x
-    return torch.tanh(x / cap) * cap
+def softcap(x: torch.Tensor, y: torch.Tensor, softcap_factor: float) -> None:
+    # softcap.cuh is softcap(x, y, factor) writing into y; the call site is
+    # linear.py `ext.softcap(x, x, self.softcap)`, i.e. in place. A 2-arg version
+    # that returns a value raises TypeError there.
+    if softcap_factor == 0.0:
+        if y is not x:
+            y.copy_(x)
+        return
+    y.copy_((torch.tanh(x.float() / softcap_factor) * softcap_factor).to(y.dtype))
 
 
 # -- Sentinel for missing BC_* classes -----------------------------------------

@@ -96,6 +96,7 @@ enum GraphedParams
     GP_dsa_pool_len,
     GP_dsa_T,
     GP_dsa_bound_max,
+    GP_dsa_indices,
 
     GP_moe_bias_add_sel,
     GP_moe_bias_add_weighted_sel,

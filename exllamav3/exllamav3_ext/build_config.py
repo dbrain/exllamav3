@@ -8,7 +8,7 @@ import os
 ROCM_EXCLUDE_DIRS = {'parallel', 'comp_units'}
 
 ROCM_EXCLUDE_FILES = {
-    'norm.cu', 'activation.cu', 'attention.cu', 'routing.cu',
+    'activation.cu', 'attention.cu', 'routing.cu',
     'softcap.cu', 'histogram.cu', 'sam.cpp',
     'cache/q_cache.cu',
     'quant/exl3_gemm.cu', 'quant/exl3_gemv.cu', 'quant/exl3_gemv_int8.cu',

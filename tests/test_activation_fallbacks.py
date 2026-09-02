@@ -63,3 +63,66 @@ def test_gate_fallbacks_match_ext_arity():
     import inspect
     assert len(inspect.signature(fb.add_sigmoid_gate).parameters) == 3
     assert len(inspect.signature(fb.add_sigmoid_gate_proj).parameters) == 4
+
+
+# --- rms_norm (norm.cu) ------------------------------------------------------
+# add_residual selects RES_POST (y += norm(x)*w), NOT overwrite; span_heads flattens
+# the trailing head dim; w_groups cycles the weight by row. #283's version ignored
+# all three, so any residual call silently discarded the residual.
+
+def _ref_norm(x, w, eps, cb, cs):
+    xf = x.float()
+    o = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * cs
+    return o * ((w + cb).float() if cb else w.float()) if w is not None else o
+
+
+def test_rms_norm_plain():
+    torch.manual_seed(20)
+    x = torch.randn(BSZ, H, device=DEV); w = torch.randn(H, device=DEV)
+    y = torch.zeros(BSZ, H, device=DEV)
+    fb.rms_norm(x, w, y, 1e-6, 0.0, 1.0, False, False)
+    torch.testing.assert_close(y, _ref_norm(x, w, 1e-6, 0.0, 1.0), atol=1e-5, rtol=1e-5)
+
+
+def test_rms_norm_add_residual_accumulates():
+    torch.manual_seed(21)
+    x = torch.randn(BSZ, H, device=DEV); w = torch.randn(H, device=DEV)
+    resid = torch.randn(BSZ, H, device=DEV)
+    y = resid.clone()
+    fb.rms_norm(x, w, y, 1e-6, 0.0, 1.0, False, True)
+    torch.testing.assert_close(y, resid + _ref_norm(x, w, 1e-6, 0.0, 1.0),
+                               atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(y, _ref_norm(x, w, 1e-6, 0.0, 1.0)), \
+        "add_residual must accumulate, not overwrite"
+
+
+def test_rms_norm_w_groups_cycles_weight_by_row():
+    torch.manual_seed(22)
+    g, rows = 4, 12
+    x = torch.randn(rows, H, device=DEV); w = torch.randn(g * H, device=DEV)
+    y = torch.zeros(rows, H, device=DEV)
+    fb.rms_norm(x, w, y, 1e-6, 0.0, 1.0, False, False, g)
+    wg = w.view(g, H)
+    for r in range(rows):
+        torch.testing.assert_close(y[r], _ref_norm(x[r:r+1], wg[r % g], 1e-6, 0.0, 1.0)[0],
+                                   atol=1e-5, rtol=1e-5)
+
+
+def test_rms_norm_span_heads_flattens():
+    torch.manual_seed(23)
+    heads, hd = 4, 32
+    x = torch.randn(BSZ, heads, hd, device=DEV)
+    y = torch.zeros(BSZ, heads, hd, device=DEV)
+    fb.rms_norm(x, None, y, 1e-6, 0.0, 1.0, True, False)
+    ref = _ref_norm(x.flatten(-2), None, 1e-6, 0.0, 1.0).view_as(y)
+    torch.testing.assert_close(y, ref, atol=1e-5, rtol=1e-5)
+
+
+def test_softcap_arity_and_inplace():
+    import inspect
+    assert len(inspect.signature(fb.softcap).parameters) == 3
+    torch.manual_seed(24)
+    x = torch.randn(BSZ, H, device=DEV)
+    ref = torch.tanh(x.float() / 30.0) * 30.0
+    fb.softcap(x, x, 30.0)                      # linear.py calls it in place
+    torch.testing.assert_close(x, ref.to(x.dtype), atol=1e-5, rtol=1e-5)
