@@ -739,6 +739,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.num_local_experts, self.num_experts,
         ) and not self.config.infer_params.no_reconstruct
 
+        # The grouped decode path reads no device tensor on the host and its grid depends
+        # only on top_k and N, so the step is static. graph_decode denies BlockSparseMLP by
+        # name otherwise; this cap overrides that. Capture is gated to bsz == 1 there, which
+        # is exactly where the grouped branch applies -- prefill still takes the dense loop
+        if self.mgemm_grouped:
+            self.caps["graph_capturable"] = True
+
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
         # gate pointer tables (never dereferenced, the gate GEMMs are skipped)

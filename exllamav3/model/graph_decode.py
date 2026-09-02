@@ -66,10 +66,11 @@ def _log(msg: str):
 # this set or set caps["graph_capturable"] = True on the module (the cap wins,
 # so a module can opt itself in from its own file without touching this one).
 #
-# BlockSparseMLP: the ROCm fallback path host-syncs on torch.bincount and
+# BlockSparseMLP: the dense per-expert fallback host-syncs on torch.bincount and
 # expert_count.tolist(), then iterates range(num_ex) on the host with
-# data-dependent index_select/index_add_ shapes. Work to make that loop static
-# and device-resident is in flight separately; when it lands, this entry goes.
+# data-dependent index_select/index_add_ shapes. It opts back in from its own
+# file when the grouped Triton mgemm decode path is active, which has none of
+# that; this entry remains the correct default for every other configuration.
 _UNCAPTURABLE_TYPES = frozenset({
     "BlockSparseMLP",
     "QSAIndexer",       # attn.py: qsa_seqlens_cpu.max().item() picks the kernel
