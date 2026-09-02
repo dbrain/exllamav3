@@ -156,7 +156,9 @@ __device__ inline float block_reduce_sum_broadcast_f(float v, int num_threads)
     {
         v = lane_id < max_warp_id ? shared[lane_id] : 0.0f;
         v = warp_reduce_sum_f(v);
-        shared[0] = v;
+        // warp_reduce_sum_f leaves the total in lane 0 only; an unguarded store races
+        // and on AMD LDS the highest lane (holding a partial) wins
+        if (lane_id == 0) shared[0] = v;
     }
     __syncthreads();
     v = shared[0];

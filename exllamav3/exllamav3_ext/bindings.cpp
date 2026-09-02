@@ -16,13 +16,16 @@
 #include "ple.cuh"
 #include "ngram.cuh"
 
+// activation.cu, softcap.cu and routing.cu build on ROCm, so their declarations are
+// hoisted above the CUDA-only include block.
+#include "activation.cuh"
+#include "softcap.cuh"
+#include "routing.cuh"
+
 #if !defined(USE_ROCM)
 
 #include "hgemm.cuh"
 #include "rope.cuh"
-#include "activation.cuh"
-#include "softcap.cuh"
-#include "routing.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
 
@@ -132,18 +135,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
 
-#if !defined(USE_ROCM)
-
+    // activation.cu, softcap.cu and routing.cu build on ROCm
+    m.def("silu_mul", &silu_mul, "silu_mul");
+    m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
+    m.def("gelu_mul", &gelu_mul, "gelu_mul");
+    m.def("relu2_mul", &relu2_mul, "relu2_mul");
+    m.def("relu_mul", &relu_mul, "relu_mul");
+    m.def("xielu", &xielu, "xielu");
+    m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
+    m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
+    m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
+    m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
+    m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
+    m.def("deinterleave_qg", &deinterleave_qg, "deinterleave_qg");
+    m.def("softcap", &softcap, "softcap");
+    m.def("routing_std", &routing_std, "routing_std");
+    m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
+
+#if !defined(USE_ROCM)
+
     m.def("moe_split_map", &moe_split_map, "moe_split_map");
     m.def("moe_split_issue", &moe_split_issue, "moe_split_issue");
     m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
-    m.def("routing_std", &routing_std, "routing_std");
-    m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");
@@ -193,18 +211,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm", &hgemm, "hgemm");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
-    m.def("silu_mul", &silu_mul, "silu_mul");
-    m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
-    m.def("gelu_mul", &gelu_mul, "gelu_mul");
-    m.def("relu2_mul", &relu2_mul, "relu2_mul");
-    m.def("relu_mul", &relu_mul, "relu_mul");
-    m.def("xielu", &xielu, "xielu");
-    m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
-    m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
-    m.def("deinterleave_qg", &deinterleave_qg, "deinterleave_qg");
-    m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
-    m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
-    m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
