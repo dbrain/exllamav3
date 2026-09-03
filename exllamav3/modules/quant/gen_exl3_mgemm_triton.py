@@ -38,10 +38,10 @@ STORE_OUT = (
 BRANCHES = [
     ("bits=4",     818,  819,  843,  845,  886, STORE_ACC),
     ("bits=6",     926,  927,  961,  963, 1004, STORE_OUT),
-    ("bits=1/2/8", 1052, 1053, 1075, 1077, 1124, STORE_ACC),
-    ("bits=3",     1163, 1164, 1188, 1190, 1221, STORE_ACC),
-    ("bits=5/7",   1253, 1254, 1279, 1281, 1299, STORE_ACC),
-    ("generic",    1327, 1328, 1410, 1412, 1429, STORE_ACC),
+    ("bits=1/2/8", 1052, 1053, 1075, 1077, 1126, STORE_ACC),
+    ("bits=3",     1165, 1166, 1190, 1192, 1223, STORE_ACC),
+    ("bits=5/7",   1255, 1256, 1281, 1283, 1301, STORE_ACC),
+    ("generic",    1329, 1330, 1412, 1414, 1431, STORE_ACC),
 ]
 
 # Anchors that must be found at (line, expected prefix); catches a moved source.
@@ -54,34 +54,29 @@ ANCHORS = [
     (1004, "            out = tl.permute(tl.join(h0, h1), (0, 2, 1))"),
     (1052, "    elif (K_BITS == 1 or K_BITS == 2 or K_BITS == 8)"),
     (1076, "        if M1:"),
-    (1163, "    elif K_BITS == 3 and"),
-    (1189, "        if M1:"),
-    (1253, "    elif (K_BITS == 5 or K_BITS == 7)"),
-    (1280, "        if M1:"),
-    (1327, "    else:"),
-    (1411, "        if M1:"),
+    (1165, "    elif K_BITS == 3 and"),
+    (1191, "        if M1:"),
+    (1255, "    elif (K_BITS == 5 or K_BITS == 7)"),
+    (1282, "        if M1:"),
+    (1329, "    else:"),
+    (1413, "        if M1:"),
 ]
 
-# Upstream bug fixed on the way in. The K_BITS==8 M1 reduction leaves `s` as
+# (Historical) The K_BITS==8 M1 reduction left `s` as
 # (nj, c3, cl) where the shared tail expects (c3, nj, cl), so the output tile is
 # a permutation of the right values whenever NN > 1 (BLOCK_N > 16). Verified
 # against ext.reconstruct: the repo kernel is off by ~85-175% of peak at
 # BLOCK_N 32/64/128 for K_BITS=8 while its own M>1 tensor-core branch is
 # correct to 3e-4, and every other width (1-7) is correct at M==1. Accidentally
-# correct at BLOCK_N=16 (NN==1), which is why the generic/narrow shapes pass.
+# correct at BLOCK_N=16 (NN==1), which is why it went unnoticed. Now fixed in
+# exl3_triton.py itself (tests/test_exl3_triton_bits8.py), so FIXES is empty
+# and the M1 branch is copied verbatim with no deviation.
 #
 # This is the ONE place the copy deviates from exl3_triton.py; everything else
 # is verbatim.
-FIXES = [(
-    "            s = tl.sum(tl.sum(tl.sum(tl.sum(acc7, 0), 0), 2), 2)     # -> (nj, cl, c3)\n"
-    "            s = tl.permute(s, (0, 2, 1))\n",
-    "            s = tl.sum(tl.sum(tl.sum(tl.sum(acc7, 0), 0), 2), 2)     # -> (nj, cl, c3)\n"
-    "            # UPSTREAM FIX (see _gen.py): the shared tail below wants\n"
-    "            # (c3, nj, cl); exl3_triton.py has (0, 2, 1) here, which only\n"
-    "            # happens to be right when NN == 1.\n"
-    "            s = tl.permute(s, (2, 0, 1))\n",
-)]
-
+# Upstream exl3_triton.py now carries the (2, 0, 1) permute fix, so the M1 branch
+# is copied with no deviation at all.
+FIXES = []
 # Names that only exist in the non-M1 / split-K halves of the source kernel.
 FORBIDDEN = ("BLOCK_M", "offs_m", "mask_m", "pid_split", "stride_ys", "SPLITS", "M1")
 
