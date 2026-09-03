@@ -62,7 +62,13 @@ _NOISE_TOLERANCE = float(os.environ.get("EXL3_DECODE_GRAPH_NOISE_TOL", "4"))
 
 # Eager samples used to estimate that spread. Must be >= 2; 3 costs one extra
 # forward at capture time and avoids a lucky identical pair reading as 0 noise.
-_NOISE_SAMPLES = max(2, int(os.environ.get("EXL3_DECODE_GRAPH_NOISE_SAMPLES", "3")))
+# Six, not three. The spread between two eager runs of the same span is bimodal
+# on 35B-A3B -- measured as exactly 0.0 or exactly 3.477e-01, nothing between --
+# so a floor estimated from too few samples lands on 0, collapses the budget to
+# the 1e-3 absolute floor, and rejects a sound graph. Measured over 12 trials,
+# a 3-sample floor (3 pairs) read 0 in 3 of them; 6 samples gives 15 pairs and
+# takes that to ~0.1%.
+_NOISE_SAMPLES = max(2, int(os.environ.get("EXL3_DECODE_GRAPH_NOISE_SAMPLES", "6")))
 
 
 def _log(msg: str):
