@@ -191,3 +191,67 @@ def test_signature_ignores_buffer_contents():
 def test_recurrent_state_tensors_empty_for_dense():
     assert gd._recurrent_state_tensors({}) == []
     assert gd._recurrent_state_tensors({"recurrent_states": None}) == []
+
+
+# ------------------------------------------------------------------- QSA regime
+
+def FakeIndexer(threshold = 2051):
+    m = FakeMod("QSAIndexer", "blk.attn.indexer")
+    m.sparse_threshold = lambda: threshold
+    return m
+
+
+def _qsa_attn(threshold = 2051):
+    """A full-attention block carrying an indexer, as Flash-Next builds."""
+    idx = FakeIndexer(threshold)
+    attn = FakeMod("Attention", "blk.attn", {}, subs = [idx])
+    attn.qsa_indexer = idx
+    return _blk([attn], key = "blk.full")
+
+
+def test_qsa_module_capturable_only_in_the_dense_regime():
+    idx = FakeIndexer()
+    assert gd._module_capturable(idx, qsa_dense = True) is True
+    assert gd._module_capturable(idx, qsa_dense = False) is False
+
+
+def test_qsa_layers_are_captured_below_the_threshold_and_islands_above():
+    """Flash-Next shape: every 4th block is full attention with an indexer."""
+    mods = [_emb(), _blk(), _blk(), _qsa_attn(), _blk(), _head()]
+    g, ok, _ = _plan(mods)
+    assert ok
+    # dense regime: the QSA block folds into one big span
+    assert _spans(g.layouts[True]) == [("e", 0, 1), ("G", 1, 6)]
+    # sparse regime: it becomes an eager island
+    assert _spans(g.layouts[False]) == [("e", 0, 1), ("G", 1, 3), ("e", 3, 4), ("G", 4, 6)]
+    assert g.qsa_threshold == 2051
+
+
+def test_qsa_regime_flips_at_the_threshold():
+    g, _, _ = _plan([_emb(), _qsa_attn(threshold = 2051), _head()])
+    def cs(n): return torch.full((1,), n, dtype = torch.int32)
+    assert g._qsa_regime({"cache_seqlens": cs(2049)}) is True   # 2049 + 1 <= 2051
+    assert g._qsa_regime({"cache_seqlens": cs(2050)}) is True   # 2050 + 1 <= 2051
+    assert g._qsa_regime({"cache_seqlens": cs(2051)}) is False  # crossed
+
+
+def test_qsa_regime_is_in_the_signature():
+    """Crossing the threshold must mint a new graph, not replay the wrong branch."""
+    g, _, _ = _plan([_emb(), _qsa_attn(), _head()])
+    def p(n): return {"block_table": _BT,
+                      "cache_seqlens": torch.full((1,), n, dtype = torch.int32)}
+    assert g._signature(_ID1, p(10)) != g._signature(_ID1, p(4000))
+    assert g._signature(_ID1, p(10)) == g._signature(_ID1, p(20))
+
+
+def test_qsa_regime_is_conservative_when_seqlens_are_on_device():
+    """Reading a device tensor would sync; treat the step as sparse instead."""
+    g, _, _ = _plan([_emb(), _qsa_attn(), _head()])
+    dev_cs = torch.zeros(1, dtype = torch.int32, device = "meta")
+    assert g._qsa_regime({"cache_seqlens": dev_cs}) is False
+
+
+def test_no_indexer_means_no_regime_split():
+    g, ok, _ = _plan([_emb(), _blk(), _head()])
+    assert ok and g.qsa_threshold is None
+    assert set(g.layouts) == {False}
