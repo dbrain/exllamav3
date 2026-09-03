@@ -1120,7 +1120,9 @@ def _fused_dequant_gemm_kernel(
                 s = tl.sum(tl.sum(tl.sum(tl.sum(acc7, 0), 1), 1), 3)     # -> (c3, nj, cl)
             else:
                 s = tl.sum(tl.sum(tl.sum(tl.sum(acc7, 0), 0), 2), 2)     # -> (nj, cl, c3)
-                s = tl.permute(s, (0, 2, 1))
+                # the shared tail indexes n = 16*nj + 8*c3 + cl, so it wants
+                # (c3, nj, cl); (0, 2, 1) is only right when NN == 1
+                s = tl.permute(s, (2, 0, 1))
             acc = tl.reshape(tl.permute(s, (1, 0, 2)), (BLOCK_N,))       # n = 16*nj + 8*c3 + cl
             tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
         else:
