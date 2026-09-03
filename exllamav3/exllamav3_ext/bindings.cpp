@@ -22,6 +22,9 @@
 #include "softcap.cuh"
 #include "routing.cuh"
 
+// gdn.cu builds on ROCm, so its declarations sit above the CUDA-only block
+#include "gdn.cuh"
+
 #if !defined(USE_ROCM)
 
 #include "hgemm.cuh"
@@ -155,6 +158,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
 
+    // gdn.cu builds on ROCm (cuda_recurrent_gated_delta_rule comes from it), so the
+    // recurrent rewind bindings belong above the CUDA-only block. Speculative decoding
+    // rewinds conv and SSM state whenever a draft token is rejected, so a recurrent
+    // model cannot spec-decode without them.
+    py::class_<ConvRewindJob>(m, "ConvRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
+    py::class_<StateRewindJob>(m, "StateRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+
 #if !defined(USE_ROCM)
 
     m.def("moe_split_map", &moe_split_map, "moe_split_map");
@@ -229,12 +243,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         { kda_gate_op_gr(qkv, b, f, dt_bias, a_log, mixed_qkv, beta, g, lower_bound, beta_scale, nullptr); },
         "kda_gate_op");
 
-    py::class_<ConvRewindJob>(m, "ConvRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
-    py::class_<StateRewindJob>(m, "StateRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int64_t>());
-    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
-    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
