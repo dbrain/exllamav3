@@ -1,5 +1,6 @@
 *.egg-info/
 build/
+uv.lock
 
 *.pyc
 __pycache__/
@@ -9,7 +10,6 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
-
 # hipify-generated files
 exllamav3/exllamav3_ext/**/*_hip.*
 exllamav3/exllamav3_ext/**/*.hip

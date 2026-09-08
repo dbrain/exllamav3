@@ -304,11 +304,11 @@ if has_triton:
                 # the dequantized fp16 tile for the score dot (QC_TRANS 1) -- the transpose is of
                 # a plain fp16 value, not of loader interleave output (the miscompiling shape)
                 if QC_TRANS:
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
                     kt = tl.trans(v_tile)
                 else:
-                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
             else:
                 # V is K: load the latent tile once, transpose it for the score dot
                 v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
@@ -476,11 +476,11 @@ if has_triton:
 
             if QC > 0:
                 if QC_TRANS:
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
                     kt = tl.trans(v_tile)
                 else:
-                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
             else:
                 v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
                                  mask = in_range[:, None], other = 0.0)
@@ -546,7 +546,7 @@ if has_triton:
 
         offs_c = tl.arange(0, D_c)
         if QC > 0:
-            tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+            tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
             # h32 is symmetric orthonormal, so the same multiply that rotates also unrotates
             tile = _rot_h32(tile, h32, BLOCK_R, D_c)
         else:
@@ -1107,17 +1107,18 @@ def mla_attn_triton_prefill_mha(
     else:
         ckv_scales, qc_bits, h32 = q, 0, q
 
-    # Workspace is bounded by (tile_size, chunk length), NOT by context length, and shared
-    # across layers on the same device via g_tensor_cache. Layers run sequentially on the
-    # device's stream, so one set of buffers serves all of them (the BC-attention statics
-    # pattern). Only ONE tile of up-projected K/V ever exists at a time
+    # Workspace is bounded by (tile_size, chunk length), NOT by context length, and only ONE tile
+    # of up-projected K/V ever exists at a time. These are prefill-sized (128 MiB per buffer at a
+    # 2048-row tile), so they are allocated per call from the caching allocator rather than kept
+    # in g_tensor_cache, which is reserved for small buffers; a caller that runs the same shape
+    # repeatedly can pass its own scratch dict
     def sbuf(key, shape, dtype):
         if scratch is not None:
             buf = scratch.get(key)
             if buf is None or buf.shape != torch.Size(shape):
                 buf = scratch[key] = torch.empty(shape, dtype = dtype, device = dev)
             return buf
-        return g_tensor_cache.get(dev, shape, dtype, "mla_" + key)
+        return torch.empty(shape, dtype = dtype, device = dev)
 
     ts = tile_size
     ckv_t = sbuf("mha_ckv", (ts, D_c), torch.half)
