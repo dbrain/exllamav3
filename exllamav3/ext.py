@@ -208,7 +208,8 @@ if torch.version.hip:
         'quant_cache_paged', 'dequant_cache_paged', 'dequant_cache_paged_window',
         'BC_SAM',
         'exl3_moe_cpu_set_memops', 'exl3_moe_cpu_set_prof',
-        'exl3_moe_cpu_has_avx2', 'exl3_moe_cpu_has_avx512_vnni', 'exl3_moe_cpu_has_avx512_vbmi',
+        'exl3_moe_cpu_has_avx2', 'exl3_moe_cpu_has_avx512_bw',
+        'exl3_moe_cpu_has_avx512_vnni', 'exl3_moe_cpu_has_avx512_vbmi',
         'exl3_moe_cpu_make_layer', 'exl3_moe_cpu_free_layer', 'exl3_moe_cpu_forward',
         'exl3_moe_cpu_worker_run', 'exl3_moe_cpu_pool_stress',
     ]:

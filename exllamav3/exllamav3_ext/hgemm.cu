@@ -101,6 +101,15 @@ void hgemm
     hgemm_gr(a, b, c, nullptr);
 }
 
+#if defined(USE_ROCM)
+// hgemm_f16acc.cu is excluded from the ROCm build (raw PTX: cp.async / ldmatrix / mma.sync),
+// so the fp16-accumulator probe never fires and every caller takes the hipBLAS path
+bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c) { return false; }
+int hgemm_f16acc_status(int device) { return 0; }
+void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c) { hgemm(a, b, c); }
+void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c) { hgemm(a, b, c); }
+#endif
+
 /*
 Strided-batched row-major matmul, a[b] @ w[b] -> c[b] for b in [0, B), fp16 inputs with fp32
 accumulation (same cuBLAS setup as hgemm). a: [B, m, k], w: [B, k, n], c: [B, m, n], all

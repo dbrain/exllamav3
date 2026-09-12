@@ -428,6 +428,10 @@ def exl3_moe_cpu_has_avx2() -> bool:
     return False
 
 
+def exl3_moe_cpu_has_avx512_bw() -> bool:
+    return False
+
+
 def exl3_moe_cpu_has_avx512_vnni() -> bool:
     return False
 
