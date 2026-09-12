@@ -49,21 +49,22 @@ def _run(hidden, gate, gate_t, M, arm):
             os.environ["EXL3_ROUTING_GEMV"] = prev
 
 
+@pytest.mark.parametrize("arm", ["multi", "multi4"])
 @pytest.mark.parametrize("M", list(range(2, MAX_M + 1)))
-def test_multi_no_worse_than_hgemm(M):
+def test_multi_no_worse_than_hgemm(M, arm):
     hidden, gate, gate_t = _mk(M, seed = 1000 + M)
     ref = (hidden.float() @ gate.float())
 
     s_base, i_base, w_base = _run(hidden, gate, gate_t, M, None)
-    s_mult, i_mult, w_mult = _run(hidden, gate, gate_t, M, "multi")
+    s_mult, i_mult, w_mult = _run(hidden, gate, gate_t, M, arm)
 
     e_base = (s_base.float() - ref).abs().max().item()
     e_mult = (s_mult.float() - ref).abs().max().item()
     assert e_mult <= max(e_base * 1.5, 4e-3), \
-        f"M={M}: multi err {e_mult:.3e} vs hgemm err {e_base:.3e}"
+        f"M={M} arm={arm}: multi err {e_mult:.3e} vs hgemm err {e_base:.3e}"
 
     assert torch.equal(i_base.sort(dim = 1).values, i_mult.sort(dim = 1).values), \
-        f"M={M}: top-{TOPK} selection differs"
+        f"M={M} arm={arm}: top-{TOPK} selection differs"
     assert (w_base.float() - w_mult.float()).abs().max().item() < 4e-3
 
 
@@ -80,19 +81,30 @@ def test_knob_is_read_per_call():
     assert (b.float() - ref).abs().max().item() < 5e-2
 
 
+@pytest.mark.parametrize("arm", ["multi", "multi4"])
 @pytest.mark.parametrize("M", [MAX_M + 1, 64])
-def test_above_max_m_falls_back(M):
+def test_above_max_m_falls_back(M, arm):
     hidden, gate, gate_t = _mk(M, seed = 2000 + M)
     s_base = _run(hidden, gate, gate_t, M, None)[0]
-    s_mult = _run(hidden, gate, gate_t, M, "multi")[0]
+    s_mult = _run(hidden, gate, gate_t, M, arm)[0]
     assert torch.equal(s_base, s_mult), f"M={M} should fall back to hgemm, bit-identically"
 
 
-def test_bsz1_unaffected():
+@pytest.mark.parametrize("arm", ["multi", "multi4"])
+def test_bsz1_unaffected(arm):
     hidden, gate, gate_t = _mk(1, seed = 3)
     s_base = _run(hidden, gate, gate_t, 1, None)[0]
-    s_mult = _run(hidden, gate, gate_t, 1, "multi")[0]
+    s_mult = _run(hidden, gate, gate_t, 1, arm)[0]
     assert torch.equal(s_base, s_mult), "bsz 1 already had its own kernel; multi must not change it"
+
+
+def test_unknown_arm_value_is_off():
+    """An unrecognised value must fall back, not silently pick a kernel."""
+    M = 7
+    hidden, gate, gate_t = _mk(M, seed = 11)
+    s_base = _run(hidden, gate, gate_t, M, None)[0]
+    s_junk = _run(hidden, gate, gate_t, M, "yes")[0]
+    assert torch.equal(s_base, s_junk)
 
 
 def test_non_contiguous_hidden_falls_back():

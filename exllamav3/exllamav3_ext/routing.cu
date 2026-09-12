@@ -246,13 +246,77 @@ void routing_gemv_m_kernel
     }
 }
 
+// Same decomposition, 16-byte loads. The half2 version issues one 4-byte load per lane per
+// iteration (40 iterations at k = 2560); this issues one 16-byte load (10 iterations), which
+// is the usual way to close the gap between a coalesced-but-narrow read and the bus. Needs
+// k % 8 == 0. Register cost is M accumulators plus two float4 staging regs, which the ISA
+// dump must confirm still fits 16 waves/SIMD before any timing is believed.
+template <int M>
+__global__ __launch_bounds__(RGEMV_WARPS * 32)
+void routing_gemv_m4_kernel
+(
+    const half* __restrict__ x,         // (M, k)
+    const half* __restrict__ gate_t,    // (E, k)
+    half* __restrict__ scores,          // (M, E)
+    const int k,
+    const int E
+)
+{
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * RGEMV_WARPS + warp;
+    if (row >= E) return;
+
+    const int k8 = k / 8;
+    const float4* w4 = (const float4*) (gate_t + (size_t) row * k);
+    const float4* x4 = (const float4*) x;
+
+    float sum[M];
+    #pragma unroll
+    for (int m = 0; m < M; ++m) sum[m] = 0.0f;
+
+    for (int j = lane; j < k8; j += 32)
+    {
+        float4 wv = w4[j];
+        const half2* wh = (const half2*) &wv;
+        #pragma unroll
+        for (int m = 0; m < M; ++m)
+        {
+            float4 xv = x4[(size_t) m * k8 + j];
+            const half2* xh = (const half2*) &xv;
+            #pragma unroll
+            for (int t = 0; t < 4; ++t)
+            {
+                float2 wf = __half22float2(wh[t]);
+                float2 xf = __half22float2(xh[t]);
+                sum[m] = fmaf(xf.x, wf.x, sum[m]);
+                sum[m] = fmaf(xf.y, wf.y, sum[m]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < M; ++m)
+    {
+        float v = sum[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xffffffffu, v, offset);
+        if (lane == 0) scores[(size_t) m * E + row] = __float2half_rn(v);
+    }
+}
+
 // EXL3_ROUTING_GEMV: read per call so both arms interleave in one process. "multi" takes the
 // M-row kernel for 1 < M <= ROUTING_GEMV_MAX_M; anything else keeps the hgemm fallthrough.
 // bsz == 1 is unaffected either way -- it already had its own kernel.
-static bool routing_gemv_multi_env()
+// 0 = off, 1 = half2 loads ("multi"), 2 = float4 loads ("multi4")
+static int routing_gemv_multi_env()
 {
     const char* e = getenv("EXL3_ROUTING_GEMV");
-    return e && !strcmp(e, "multi");
+    if (!e) return 0;
+    if (!strcmp(e, "multi")) return 1;
+    if (!strcmp(e, "multi4")) return 2;
+    return 0;
 }
 
 // On a shared .so a sha names a BUILD, not a CHANGE (trap 39), and a silent fallback here
@@ -307,8 +371,12 @@ void routing_gemv
             half* sp = (half*) scores.data_ptr();
             dim3 grid(CEIL_DIVIDE(E, RGEMV_WARPS));
             dim3 block(RGEMV_WARPS * 32);
-            #define ROUTING_GEMV_CASE(N) \
-                case N: routing_gemv_m_kernel<N><<<grid, block, 0, stream>>>(xp, wp, sp, k, E); break;
+            const bool v4 = (routing_gemv_multi_env() == 2) && (k % 8 == 0);
+            #define ROUTING_GEMV_CASE(N)                                                     \
+                case N:                                                                      \
+                    if (v4) routing_gemv_m4_kernel<N><<<grid, block, 0, stream>>>(xp, wp, sp, k, E); \
+                    else    routing_gemv_m_kernel<N> <<<grid, block, 0, stream>>>(xp, wp, sp, k, E); \
+                    break;
             switch (M)
             {
                 ROUTING_GEMV_CASE(2)  ROUTING_GEMV_CASE(3)  ROUTING_GEMV_CASE(4)
@@ -319,7 +387,8 @@ void routing_gemv
                 default: hgemm(hidden, gate, scores); break;
             }
             #undef ROUTING_GEMV_CASE
-            routing_gemv_note("multi-row kernel live", M);
+            routing_gemv_note(v4 ? "multi-row kernel live (float4 loads)"
+                                 : "multi-row kernel live (half2 loads)", M);
         }
         else
         {

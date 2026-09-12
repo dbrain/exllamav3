@@ -224,6 +224,10 @@ def routing_dots(bsz, cfg, y, params):
             )
         else:
             router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+            # Same defect as routing_std's bsz > 1 branch: without gate_t the router GEMV
+            # falls through to hgemm for every multi-row call
+            if cfg.gate_tensor_t is None:
+                cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
             ext.routing_ds3_nogroup(
                 y,
                 cfg.gate_tensor,
@@ -232,7 +236,7 @@ def routing_dots(bsz, cfg, y, params):
                 selected_experts,
                 routing_weights,
                 cfg.routed_scaling_factor,
-                None,
+                cfg.gate_tensor_t,
                 ROUTING_ACT_SIGMOID,
             )
         return selected_experts, routing_weights
