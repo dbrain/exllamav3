@@ -11,6 +11,7 @@
 #include "graph.cuh"
 #include "gdn.cuh"
 #include <cmath>
+#include <cstdlib>
 
 using bfloat16 = __nv_bfloat16;
 #define MAX_K_HEADS 32
@@ -929,6 +930,20 @@ void cuda_recurrent_gated_delta_rule_gr
     }
 
     int v_split = (bsz == 1 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
+    // EXL3_GDN_V_SPLIT: read per call so both arms interleave in one process. v_split 4
+    // quarters each block's slice of the state columns and quadruples the grid, but leaves
+    // 3/4 of the 128-wide x dimension inactive in the state loops (`active = t < V_CHUNK_DIM`)
+    // while those threads still hold registers, run the q/k norm and hit every __syncthreads.
+    // Which side of that trade wins is a per-part occupancy question. Only 1 and 4 exist --
+    // the launcher's template dispatch is a 4-or-1 branch and threads.x is sized from the same
+    // value, so anything else would run the wrong kernel against the wrong block shape. Never
+    // force 4 where the guard above chose 1 (bsz > 1 or a non-128 head dim); that is a
+    // correctness condition, not a heuristic.
+    if (const char* vs = getenv("EXL3_GDN_V_SPLIT"))
+    {
+        int want = atoi(vs);
+        if (want == 1 || (want == 4 && v_split == 4)) v_split = want;
+    }
     TORCH_CHECK(v_head_dim % v_split == 0, "v_head_dim must be divisible by v_split");
 
     dim3 blocks(bsz, num_v_heads, v_split);  // group * num_k_heads

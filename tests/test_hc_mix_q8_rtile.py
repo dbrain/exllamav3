@@ -25,6 +25,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import pytest
 import torch
 from exllamav3.ext import exllamav3_ext as ext
 
@@ -106,6 +107,33 @@ def check_mixed_width(device, mode, R, seed):
 
 def _device():
     return torch.device(os.environ.get("EXL3_TEST_DEVICE", "cuda:0"))
+
+
+@pytest.fixture(params = ("default", "2", "4", "8"), autouse = True)
+def j_tile(request, monkeypatch):
+    """EXL3_HC_J_TILE gives each gr_dots block J fn rows instead of one, so the stream slice
+    is read once per J weight rows instead of once per row. For a fixed (stream row, fn row)
+    the accumulation walks c in the same order with the same eight fmas, so every width must
+    be BIT-IDENTICAL, not merely close -- `check_exact` and `check_row_invariance` are what
+    prove it (R = 1 always runs the untiled kernel, whatever J is)."""
+    if request.param == "default":
+        monkeypatch.delenv("EXL3_HC_J_TILE", raising = False)
+    else:
+        monkeypatch.setenv("EXL3_HC_J_TILE", request.param)
+    return request.param
+
+
+@pytest.fixture(params = ("default", "4", "2"), autouse = True)
+def r_tile(request, monkeypatch):
+    """EXL3_HC_R_TILE picks between the compiled R_TILE widths at launch time, so the whole
+    gate has to hold under each: the header's contract is that tiling changes the weight
+    read count and nothing else, and row invariance is what proves it (R = 1 always runs the
+    untiled kernel, whatever the tile width)."""
+    if request.param == "default":
+        monkeypatch.delenv("EXL3_HC_R_TILE", raising = False)
+    else:
+        monkeypatch.setenv("EXL3_HC_R_TILE", request.param)
+    return request.param
 
 
 def test_ref():

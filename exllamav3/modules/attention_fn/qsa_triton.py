@@ -29,6 +29,8 @@ paged/BC form runs decode rows (q_len == 1), the flat form any (B * S) row set. 
 runtime arguments or derived on device, so the kernels are CUDA-graph-safe.
 """
 
+import os
+
 import torch
 
 try:
@@ -283,6 +285,24 @@ if has_triton:
         return _sm_counts[dev.index]
 
 
+    def _qsa_sparse_splits(dev, programs, k_pad, block_n):
+        """Flash-decoding split count for the gathered-GQA kernel.
+
+        The stock target is 2 * CU count, inherited from the large-SM parts the split/combine
+        pair was written on. An M=7 verify here launches programs = 7 * 2 * 1 = 14, so on a
+        16-CU part the target admits 2 splits = 28 workgroups, a 1.75/CU tail on a kernel that
+        is a pure gather. Splitting costs partial_o/partial_ml traffic and a wider combine but
+        NOT K/V bytes -- the splits read disjoint slices of the same index list -- so the
+        optimum is an occupancy question and has to be measured, not derived. Read per call so
+        both arms interleave in one process.
+        """
+        t = os.environ.get("EXL3_QSA_SPLIT_TARGET")
+        mult = 2 if t is None else int(t)
+        if mult <= 0:
+            return 1
+        return max(1, min(mult * _get_sms(dev) // programs, -(-k_pad // (4 * block_n)), 128))
+
+
     def qsa_sparse_attend_rows(
         q: torch.Tensor,               # (R, n_q_heads, head_dim) fp16, normed + roped
         k: torch.Tensor,               # (rows, n_kv_heads, head_dim) fp16 (paged: flat cache view)
@@ -325,7 +345,7 @@ if has_triton:
             and indices.is_contiguous() and k_scales.is_contiguous() and v_scales.is_contiguous()
         assert not paged or (block_table.is_contiguous() and block_table.shape[0] == R)
 
-        splits = max(1, min(2 * _get_sms(dev) // programs, -(-K_pad // (4 * BLOCK_N)), 128))
+        splits = _qsa_sparse_splits(dev, programs, K_pad, BLOCK_N)
         per_split = -(-K_pad // splits)
         split_len = -(-per_split // BLOCK_N) * BLOCK_N
         partial_o = torch.empty((programs * splits * BLOCK_H * hd,), dtype = torch.float, device = dev)

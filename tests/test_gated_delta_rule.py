@@ -143,6 +143,24 @@ def _run_chunk_gated_delta_rule(
     return out.to(torch.bfloat16), final_state
 
 
+@pytest.fixture(params = ["default", "4", "1"], autouse = True)
+def gdn_v_split(request, monkeypatch):
+    """EXL3_GDN_V_SPLIT selects the recurrent kernel's grid.z / column split at launch.
+
+    The two geometries partition the SAME 128 k-rows across the SAME SUBK y-threads and
+    differ only in which block owns which v columns, so both must reproduce the reference.
+    v_split 4 is the stock heuristic; v_split 1 is what ships here (it leaves no inactive
+    threads holding registers through the q/k norm and every __syncthreads). The launcher
+    refuses to raise 1 -> 4 where the shape guard chose 1, so "4" is a request, not an
+    override -- bsz > 1 and non-128 head dims stay at 1 under every value.
+    """
+    if request.param == "default":
+        monkeypatch.delenv("EXL3_GDN_V_SPLIT", raising = False)
+    else:
+        monkeypatch.setenv("EXL3_GDN_V_SPLIT", request.param)
+    return request.param
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
 @pytest.mark.parametrize("history", [False, True])
 @pytest.mark.parametrize(
@@ -423,3 +441,61 @@ def test_cuda_gated_delta_rule_history_slots_are_per_step(seqlen):
     for t in range(1, seqlen - 1):
         assert not torch.allclose(cuda_state[1, t], cuda_state[1, t + 1], rtol = 1e-3, atol = 1e-3), \
             f"history slots {t} and {t + 1} are identical; the per-step state is not advancing"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize(
+    "bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
+    [
+        (1, 7, 16, 48, 128, 128),   # the deployed ndt6 verify
+        (1, 1, 16, 48, 128, 128),   # plain decode
+        (1, 8, 16, 48, 128, 128),
+        (1, 15, 16, 32, 128, 128),
+    ],
+)
+@torch.inference_mode()
+def test_v_split_geometries_agree(
+    monkeypatch,
+    gdn_v_split,
+    history,
+    bsz,
+    seqlen,
+    num_k_heads,
+    num_v_heads,
+    k_head_dim,
+    v_head_dim,
+):
+    """v_split 1 and 4 must produce the same output and the same state.
+
+    They are the same arithmetic in a different block decomposition, so this is a much
+    tighter gate than either arm's 5e-2 agreement with the torch reference. It is not a
+    bitwise gate: sh_dot1/sh_dot2 are LDS atomicAdd fan-ins over SUBK contributors in
+    unspecified order, which is a float reassociation present in BOTH arms equally.
+    """
+    torch.manual_seed(4321)
+    qkv_dim = 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim
+    state_len = seqlen if history else 1
+    num_slots = bsz + 2
+
+    mixed_qkv = (torch.randn((bsz, seqlen, qkv_dim), dtype = torch.float, device = device) * 0.25).bfloat16()
+    g = torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device) * 0.5 - 1.0
+    beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
+    state0 = torch.randn(
+        (num_slots, state_len, num_v_heads, k_head_dim, v_head_dim),
+        dtype = torch.float,
+        device = device,
+    ) * 0.05
+    slots = torch.arange(bsz, dtype = torch.int32, device = device) + 1
+
+    outs = {}
+    for want in ("1", "4"):
+        monkeypatch.setenv("EXL3_GDN_V_SPLIT", want)
+        outs[want] = _run_cuda_gated_delta_rule(
+            mixed_qkv, g, beta, state0.clone(), slots, history,
+            num_k_heads, num_v_heads, k_head_dim, v_head_dim,
+        )
+
+    torch.testing.assert_close(outs["1"][0], outs["4"][0], rtol = 1e-3, atol = 1e-3)
+    torch.testing.assert_close(outs["1"][1][:, :state_len], outs["4"][1][:, :state_len],
+                               rtol = 1e-3, atol = 1e-3)

@@ -221,10 +221,16 @@ class GTensorCache:
 
     def get(self, device, shape, dtype, x = ""):
         key = self.make_key(device, shape, dtype, x)
-        if key not in self.cache:
-            refc, v = (0, torch.empty(shape, dtype = dtype, device = device))
-        else:
-            refc, v = self.cache[key]
+        refc, v = self.cache.get(key, (0, None))
+        # A tensor allocated inside inference_mode stays an inference tensor for life, and an
+        # in-place write to one outside that scope raises. This cache is global and outlives
+        # both scopes, so a workspace first taken during a forward would poison its tag for
+        # every later non-inference user -- GatedResidual._prepare copy_s into gr_prep_tmp at
+        # load time, which is exactly that shape.
+        if v is not None and v.is_inference() and not torch.is_inference_mode_enabled():
+            refc, v = 0, None
+        if v is None:
+            v = torch.empty(shape, dtype = dtype, device = device)
         self.cache[key] = (refc + 1, v)
         return v
 

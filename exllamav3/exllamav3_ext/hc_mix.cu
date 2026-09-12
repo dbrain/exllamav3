@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include "hc_mix.cuh"
 #include <c10/cuda/CUDAGuard.h>
@@ -689,6 +690,33 @@ small blocks need, so R = 1 decode keeps the untiled geometry.
 #define GR_R_TILE 4
 #define GR_RTILE_MIN_R 2
 
+// EXL3_HC_R_TILE: pick between the compiled R_TILE widths per call, so both arms interleave
+// in one process instead of costing a rebuild and a cross-process comparison. Only 2 and 4
+// are instantiated: 8 was measured (+29-30%, vgpr 256 / spill 76 / scratch 308 B) and is not
+// compiled, so nothing can select it by accident.
+static inline int gr_r_tile_env()
+{
+    if (const char* e = getenv("EXL3_HC_R_TILE"))
+    {
+        int v = atoi(e);
+        if (v == 2 || v == 4) return v;
+    }
+    return GR_R_TILE;
+}
+
+// EXL3_HC_J_TILE: fn rows per gr_dots block. 1 = the one-row-per-block kernel. Read per call.
+#define GR_J_TILE 1
+
+static inline int gr_j_tile_env()
+{
+    if (const char* e = getenv("EXL3_HC_J_TILE"))
+    {
+        int v = atoi(e);
+        if (v == 1 || v == 2 || v == 4 || v == 8) return v;
+    }
+    return GR_J_TILE;
+}
+
 template <int H, int R_TILE>
 __global__ __launch_bounds__(GR_THREADS_A)
 void gr_dots_q8_rt_kernel
@@ -779,6 +807,155 @@ void gr_dots_q8_rt_kernel
         for (int w = 0; w < GR_THREADS_A / 32; ++w)
             v += red[t][hh][w];
         // Row M is the sum of squares of the raw streams, not a weight dot: unscaled
+        if (j < M) v *= __half2float(fn_scale[(size_t) j * H + hh]);
+        dots[((size_t) (r0 + t) * (M + 1) + j) * H + hh] = v;
+    }
+}
+
+/*
+
+J-tiled gr_dots. The R-tiled kernel above grids on (M + 1, n_rtiles) and gives each block ONE
+fn row, so every block re-reads the SAME R_TILE stream rows: per r-tile it reads 3.32 MB of fn
+and 325 x R_TILE x H x D x 4 B = 53.2 MB of streams at the Flash-Next shape. The streams are
+164 KB and L2-resident, so this is not DRAM traffic -- but it is 16x the weight traffic through
+L2, and it is what the measured cost model says dominates the call:
+
+    us(R, tiles) ~= 51 fixed + 98 per r-tile + 18.8 PER ROW   (perf/exl3/ledger-hcbound.csv)
+
+98 us for the 6.59 MB a tile reads is 67 GB/s against the 86.4 ceiling -- the weight side is
+already near the wall. The 18.8 us/row is 13.3 MB of stream re-reads at ~700 GB/s, i.e. L2
+rate, and at the deployed R = 7 it is 132 of ~379 us, 35% of the call.
+
+J_TILE fn rows per block divides that term by J_TILE: the streams for a c-slice are loaded once
+and applied to J_TILE weight rows. Nothing else changes -- for a fixed (t, u) the accumulation
+walks c in exactly the original order with exactly the original 8 fmas, so `a` is bit-identical
+to the untiled kernel's. The row-M norm branch (sum of squares of the raw streams) keeps its own
+c loop at its own stride precisely so its per-lane partition is unchanged; folding it into the
+J loop would re-associate it and break bit-exactness against the fp16 path.
+
+Registers are the risk, not the arithmetic: `float a[R_TILE][J_TILE]` plus the hoisted
+`float4 s0/s1[R_TILE]`. Read vgpr_count / vgpr_spill_count off the code object before believing
+any timing -- three levers on this part have died at a wider tile (perf/exl3/kstats.sh).
+
+*/
+
+template <int H, int R_TILE, int J_TILE>
+__global__ __launch_bounds__(GR_THREADS_A)
+void gr_dots_q8_rtj_kernel
+(
+    const float* __restrict__ streams,   // (R, H, D)
+    const int8_t* __restrict__ fn,       // (M, H * D) int8
+    const half* __restrict__ fn_scale,   // (M, H)
+    float* __restrict__ dots,            // (R, M + 1, H)
+    const int M,
+    const int D,
+    const int R
+)
+{
+    const int r0 = blockIdx.y * R_TILE;
+    const int nr = min(R_TILE, R - r0);
+    const int j0 = blockIdx.x * J_TILE;
+    const int nj = min(J_TILE, (M + 1) - j0);
+    if (nj <= 0) return;
+    const int nj_fn = min(nj, M - j0);   // rows in this block that are real fn rows
+    const int D4 = D / 4;
+
+    const float4* s4[R_TILE];
+    #pragma unroll
+    for (int t = 0; t < R_TILE; ++t)
+        s4[t] = (const float4*) (streams + (size_t) min(r0 + t, R - 1) * H * D);
+
+    __shared__ float red[R_TILE][J_TILE][H][GR_THREADS_A / 32];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+
+    #pragma unroll
+    for (int h = 0; h < H; ++h)
+    {
+        float a[R_TILE][J_TILE];
+        #pragma unroll
+        for (int t = 0; t < R_TILE; ++t)
+            #pragma unroll
+            for (int u = 0; u < J_TILE; ++u) a[t][u] = 0.0f;
+
+        if (nj_fn > 0)
+        {
+            for (int c = threadIdx.x; c < D4 / 2; c += GR_THREADS_A)
+            {
+                float4 s0[R_TILE], s1[R_TILE];
+                #pragma unroll
+                for (int t = 0; t < R_TILE; ++t)
+                {
+                    if (t >= nr) break;
+                    s0[t] = s4[t][(size_t) h * D4 + 2 * c];
+                    s1[t] = s4[t][(size_t) h * D4 + 2 * c + 1];
+                }
+                #pragma unroll
+                for (int u = 0; u < J_TILE; ++u)
+                {
+                    if (u >= nj_fn) break;
+                    const int2* f8 = (const int2*) (fn + ((size_t) (j0 + u) * H + h) * D);
+                    int2 pk = f8[c];
+                    char4 q0 = *(char4*) &pk.x;
+                    char4 q1 = *(char4*) &pk.y;
+                    #pragma unroll
+                    for (int t = 0; t < R_TILE; ++t)
+                    {
+                        if (t >= nr) break;
+                        a[t][u] = fmaf(s0[t].x, (float) q0.x, a[t][u]);
+                        a[t][u] = fmaf(s0[t].y, (float) q0.y, a[t][u]);
+                        a[t][u] = fmaf(s0[t].z, (float) q0.z, a[t][u]);
+                        a[t][u] = fmaf(s0[t].w, (float) q0.w, a[t][u]);
+                        a[t][u] = fmaf(s1[t].x, (float) q1.x, a[t][u]);
+                        a[t][u] = fmaf(s1[t].y, (float) q1.y, a[t][u]);
+                        a[t][u] = fmaf(s1[t].z, (float) q1.z, a[t][u]);
+                        a[t][u] = fmaf(s1[t].w, (float) q1.w, a[t][u]);
+                    }
+                }
+            }
+        }
+        if (nj_fn < nj)
+        {
+            // Row M: sum of squares of the raw streams. Own loop, own stride, unchanged.
+            const int u = nj_fn;
+            for (int c = threadIdx.x; c < D4; c += GR_THREADS_A)
+            {
+                #pragma unroll
+                for (int t = 0; t < R_TILE; ++t)
+                {
+                    if (t >= nr) break;
+                    float4 s = s4[t][(size_t) h * D4 + c];
+                    a[t][u] = fmaf(s.x, s.x, fmaf(s.y, s.y, fmaf(s.z, s.z,
+                                   fmaf(s.w, s.w, a[t][u]))));
+                }
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < R_TILE; ++t)
+        {
+            if (t >= nr) break;
+            #pragma unroll
+            for (int u = 0; u < J_TILE; ++u)
+            {
+                if (u >= nj) break;
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    a[t][u] += __shfl_down_sync(0xffffffffu, a[t][u], offset);
+                if (lane == 0) red[t][u][h][warp] = a[t][u];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < nr * nj * H)
+    {
+        const int t = threadIdx.x / (nj * H);
+        const int rem = threadIdx.x % (nj * H);
+        const int u = rem / H;
+        const int hh = rem % H;
+        const int j = j0 + u;
+        float v = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < GR_THREADS_A / 32; ++w)
+            v += red[t][u][hh][w];
         if (j < M) v *= __half2float(fn_scale[(size_t) j * H + hh]);
         dots[((size_t) (r0 + t) * (M + 1) + j) * H + hh] = v;
     }
@@ -1574,11 +1751,14 @@ void gr_mix_q
     // The R-tiled int8 pair reads the weight once per GR_R_TILE stream rows; int4 has no
     // tiled form, so the two sides pick independently (fn and upt can be different widths)
     const bool rtile = R >= GR_RTILE_MIN_R;
-    const int n_rtiles = (R + GR_R_TILE - 1) / GR_R_TILE;
+    const int r_tile = gr_r_tile_env();
+    const int j_tile = gr_j_tile_env();
+    const int n_rtiles = (R + r_tile - 1) / r_tile;
     const bool rtile_fn = rtile && !fn4;
     const bool rtile_up = rtile && !up4;
 
-    dim3 grid_a(M + 1, rtile_fn ? n_rtiles : R);
+    const int j_t = rtile_fn ? j_tile : 1;
+    dim3 grid_a((M + 1 + j_t - 1) / j_t, rtile_fn ? n_rtiles : R);
     if (fn4)
     {
         TORCH_CHECK(fn_scale.numel() % ((int64_t) M * H) == 0, "gr_mix_q: fn_scale shape");
@@ -1601,10 +1781,25 @@ void gr_mix_q
         #define ARGS_A \
             (const float*) streams.data_ptr(), (const int8_t*) fn.data_ptr(), \
             (const half*) fn_scale.data_ptr(), (float*) dots.data_ptr(), M, D
-        if (rtile_fn)
-            gr_dots_q8_rt_kernel<4, GR_R_TILE><<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R);
+        #define LAUNCH_DOTS_J(RT)                                                             \
+            switch (j_t)                                                                      \
+            {                                                                                 \
+                case 8: gr_dots_q8_rtj_kernel<4, RT, 8>                                       \
+                            <<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R); break;           \
+                case 4: gr_dots_q8_rtj_kernel<4, RT, 4>                                       \
+                            <<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R); break;           \
+                case 2: gr_dots_q8_rtj_kernel<4, RT, 2>                                       \
+                            <<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R); break;           \
+                default: gr_dots_q8_rt_kernel<4, RT>                                          \
+                            <<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R); break;           \
+            }
+        if (rtile_fn && r_tile == 2)
+            LAUNCH_DOTS_J(2)
+        else if (rtile_fn)
+            LAUNCH_DOTS_J(4)
         else
             gr_dots_q8_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A);
+        #undef LAUNCH_DOTS_J
         #undef ARGS_A
     }
     cuda_check(cudaPeekAtLastError());
@@ -1613,7 +1808,7 @@ void gr_mix_q
     int chunk_cols, n_chunks;
     gr_finalize_grid(D, rows_c, chunk_cols, n_chunks);
     dim3 grid_c(n_chunks, rows_c);
-    int smem = (rtile_up ? GR_R_TILE : 1) * LR * sizeof(float);
+    int smem = (rtile_up ? r_tile : 1) * LR * sizeof(float);
     float* post_p = post ? (float*) post.value().data_ptr() : nullptr;
     #define ARGS(T) \
         (const float*) streams.data_ptr(), (const float*) dots.data_ptr(), \
@@ -1624,11 +1819,17 @@ void gr_mix_q
         gr_finalize_q4_kernel<4, true><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS(uint8_t));
     else if (up4)
         gr_finalize_q4_kernel<4, false><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS(uint8_t));
+    else if (rtile_up && half_out && r_tile == 2)
+        gr_finalize_q8_rt_kernel<4, 2, true>
+            <<<grid_c, NUM_THREADS, smem, stream>>>(ARGS(int8_t), R);
     else if (rtile_up && half_out)
-        gr_finalize_q8_rt_kernel<4, GR_R_TILE, true>
+        gr_finalize_q8_rt_kernel<4, 4, true>
+            <<<grid_c, NUM_THREADS, smem, stream>>>(ARGS(int8_t), R);
+    else if (rtile_up && r_tile == 2)
+        gr_finalize_q8_rt_kernel<4, 2, false>
             <<<grid_c, NUM_THREADS, smem, stream>>>(ARGS(int8_t), R);
     else if (rtile_up)
-        gr_finalize_q8_rt_kernel<4, GR_R_TILE, false>
+        gr_finalize_q8_rt_kernel<4, 4, false>
             <<<grid_c, NUM_THREADS, smem, stream>>>(ARGS(int8_t), R);
     else if (half_out)
         gr_finalize_q8_kernel<4, true><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS(int8_t));
