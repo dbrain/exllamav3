@@ -25,6 +25,30 @@ import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
+def resolve_recurrent_checkpoint_interval(explicit: int | None, caps: dict) -> int:
+    """Explicit argument wins, then EXL3_RECURRENT_CKPT, then the architecture default.
+
+    The env override exists because this interval decides how much of a *completion* the prompt
+    cache can resume from: allocate_pages caps the resume point at the last page carrying a
+    recurrent checkpoint, so at the 2048 default an answer shorter than 2048 tokens is
+    re-prefilled in full on the next turn. TabbyAPI exposes no config key for it.
+
+    An unaligned or malformed value falls back rather than tripping the constructor's alignment
+    assert, so a typo in a deployment env file cannot abort model load.
+    """
+    if explicit is not None:
+        return explicit
+    env = os.environ.get("EXL3_RECURRENT_CKPT")
+    if env is not None:
+        try:
+            v = int(env.strip())
+        except ValueError:
+            v = 0
+        if v > 0 and v % PAGE_SIZE == 0:
+            return v
+    return caps.get("default_recurrent_checkpoint_interval", 2048)
+
+
 class Generator:
 
     def __init__(
@@ -275,14 +299,13 @@ class Generator:
             self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
             self.recurrent_cache = None
-        if recurrent_checkpoint_interval is None:
-            recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
+        recurrent_checkpoint_interval = resolve_recurrent_checkpoint_interval(
+            recurrent_checkpoint_interval, model.caps)
 
-        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval % PAGE_SIZE == 0, \
+        assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
             "checkpoint interval must be a multiple of the page size (256)"
         def ceil_span(a, b):
             return (a + b - 1) // b * b
-        recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval_pp = ceil_span(recurrent_checkpoint_interval_pp, self.max_chunk_size)
 
