@@ -183,6 +183,55 @@ def nc_forward(module, x, positions = None, params = None):
     return out, p
 
 
+def rnd_x(shape, seed, scale = 0.5):
+    """Seeded input activations.
+
+    build_dsa carefully seeds a CPU generator for the WEIGHTS, but every test then drew x from
+    the GLOBAL CUDA RNG, so the activations depended on whatever ran earlier in the process and
+    the whole file was order-dependent. test_dsa_selection[300] is simply the one whose
+    tolerance is tight enough to notice: on identical invocations it returned 12-passed, then
+    59/64, then 57/64, always failing at the deepest query row -- which is where near-ties at
+    the top-k boundary are densest, so it is the row a changing input perturbs first.
+    """
+    g = torch.Generator(device = "cpu").manual_seed(seed)
+    return (torch.randn(*shape, generator = g) * scale).half().to(device)
+
+
+@pytest.mark.parametrize("S", [96, 300])
+def test_dsa_selection_never_leaves_the_valid_pool(S):
+    """Selection must never return an entry that is not in the pool.
+
+    dsa_indexer_scores allocates (R, S_stride) with S_stride = max(block_n, next_pow2(T_pad))
+    and its own comment states "the kernels only write columns < T", so [T, S_stride) is
+    uninitialised -- at S=300 that is columns 300..511 against 300 real ones. dsv4._index_topk
+    then called ext.dsa_topk with t_ptr=None, and dsa_topk.cu takes `int T = scores.size(1)`,
+    the PADDED width, so the selection scanned that garbage. The sibling call site
+    (dsv4.py, the cached path) passes a device-side per-row bound and is correct; its comment
+    says why.
+
+    The allocator is poisoned first so the tail is large-positive rather than whatever happened
+    to be resident. Without that this reproduces only on allocator luck, which is precisely why
+    it presented for so long as a flaky fp16 tolerance failure rather than a correctness bug.
+    """
+    topk = 64
+    module, t, key = build_dsa(topk = topk, seed = S)
+    bsz = 2
+    x = rnd_x((bsz, S, module.hidden_size), seed = 9000 + S)
+    positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
+
+    poison = [torch.full((S, w), 6.0e4, dtype = torch.half, device = device)
+              for w in (128, 256, 512, 1024, 2048)]
+    del poison
+    torch.cuda.synchronize()
+
+    out, params = nc_forward(module, x, positions)
+    indices = params["dsa_topk_indices"].view(bsz, S, -1)
+
+    bad = indices[indices >= S]
+    assert bad.numel() == 0, \
+        f"{bad.numel()} selected entries outside the {S}-entry pool, e.g. {bad[:8].tolist()}"
+
+
 @pytest.mark.parametrize("S", [96, 300])
 def test_dsa_selection(S):
     """Module top-k membership against the reference scores. fp16 kernel scores can order the
@@ -191,7 +240,7 @@ def test_dsa_selection(S):
     topk = 64
     module, t, key = build_dsa(topk = topk, seed = S)
     bsz = 2
-    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    x = rnd_x((bsz, S, module.hidden_size), seed = 9000 + (S))
     positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
 
     out, params = nc_forward(module, x, positions)
@@ -215,7 +264,7 @@ def test_dsa_sparse_output(S):
     own selection (so a boundary tie cannot fail this test; only the attention math can)."""
     module, t, key = build_dsa(topk = 64, seed = 100 + S)
     bsz = 2
-    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    x = rnd_x((bsz, S, module.hidden_size), seed = 9000 + (100 + S))
     positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
 
     out, params = nc_forward(module, x, positions)
@@ -228,7 +277,7 @@ def test_dsa_dense_equivalence():
     """T <= index_topk: the sparse machinery must stand down and reproduce dense MLA."""
     module, t, key = build_dsa(topk = 64, seed = 7)
     bsz, S = 2, 64
-    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    x = rnd_x((bsz, S, module.hidden_size), seed = 9000 + (7))
     positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
 
     out, params = nc_forward(module, x, positions)
@@ -248,7 +297,7 @@ def test_dsa_sharing():
     shared, t2, _ = build_dsa(topk = 64, mode = "shared", seed = 11)
 
     bsz = 1
-    x = (torch.randn((bsz, S, full.hidden_size), device = device) * 0.5).half()
+    x = rnd_x((bsz, S, full.hidden_size), seed = 9000 + (11))
     positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
 
     out_full, params = nc_forward(full, x, positions)
@@ -272,7 +321,7 @@ def test_dsa_cached_vs_nc():
     topk = 64
     module, t, key = build_dsa(topk = topk, seed = 23)
     bsz = 2
-    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    x = rnd_x((bsz, S, module.hidden_size), seed = 9000 + (23))
     positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
 
     _, nc_params = nc_forward(module, x, positions)
@@ -319,7 +368,7 @@ def test_dsa_cached_decode():
     S = 200
     module, t, key = build_dsa(topk = 64, seed = 31)
     bsz = 1
-    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    x = rnd_x((bsz, S, module.hidden_size), seed = 9000 + (31))
     positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
 
     layer = CacheLayer_MLA_fp16(None, module, 0, 4 * PAGE_SIZE)
@@ -370,7 +419,7 @@ def test_dsa_cached_quant_prefill(bits):
     topk = 64
     module, t, key = build_dsa(topk = topk, seed = 41)
     bsz = 2
-    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    x = rnd_x((bsz, S, module.hidden_size), seed = 9000 + (41))
     positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
 
     layer = CacheLayer_MLA_quant(None, module, 0, 4 * PAGE_SIZE * bsz, k_bits = bits)
@@ -402,7 +451,7 @@ def test_dsa_cached_quant_decode(bits):
     S = 200
     module, t, key = build_dsa(topk = 64, seed = 43)
     bsz = 1
-    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    x = rnd_x((bsz, S, module.hidden_size), seed = 9000 + (43))
     positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
 
     layer = CacheLayer_MLA_quant(None, module, 0, 4 * PAGE_SIZE, k_bits = bits)
