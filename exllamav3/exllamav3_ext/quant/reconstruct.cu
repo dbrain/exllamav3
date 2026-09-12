@@ -542,7 +542,10 @@ void reconstruct_had_batch
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_batch_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_had_batch_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    // Hoisted out of the launch: hipify's <<<>>> rewrite mangles a subscripted
+    // kernel-pointer array (the rest of this file already does it this way)
+    auto reconstruct_had_batch_kernel = reconstruct_had_batch_kernel_instances[cbi];
+    reconstruct_had_batch_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t* const*) packed_ptrs.data_ptr(),
@@ -598,7 +601,10 @@ void reconstruct_batch
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_batch_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_batch_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    // Hoisted out of the launch: hipify's <<<>>> rewrite mangles a subscripted
+    // kernel-pointer array (the rest of this file already does it this way)
+    auto reconstruct_batch_kernel = reconstruct_batch_kernel_instances[cbi];
+    reconstruct_batch_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t* const*) packed_ptrs.data_ptr(),
