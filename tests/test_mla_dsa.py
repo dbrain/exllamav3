@@ -201,18 +201,18 @@ def rnd_x(shape, seed, scale = 0.5):
 def test_dsa_selection_never_leaves_the_valid_pool(S):
     """Selection must never return an entry that is not in the pool.
 
-    dsa_indexer_scores allocates (R, S_stride) with S_stride = max(block_n, next_pow2(T_pad))
-    and its own comment states "the kernels only write columns < T", so [T, S_stride) is
-    uninitialised -- at S=300 that is columns 300..511 against 300 real ones. dsv4._index_topk
-    then called ext.dsa_topk with t_ptr=None, and dsa_topk.cu takes `int T = scores.size(1)`,
-    the PADDED width, so the selection scanned that garbage. The sibling call site
-    (dsv4.py, the cached path) passes a device-side per-row bound and is correct; its comment
-    says why.
+    `dsa_indexer_scores` allocates (R, S_stride) with S_stride a kernel constexpr deliberately
+    decoupled from the visible pool length, so at S=300 the backing is 512 wide against 300 real
+    columns and the tail is never written. `dsa_topk.cu` takes `int T = scores.size(1)`, and six
+    of eight call sites pass `t_ptr = None`, so the scan bound is whatever width it is handed.
 
-    The allocator is poisoned first so the tail is large-positive rather than whatever happened
-    to be resident. Without that this reproduces only on allocator luck, which is precisely why
-    it presented for so long as a flaky fp16 tolerance failure rather than a correctness bug.
-    """
+    That is safe only because `dsa_indexer_scores` ends with `return scores[:, :T]` -- callers
+    never receive the padded width. This test pins that, because the property is load-bearing
+    and invisible at the call site. See test_dsa_topk_bounds.py, which builds the unbounded case
+    by hand to show the mechanism is real.
+
+    The allocator is poisoned first so a regression surfaces as large-positive garbage winning
+    the top-k rather than depending on whatever happened to be resident."""
     topk = 64
     module, t, key = build_dsa(topk = topk, seed = S)
     bsz = 2
@@ -234,9 +234,18 @@ def test_dsa_selection_never_leaves_the_valid_pool(S):
 
 @pytest.mark.parametrize("S", [96, 300])
 def test_dsa_selection(S):
-    """Module top-k membership against the reference scores. fp16 kernel scores can order the
-    k-th boundary differently from the fp32 reference, so require near-total overlap rather
-    than identity."""
+    """Module top-k against the reference scores, compared by SCORE rather than by index.
+
+    The indexer's scores are ReLU-sparse, so a row can hold fewer than topk positive candidates
+    and the k-th reference score is then exactly 0.0 -- a tie plateau dozens of entries wide.
+    Which of those zeros a given implementation returns is arbitrary and every choice is equally
+    correct, so an index-overlap assertion is ill-posed there: it failed 58/64 at row 289 of
+    S=300 with all six missing AND all six substituted entries scoring exactly 0.00000.
+
+    The well-posed invariant is the one top-k actually promises: every entry scoring strictly
+    better than the k-th must be selected, and nothing scoring strictly worse may be. That is
+    stricter than the old overlap tolerance wherever scores are distinct, and correctly
+    indifferent across a tie."""
     topk = 64
     module, t, key = build_dsa(topk = topk, seed = S)
     bsz = 2
@@ -250,12 +259,25 @@ def test_dsa_selection(S):
     for b in range(bsz):
         for q_row in range(0, S, 17):
             k_eff = min(topk, q_row + 1)
-            ref_top = set(ref_scores[b, q_row].topk(k_eff).indices.tolist())
+            ref_row = ref_scores[b, q_row].float()
+            kth = ref_row.topk(k_eff).values[-1].item()
             got = set(i for i in indices[b, q_row].tolist() if i >= 0)
             assert len(got) == k_eff, f"row {q_row}: {len(got)} selected, expected {k_eff}"
-            overlap = len(ref_top & got)
-            assert overlap >= k_eff - max(2, k_eff // 16), \
-                f"row {q_row}: only {overlap}/{k_eff} of the reference selection"
+
+            # fp16 scores, so a strict comparison would re-litigate the boundary it is meant to
+            # tolerate; scale the band by the row's magnitude rather than using an absolute eps.
+            # Masked entries are -inf, so the scale must come from the finite side or tol is inf
+            # and BOTH assertions below silently accept everything.
+            top = ref_row.max().item()
+            tol = 1e-3 * max(1.0, abs(top))
+            missed = [i for i in (ref_row > kth + tol).nonzero().flatten().tolist() if i not in got]
+            assert not missed, \
+                f"row {q_row}: {len(missed)} entries scoring above the k-th were not selected, " \
+                f"e.g. {[(i, round(ref_row[i].item(), 5)) for i in missed[:4]]} vs kth={kth:.5f}"
+            worse = [i for i in got if ref_row[i].item() < kth - tol]
+            assert not worse, \
+                f"row {q_row}: {len(worse)} selected entries score below the k-th, " \
+                f"e.g. {[(i, round(ref_row[i].item(), 5)) for i in worse[:4]]} vs kth={kth:.5f}"
 
 
 @pytest.mark.parametrize("S", [96, 300])
