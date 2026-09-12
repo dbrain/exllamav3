@@ -302,6 +302,10 @@ class Sequence:
         recurrent_cache: None | RecurrentCache,
         protected_hashes: set | None = None,
     ):
+        # Only ever written on a successful restore, so without this it survives into the next
+        # allocation and reports a tail this one does not have
+        self.tail_restored = 0
+
         if self.max_cached_pages is None:
             page_hashes = self.page_hashes
         else:
@@ -408,12 +412,32 @@ class Sequence:
             page.can_revert = False
 
 
+    def state_is_publishable(self, state) -> bool:
+        """Whether this state may be checkpointed for the sequence's current position.
+
+        Checkpoints are keyed by page or tail CONTENT, but the restoring side recovers the position
+        arithmetically (cached_pages * PAGE_SIZE, plus the matched tail length) and hands it to
+        new_from_stashed(), where GDNState.unstash asserts the two agree. A state that disagrees
+        therefore aborts the next request that reaches it rather than the one that published it.
+
+        It happens under speculative decoding: advance_recurrent_states() adds the WHOLE verify
+        window to the state's position and only the rejected remainder is rewound, so a job that
+        stops mid-window on max_tokens leaves the state ahead of the sequence -- folding in draft
+        tokens the sequence never accepted. Such a state does not describe any prefix of this
+        sequence, so it is not publishable under any key. Measured at +3 and +5 tokens at ndt6.
+        """
+        position = getattr(state, "position", None)
+        return position is None or position == self.kv_position
+
+
     def register_tail(self, pagetable: PageTable, recurrent_cache: RecurrentCache, state):
         """
         Make this sequence's current partial tail page a resume point: index it by content and stash the
         recurrent state at the matching non-page-aligned position.
         """
         if not TAIL_CACHE:
+            return
+        if not self.state_is_publishable(state):
             return
         complete_pages = self.kv_position // PAGE_SIZE
         n = self.kv_position - complete_pages * PAGE_SIZE

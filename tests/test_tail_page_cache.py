@@ -311,16 +311,21 @@ def _stub_job(kv_position, cached_pages, prompt_len, chunk = 512,
     return j
 
 
+@pytest.mark.parametrize("interval", [2048, 1024, 512, PAGE_SIZE])
 @pytest.mark.parametrize("tail", [0, 1, 155, PAGE_SIZE - 1])
-def test_checkpoint_boundaries_stay_page_aligned_after_a_tail_resume(tail):
+def test_checkpoint_boundaries_stay_page_aligned_after_a_tail_resume(tail, interval):
     """maybe_stash_recurrent asserts kv_position % PAGE_SIZE == 0, so a generation that resumed at
     a non-page-aligned tail position must still only hit boundaries on the page grid. cached_pages
-    is what the real allocate_pages reports -- the page-aligned prefix, NOT the resume point."""
+    is what the real allocate_pages reports -- the page-aligned prefix, NOT the resume point.
+
+    Parametrized over interval because EXL3_RECURRENT_CKPT makes it a deployment knob: the
+    boundary is cached_pages * PAGE_SIZE + k * interval, so any multiple of PAGE_SIZE is safe and
+    anything else would fire the assert on a tail-resumed generation."""
     prompt_len = PAGE_SIZE * 14 - 1
     cached_pages = 13
     resume = cached_pages * PAGE_SIZE + tail
     hits = [p for p in range(resume, resume + 8192)
-            if _stub_job(p, cached_pages, prompt_len).is_checkpoint_boundary()]
+            if _stub_job(p, cached_pages, prompt_len, interval = interval).is_checkpoint_boundary()]
     assert hits, "no checkpoint would ever be taken after a tail resume"
     for p in hits:
         assert p % PAGE_SIZE == 0, f"checkpoint at {p} is not page aligned"
@@ -562,3 +567,209 @@ def test_mtp_warm_turns_force_an_eager_reseed_step(monkeypatch):
 
         forward_one(pt, s)
         pt.deallocate_pages(s.allocated_pages)
+
+
+# --- what the completion costs the next turn ----------------------------------------------------
+
+def _decode_turn(pt, rc, s, gen_tokens, interval, cached_pages):
+    """Decode `gen_tokens`, stashing a recurrent checkpoint wherever Job.is_checkpoint_boundary
+    puts one. Job commits the page (forward_one) but only stashes on a boundary, so the two can
+    disagree -- which is the whole finding."""
+    for _ in range(gen_tokens):
+        forward_one(pt, s, next_token = 7)
+        if s.kv_position % PAGE_SIZE == 0 and \
+                _stub_job(s.kv_position, cached_pages, len(s.sequence_ids) - 1,
+                          interval = interval).is_checkpoint_boundary():
+            rc.put(s.allocated_pages[s.kv_position // PAGE_SIZE - 1].phash,
+                   f"decode@{s.kv_position}")
+
+
+@pytest.mark.parametrize("interval", [2048, PAGE_SIZE])
+def test_generated_tokens_are_reusable_only_at_a_page_sized_checkpoint_interval(interval):
+    """ROUND2 section 33. commit_page content-hashes the pages a completion fills, but
+    pagetable.allocate_pages caps the resume point at the last page that also has a recurrent
+    checkpoint. At the 2048 default a sub-2048-token answer leaves none, so turn k+1 re-prefills
+    the whole completion; at PAGE_SIZE every completed page anchors one."""
+    pt, _ = build()
+    rc = FakeRecurrentCache()
+    P, G = PAGE_SIZE * 4 - 5, 600          # ~1k prompt, 600-token answer: the deployed turn shape
+
+    s1 = run_prefill(pt, rc, seq_for(P, max_new_tokens = G + 16), "state@prefill")
+    prompt_end = s1.kv_position
+    _decode_turn(pt, rc, s1, G, interval, cached_pages = 0)
+    final_end = s1.kv_position
+    pt.deallocate_pages(s1.allocated_pages)
+
+    ids2 = torch.cat([s1.sequence_ids.torch(), torch.full((1, 40), 3, dtype = torch.long)], dim = -1)
+    s2 = Sequence(ids2, ids2)
+    s2.prepare(False, 64)
+    _, cached_pages, _, _ = s2.allocate_pages(pt, rc)
+
+    expect = (final_end if interval == PAGE_SIZE else prompt_end) // PAGE_SIZE
+    assert cached_pages == expect, (
+        f"interval {interval}: reused {cached_pages * PAGE_SIZE} of {final_end} tokens, "
+        f"expected {expect * PAGE_SIZE} (prompt ended {prompt_end}, generation ended {final_end})"
+    )
+
+
+def _real_stash_job(seq, rc, interval, cached_pages = 0):
+    """A Job wired to a REAL Sequence and the REAL maybe_stash_recurrent, so the checkpoint KEY is
+    whatever production computes -- not one the test chose."""
+    from exllamav3.generator.job import Job
+    j = Job.__new__(Job)
+    j.sequences = [seq]
+    j.cached_pages = cached_pages
+    j.checkpoint = None
+    j.last_recurrent_checkpoint_pos = -1
+    j.recurrent_state = "live-state"
+    j.generator = SimpleNamespace(max_chunk_size = 4096, recurrent_cache = rc,
+                                  recurrent_checkpoint_interval = interval,
+                                  recurrent_checkpoint_interval_pp = 32768)
+    return j
+
+
+@pytest.mark.parametrize("interval", [2048, PAGE_SIZE])
+def test_production_stash_keys_the_page_the_next_turn_will_look_up(interval):
+    """ROUND2 section 33.5, the half a shared-cache A/B cannot answer: when decode completes a
+    page and Generator.recurrent_checkpoint() stashes, is the key the same hash the NEXT turn's
+    Sequence.prepare() computes for that page? If it is not, creating the checkpoint can never
+    move the resume point however short the interval."""
+    pt, _ = build()
+    rc = FakeRecurrentCache()
+    P, G = PAGE_SIZE * 4 - 5, 600
+
+    s1 = run_prefill(pt, rc, seq_for(P, max_new_tokens = G + 16), "state@prefill")
+    job = _real_stash_job(s1, rc, interval)
+    for _ in range(G):
+        forward_one(pt, s1, next_token = 7)
+        job.maybe_stash_recurrent(rc)          # exactly what generator.py:628 calls each round
+    final_end = s1.kv_position
+    pt.deallocate_pages(s1.allocated_pages)
+
+    ids2 = torch.cat([s1.sequence_ids.torch(), torch.full((1, 40), 3, dtype = torch.long)], dim = -1)
+    s2 = Sequence(ids2, ids2)
+    s2.prepare(False, 64)
+    _, cached_pages, _, _ = s2.allocate_pages(pt, rc)
+
+    expect = (final_end if interval == PAGE_SIZE else (P - 1)) // PAGE_SIZE
+    assert cached_pages == expect, (
+        f"interval {interval}: resume point reached page {cached_pages} "
+        f"({cached_pages * PAGE_SIZE} tokens), expected page {expect}. Generation ended at "
+        f"{final_end}. Stashed keys: {len(rc)}")
+
+
+class PositionedState:
+    """A recurrent state that knows where it is, which is what production's GDNState does and what
+    the string doubles above deliberately do not."""
+    def __init__(self, position):
+        self.position = position
+
+    def __repr__(self):
+        return f"PositionedState({self.position})"
+
+
+def test_register_tail_refuses_a_state_that_overshot_the_sequence():
+    """ROUND2 section 42.5, measured on the live server.
+
+    advance_recurrent_states() adds the WHOLE verify window to the recurrent state's position
+    (`r.position += seqlen`) and only the rejected remainder is rewound. A job that stops
+    mid-window on max_tokens never rejects the leftover draft positions, so at generation end the
+    state sits AHEAD of seq.kv_position -- measured +3 and +5 at ndt6:
+
+        register_tail kv=2718 n=158 state_pos=2721
+        register_tail kv=3256 n=184 state_pos=3261
+        restore_tail  cached_pages=12 n=184 -> kv=3256  stash_pos=3261   MISMATCH
+
+    register_tail keys the checkpoint by the sequence's tail CONTENT, so the next turn recovers the
+    position arithmetically as cached_pages * PAGE_SIZE + n and hands it to new_from_stashed(),
+    where gated_delta_net.py:172 asserts `self.position == stashed["position"]`. That aborts the
+    request and takes the server down with it -- and the state is genuinely inconsistent with the
+    sequence anyway, having consumed draft tokens the sequence never accepted, so publishing it
+    under any key would be wrong.
+    """
+    pt, _ = build()
+    rc = FakeRecurrentCache()
+    s = seq_for(PAGE_SIZE * 3 + 100)
+    run_prefill(pt, rc, s, PositionedState(len(s.sequence_ids) - 1))
+    before = dict(rc)
+
+    s.register_tail(pt, rc, PositionedState(s.kv_position + 5))
+
+    assert rc == before, (
+        "register_tail published a checkpoint whose state position "
+        f"({s.kv_position + 5}) does not match the sequence position it is keyed for "
+        f"({s.kv_position}); the next turn computes the latter and unstash() will assert"
+    )
+
+
+def test_maybe_stash_recurrent_refuses_a_state_that_overshot_the_sequence():
+    """Same invariant on the page-aligned path. maybe_stash_recurrent keys by page hash and the
+    restoring side derives the position from cached_pages * PAGE_SIZE, so an overshot state fails
+    the same assert. Reached whenever a requeued job's kv_position happens to land on the grid
+    (generator.py's requeue branch stashes with an explicit PAGE_SIZE override)."""
+    pt, _ = build()
+    rc = FakeRecurrentCache()
+    s = seq_for(PAGE_SIZE * 3 + 100)
+    run_prefill(pt, rc, s, PositionedState(len(s.sequence_ids) - 1))
+    while s.kv_position % PAGE_SIZE:
+        forward_one(pt, s)
+    before = dict(rc)
+
+    job = _real_stash_job(s, rc, PAGE_SIZE)
+    job.recurrent_state = PositionedState(s.kv_position + 3)
+    job.maybe_stash_recurrent(rc)
+
+    assert rc == before, (
+        f"maybe_stash_recurrent published a state at {s.kv_position + 3} under the page hash for "
+        f"position {s.kv_position}"
+    )
+
+
+def test_a_tail_resume_leaves_kv_position_off_the_page_grid():
+    """The precondition Job.prefill must tolerate, pinned so it cannot be re-tightened by accident.
+
+    A tail hit resumes PAST the last page boundary by design -- that is the whole point of the tail
+    page. When the prompt is merely REPEATED there is nothing left to prefill, so nothing notices;
+    when it is EXTENDED, prefill starts from that unaligned position. `job.py` asserted
+    `prefill_start % PAGE_SIZE == 0 or mm_exact_chunks` with the comment "the recurrent checkpoint
+    will always be on a page boundary", which the tail cache makes false. That assert aborted the
+    request and took the server down with it, and it was unreachable until prompt-cache reuse
+    actually extended past the prompt (ROUND2 section 42.6).
+
+    The page-write loop already clamps per page (`pf_a = max(local_idx * PAGE_SIZE, prefill_start)`)
+    and the one alignment-dependent block below is skipped for recurrent models, so an unaligned
+    start is safe -- which is exactly why `mm_exact_chunks` was already allowed to produce one.
+    """
+    pt, _ = build()
+    rc = FakeRecurrentCache()
+    S1 = PAGE_SIZE * 14 - 100
+    s1 = run_prefill(pt, rc, seq_for(S1), "state@S1")
+    pt.deallocate_pages(s1.allocated_pages)
+
+    ids = torch.cat([ids_for(S1)[:, : S1 - 1], torch.full((1, 41), 7, dtype = torch.long)], dim = -1)
+    s2 = Sequence(ids, ids)
+    s2.prepare(False, 64)
+    s2.allocate_pages(pt, rc)
+
+    assert s2.tail_restored > 0, "no tail was restored, so this test is not exercising the path"
+    assert s2.kv_position % PAGE_SIZE != 0, (
+        f"kv_position {s2.kv_position} is page-aligned, so the unaligned-prefill precondition "
+        "is no longer reachable here and this test has stopped testing anything"
+    )
+
+
+def test_allocate_pages_clears_a_stale_tail_restored():
+    """`tail_restored` is only ever written on a successful restore, so without a reset it survives
+    into the next allocation of the same Sequence and reports a tail that this allocation does not
+    have. It feeds `job.cached_tokens` and gates the unaligned-prefill case, so a stale value both
+    over-reports reuse and would wave through an alignment violation."""
+    pt, _ = build()
+    rc = FakeRecurrentCache()
+    s = seq_for(PAGE_SIZE * 3 + 100)
+    s.tail_restored = 99
+
+    s.allocate_pages(pt, rc)
+
+    assert s.tail_restored == 0, (
+        f"tail_restored still reads {s.tail_restored} after an allocation that restored no tail"
+    )
