@@ -3,11 +3,12 @@ from typing_extensions import override
 import os
 import torch
 import torch.nn.functional as F
-from ..model.config import Config
+from ..model.config import Config, mgemm_kernels_available
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
+from .moe_reduce import moe_reduce
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
 from .rmsnorm import RMSNorm
@@ -40,8 +41,93 @@ MTILE_T1, MTILE_T2 = 16, 32
 FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
-FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
+# (exl3_moe_gather lives in the ROCm-excluded fused MoE TU, so the tier degrades to the
+# per-expert accumulation there rather than raising at first use)
+FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0" and hasattr(ext, "exl3_moe_gather")
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+
+# Count expert assignments without a device sync. Set to 0 to A/B against the
+# torch.bincount this replaces; the two are integer-identical, so the flag
+# changes only WHEN the host blocks, never what is computed.
+#
+# NOTE the name is the one the campaign's A/B tooling uses. It does not widen
+# the grouped-mgemm guard (see the `bsz == 1` branch below, which genuinely
+# requires one row: its buffers are sized [top_k] and its reduction is a
+# single-row sum).
+_GROUPED_MULTITOK = os.environ.get("EXL3_MOE_GROUPED_MULTITOK", "1") != "0"
+
+# Largest token count the grouped multi-token path will take. Buffers are sized
+# for it at load (num_experts_per_tok * this many rows), so it costs memory, not
+# time: ~2.4 MB per MoE layer at top_k 10 / 8 tokens on flashnext. An MTP verify
+# window is ndt + 1 tokens, so 8 covers ndt up to 7.
+_MULTITOK_MAX = int(os.environ.get("EXL3_MOE_MULTITOK_MAX", "8"))
+
+
+def _expert_counts(flat_expert_local: torch.Tensor, num_local_experts: int) -> torch.Tensor:
+    """Assignments per local expert, bin `num_local_experts` being the
+    out-of-slice sentinel. Equivalent to
+    ``torch.bincount(flat_expert_local, minlength = num_local_experts + 1)``.
+
+    bincount on CUDA reads max(input) back to the host to size its bins, so it
+    stalls the pipeline once per MoE layer per forward -- 3.47 ms measured on
+    flashnext-4.05bpw, 48 layers deep, for a count over 50 elements. The bin
+    count here is known statically (the caller has already clamped ids into
+    [0, num_local_experts]), so a scatter_add over a pre-sized zero vector gives
+    the same integers with nothing read back.
+    """
+    if not _GROUPED_MULTITOK:
+        return torch.bincount(flat_expert_local, minlength = num_local_experts + 1)
+    counts = torch.zeros(num_local_experts + 1, dtype = flat_expert_local.dtype,
+                         device = flat_expert_local.device)
+    return counts.scatter_add_(0, flat_expert_local,
+                               torch.ones_like(flat_expert_local))
+
+
+# quant/exl3_moe.cu is excluded from the ROCm build (exllamav3_ext/build_config.py), so the
+# fused expert path is unreachable there and the dense per-expert loop drives the same
+# LinearEXL3 modules instead. The native mgemm paths are additionally gated on
+# EXL3_NO_MGEMM, which defaults on under ROCm -- see mgemm_kernels_available().
+_HAS_MGEMM = mgemm_kernels_available()
+_HAS_MOE = hasattr(ext, "exl3_moe")
+
+try:
+    from .quant.exl3_mgemm_triton import (
+        _linear_exl3_mgemm_gate_up, _linear_exl3_mgemm_triton, fuse_gate_up,
+        mgemm_prepare, mgemm_prepare_gate_up,
+    )
+    from .quant import exl3_mgemm_dedup_triton
+    _HAS_TRITON_MGEMM = True
+except ImportError:
+    _HAS_TRITON_MGEMM = False
+
+
+def _supports_grouped_mgemm(is_quantized, gated, activation_fn, gates, ups, downs,
+                            num_local_experts, num_experts) -> bool:
+    """Grouped Triton mgemm covers the M == 1 decode case only.
+
+    Requires the whole expert range: a TP or CPU-split shard puts the sentinel
+    value num_local_experts in flat_expert_local for out-of-range picks, and the
+    kernel dereferences ptrs_trellis[eid] unguarded."""
+    return (
+        _HAS_TRITON_MGEMM and
+        not _HAS_MGEMM and
+        is_quantized and
+        gated and activation_fn in ("silu", "gelu") and
+        num_local_experts == num_experts and
+        all(l.inner.bias is None for l in gates + ups + downs) and
+        all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in downs)
+    )
+
+
+def _supports_quant_paths(is_quantized, gated, activation_fn, gates, ups, downs) -> bool:
+    return (
+        _HAS_MGEMM and
+        is_quantized and
+        (activation_fn in ("silu", "gelu") if gated else activation_fn == "relu2") and
+        all(l.inner.bias is None for l in gates + ups + downs) and
+        all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in downs)
+    )
+
 
 @dataclass
 class FusedBuffers:
@@ -50,6 +136,38 @@ class FusedBuffers:
     temp_intermediate_g: torch.Tensor
     temp_intermediate_u: torch.Tensor
 
+
+
+@dataclass
+class MGemmBuffers:
+    xh_gu: torch.Tensor
+    interm_gu: torch.Tensor
+    interm_g: torch.Tensor
+    interm_u: torch.Tensor
+    act: torch.Tensor
+    xh_d: torch.Tensor
+    out: torch.Tensor
+    ids: torch.Tensor
+    mt: "MTGemmBuffers | None" = None
+
+
+@dataclass
+class MTGemmBuffers:
+    """Separate buffers for the multi-token grouped path.
+
+    Kept apart from the bsz-1 set rather than widening it: ``ids`` there may be
+    ALIASED to the router's own (1, top_k) output (see _alias_mgemm_ids), so it
+    cannot be resized, and the decode buffers are the addresses a captured graph
+    replays against.
+    """
+    xrows: torch.Tensor
+    xh: torch.Tensor
+    interm_g: torch.Tensor
+    interm_u: torch.Tensor
+    act: torch.Tensor
+    xh_d: torch.Tensor
+    out: torch.Tensor
+    ids: torch.Tensor
 
 
 @dataclass
@@ -326,6 +444,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.is_quantized = False
         self.support_fused = False
         self.support_quant_paths = False
+        self.mgemm_grouped = False
+        self.mgemm_buf = None
+        self.mgemm_ptrs_gu = None
+        self.mgemm_ptrs_split = 0
+        self.mgemm_ids_own = None
         self.multi_gate = None
         self.multi_up = None
         self.multi_down = None
@@ -410,11 +533,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
-        self.support_quant_paths = (
-            self.is_quantized and
-            (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
-            all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
-            all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
+        self.support_quant_paths = _supports_quant_paths(
+            self.is_quantized, self.gated, self.activation_fn,
+            self.gates, self.ups, self.downs,
         )
 
         # The BC bsz-1 graph additionally supports the gpt-oss activation, per-expert biases
@@ -432,10 +553,26 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             not self.config.infer_params.no_reconstruct
         )
 
+        # Grouped Triton mgemm stands in for the absent CUDA exl3_mgemm at decode:
+        # one launch per projection for the whole routed set instead of one per expert,
+        # and no host round-trip, which is what makes the step graph-capturable
+        self.mgemm_grouped = _supports_grouped_mgemm(
+            self.is_quantized, self.gated, self.activation_fn,
+            self.gates, self.ups, self.downs,
+            self.num_local_experts, self.num_experts,
+        ) and not self.config.infer_params.no_reconstruct
+
+        # The grouped decode path reads no device tensor on the host and its grid depends
+        # only on top_k and N, so the step is static. graph_decode denies BlockSparseMLP by
+        # name otherwise; this cap overrides that. Capture is gated to bsz == 1 there, which
+        # is exactly where the grouped branch applies -- prefill still takes the dense loop
+        if self.mgemm_grouped:
+            self.caps["graph_capturable"] = True
+
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
         # gate pointer tables (never dereferenced, the gate GEMMs are skipped)
-        if (self.support_quant_paths or self.support_bc_bsz1) and not self.config.infer_params.no_reconstruct:
+        if (self.support_quant_paths or self.support_bc_bsz1 or self.mgemm_grouped) and not self.config.infer_params.no_reconstruct:
             self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True) if self.gated else None
             self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
             self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
@@ -449,7 +586,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
             self.support_fused = (
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
-                self.support_quant_paths
+                self.support_quant_paths and
+                _HAS_MOE
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
@@ -511,6 +649,47 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             out_trim = out_trim,
         )
         self.experts_cfg = cfg
+
+        if self.mgemm_grouped:
+            E = self.num_experts_per_tok
+            Hi = self.multi_gate.in_features
+            I = self.multi_gate.out_features
+            Ho = self.multi_down.out_features
+            dev = self.device
+            half = torch.half
+            # Stable addresses: a captured graph replays against these exact buffers
+            # gate and up share one 2E-row tile so EXL3_FUSE_MOE_GATE_UP can write
+            # both halves from a single launch; the unmerged path takes the two
+            # halves as ordinary contiguous (E, I) views, unchanged.
+            interm_gu = torch.empty((2 * E, I), dtype = half, device = dev)
+            self.mgemm_buf = MGemmBuffers(
+                xh_gu = torch.empty((2 * E, 1, Hi), dtype = half, device = dev),
+                interm_gu = interm_gu,
+                interm_g = interm_gu[:E],
+                interm_u = interm_gu[E:],
+                act = torch.empty((E, I), dtype = half, device = dev),
+                xh_d = torch.empty((E, 1, I), dtype = half, device = dev),
+                out = torch.empty((E, Ho), dtype = half, device = dev),
+                ids = torch.empty((E,), dtype = torch.long, device = dev),
+                mt = self._make_mt_buffers(E, Hi, I, Ho, dev, half),
+            )
+            self.mgemm_cb = 1 if self.multi_gate.mcg else (2 if self.multi_gate.mul1 else 0)
+            # Triton autotune benchmarks its pool on the first call for a new key and the
+            # perm/mrow tables are built lazily; both must happen outside a graph capture
+            for ml, o in ((self.multi_gate, I), (self.multi_up, I), (self.multi_down, Ho)):
+                mgemm_prepare(E, ml.in_features, o, ml.K, self.mgemm_cb, dev,
+                              ml.ptrs_trellis, ml.ptrs_suh, ml.ptrs_svh)
+            # Merged gate+up: cat(gate, up) pointer tables, split at the length of
+            # one. Built unconditionally so EXL3_FUSE_MOE_GATE_UP can be flipped
+            # per call without a reload, and warmed for the same reason -- the
+            # merged binary must be compiled outside any graph capture.
+            self.mgemm_ptrs_split = self.multi_gate.ptrs_trellis.numel()
+            self.mgemm_ptrs_gu = tuple(
+                torch.cat((getattr(self.multi_gate, t), getattr(self.multi_up, t)))
+                for t in ("ptrs_trellis", "ptrs_suh", "ptrs_svh"))
+            mgemm_prepare_gate_up(E, self.multi_gate.in_features, I,
+                                  self.multi_gate.K, self.mgemm_cb, dev,
+                                  *self.mgemm_ptrs_gu, self.mgemm_ptrs_split)
 
         if (self.support_quant_paths or self.support_bc_bsz1) \
                 and not self.config.infer_params.no_reconstruct:
@@ -678,6 +857,147 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             topk_group = self.topk_group,
             per_expert_scale = self.per_expert_scale,
         )
+        self._alias_mgemm_ids()
+
+
+    def _make_mt_buffers(self, E, Hi, I, Ho, dev, half):
+        """Buffers for the multi-token grouped path, or None when it is off.
+
+        The grouped mgemm kernel already accepts one x row per ROUTED ENTRY
+        (``x.shape[0] in (E, 1)``), so T tokens are just T * top_k entries with
+        the matching x row gathered per entry -- the same three launches per MoE
+        layer the decode path uses, instead of the per-expert Python loop the
+        bsz > 1 fallback runs on ROCm (there is no fused MoE kernel in the HIP
+        bindings: exl3_moe is bound in bindings.cpp and NOT in bindings_hip.cpp,
+        so _HAS_MOE is False and support_fused can never be true here).
+        """
+        # Allocated whenever the path is compiled in, not only when the flag is
+        # on at load: the flag is read per CALL in forward() so an A/B harness
+        # can flip it in one process, and buffers that only exist for one arm
+        # would make the off arm unmeasurable.
+        if _MULTITOK_MAX < 2:
+            return None
+        R = E * _MULTITOK_MAX
+        return MTGemmBuffers(
+            xrows = torch.empty((R, Hi), dtype = half, device = dev),
+            xh = torch.empty((R, 1, Hi), dtype = half, device = dev),
+            interm_g = torch.empty((R, I), dtype = half, device = dev),
+            interm_u = torch.empty((R, I), dtype = half, device = dev),
+            act = torch.empty((R, I), dtype = half, device = dev),
+            xh_d = torch.empty((R, 1, I), dtype = half, device = dev),
+            out = torch.empty((R, Ho), dtype = half, device = dev),
+            ids = torch.empty((R,), dtype = torch.long, device = dev),
+        )
+
+
+    def _grouped_multitok(self, x, y, bsz, selected_experts, routing_weights):
+        """T tokens through the grouped Triton mgemm: 3 launches per layer.
+
+        Rows are ordered token-major (token t occupies rows [t*top_k, (t+1)*top_k)),
+        which is what makes the reduction a plain per-token sum with no sort, no
+        counts and no host readback.
+
+        EXL3_MOE_SORT_ROWS=1 (read per call, so one process can A/B it) orders the
+        rows by expert instead: the kernel reads one expert matrix per routed ENTRY,
+        and sorting puts entries that share an expert in adjacent programs of the
+        entry-major grid, where the repeat read can come from L2. Outputs are put
+        back token-major before the reduction, so the result is bitwise unchanged.
+        """
+        b = self.mgemm_buf.mt
+        top_k = self.num_experts_per_tok
+        R = bsz * top_k
+        ids = b.ids[:R]
+        xrows = b.xrows[:R]
+        maxr = exl3_mgemm_dedup_triton.max_rows_env()
+        if maxr and not (
+                exl3_mgemm_dedup_triton.dedup_supported(
+                    self.multi_gate.K, xrows.shape[1], b.interm_g.shape[1]) and
+                exl3_mgemm_dedup_triton.dedup_supported(
+                    self.multi_down.K, b.act.shape[1], b.out.shape[1])):
+            maxr = 0
+        perm = None
+        if maxr or os.environ.get("EXL3_MOE_SORT_ROWS", "0") == "1":
+            # The dedup kernel derives each entry's run position from the sort order,
+            # so sorting is mandatory for it and optional (L2 reuse only) without it.
+            sorted_ids, perm = torch.sort(selected_experts.view(-1), stable = True)
+            ids.copy_(sorted_ids)
+            xrows.copy_(y.index_select(0, torch.div(perm, top_k, rounding_mode = "floor")))
+        else:
+            ids.copy_(selected_experts.view(-1))
+            xrows.view(bsz, top_k, -1).copy_(
+                y.unsqueeze(1).expand(bsz, top_k, y.shape[-1]))
+
+        def proj(mod, src, xh, dst):
+            if maxr:
+                exl3_mgemm_dedup_triton.linear_exl3_mgemm_dedup(
+                    src, xh, dst, mod.ptrs_trellis, mod.ptrs_suh, mod.ptrs_svh,
+                    ids, mod.K, self.mgemm_cb, maxr)
+            else:
+                _linear_exl3_mgemm_triton(
+                    src, xh, dst, mod.ptrs_trellis, mod.ptrs_suh, mod.ptrs_svh,
+                    ids, mod.K, self.mgemm_cb)
+
+        proj(self.multi_gate, xrows, b.xh[:R], b.interm_g[:R])
+        proj(self.multi_up, xrows, b.xh[:R], b.interm_u[:R])
+        self.activation_fn_call(b.interm_g[:R], b.interm_u[:R], b.act[:R],
+                                self.act_limit)
+        proj(self.multi_down, b.act[:R], b.xh_d[:R], b.out[:R])
+        out = b.out[:R]
+        if perm is not None:
+            out = torch.empty_like(out).index_copy_(0, perm, out)
+        o = out.view(bsz, top_k, -1).float()
+        w = routing_weights.view(bsz, top_k, 1).float()
+        return torch.sum(o * w, dim = 1).view(x.shape)
+
+
+    def _alias_mgemm_ids(self):
+        """Point the grouped mgemm's expert-id buffer at the router's own output.
+
+        The bsz-1 routing kernels write their top-k straight into
+        RoutingCFG.selected_experts_bsz1, a stable (1, top_k) int64 buffer, and
+        the decode branch then copies it into MGemmBuffers.ids -- one launch per
+        layer per token to move 80 bytes. Making them the same tensor removes
+        the copy outright. Both buffers are allocated once at load and written
+        in place, so a captured graph keeps a valid address either way.
+
+        load_local (which builds mgemm_buf) runs before load_routing, hence the
+        re-point here rather than at construction. Behind EXL3_MOE_ALIAS_IDS
+        because it changes which allocation the kernel reads, and the forward
+        path falls back to the copy whenever the two differ -- routing paths
+        that hand back a different tensor (the broadcast branch, TP) are
+        unaffected.
+
+        MEASURED -0.322 ms/token (-0.3%) against a same-process control that
+        repeated the baseline arm last: 120.437 vs 120.759 ms at 2604 vs 2652
+        launches, i.e. ~6.7 us for a launch that moves 80 bytes and does no
+        arithmetic. That is the closest thing this model has to a pure launch
+        cost, and it is barely outside the 0.50 ms spread of the run's null
+        arms, so treat 6.7 us as an order of magnitude, not a constant. It also
+        prices the whole launch-deletion programme: ~600 launches at that rate
+        is ~4 ms of a 120 ms token.
+
+        REVERSIBLE: the originally allocated buffer is kept, so an A/B harness
+        can call this again with the flag flipped and get the copy back. A
+        load-time-only switch would be untestable against a running process,
+        which is exactly what the launch census has to do.
+        """
+        buf = self.mgemm_buf
+        cfg = self.routing_cfg
+        if buf is None:
+            return
+        if self.mgemm_ids_own is None:
+            self.mgemm_ids_own = buf.ids
+        on = os.environ.get("EXL3_MOE_ALIAS_IDS", "0").lower() not in \
+            ("0", "", "off", "no", "false")
+        if not on or cfg is None or self.routing_gate is None:
+            buf.ids = self.mgemm_ids_own
+            return
+        sel = cfg.selected_experts_bsz1
+        if sel.dtype != self.mgemm_ids_own.dtype or \
+                sel.numel() != self.mgemm_ids_own.numel():
+            buf.ids = self.mgemm_ids_own
+            return
+        buf.ids = sel.view(-1)
 
 
     @override
@@ -850,6 +1170,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc = None
         self.fused_mode_buffers = None
         self.batch_recon = None
+        self.mgemm_buf = None
+        self.mgemm_ptrs_gu = None
+        self.mgemm_ptrs_split = 0
+        self.mgemm_ids_own = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -939,6 +1263,50 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
+        # Grouped Triton mgemm (decode). Every routed expert sees the same row and has
+        # exactly one, so no sort/bincount/count readback is needed: the [top_k] expert
+        # list is already what the kernel wants, and it stays on the device
+        # Grouped Triton mgemm, T tokens. Same three launches per layer as decode;
+        # see _grouped_multitok. The bsz > 1 alternative on this build is the dense
+        # branch below, which has no fused MoE kernel to fall back on and so runs a
+        # 512-iteration Python loop per MoE layer -- measured 45 ms -> 306 ms for the
+        # 48 MoE layers going from 1 token to 2.
+        elif (_GROUPED_MULTITOK and self.mgemm_grouped and self.mgemm_buf is not None
+              and self.mgemm_buf.mt is not None
+              and 1 < bsz <= _MULTITOK_MAX
+              and self.num_local_experts == self.num_experts
+              and self.gated and self.activation_fn_call is not None):
+            final_hidden_states = self._grouped_multitok(
+                x, y, bsz, selected_experts, routing_weights)
+
+        elif self.mgemm_grouped and bsz == 1 and self.mgemm_buf is not None:
+            b = self.mgemm_buf
+            # The router already wrote the routed set into a stable device
+            # buffer; when b.ids IS that buffer (see _alias_mgemm_ids) the copy
+            # is 48 launches/token to move 80 bytes onto itself.
+            if b.ids.data_ptr() != selected_experts.data_ptr():
+                b.ids.copy_(selected_experts.view(-1))
+            n_routed = b.ids.numel()
+            if fuse_gate_up() and self.mgemm_ptrs_gu is not None:
+                _linear_exl3_mgemm_gate_up(
+                    y, b.xh_gu, b.interm_gu, *self.mgemm_ptrs_gu,
+                    b.ids, self.multi_gate.K, self.mgemm_cb, self.mgemm_ptrs_split)
+            else:
+                _linear_exl3_mgemm_triton(
+                    y, b.xh_gu[:n_routed], b.interm_g,
+                    self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh,
+                    self.multi_gate.ptrs_svh, b.ids, self.multi_gate.K, self.mgemm_cb)
+                _linear_exl3_mgemm_triton(
+                    y, b.xh_gu[:n_routed], b.interm_u,
+                    self.multi_up.ptrs_trellis, self.multi_up.ptrs_suh,
+                    self.multi_up.ptrs_svh, b.ids, self.multi_up.K, self.mgemm_cb)
+            self.activation_fn_call(b.interm_g, b.interm_u, b.act, self.act_limit)
+            _linear_exl3_mgemm_triton(
+                b.act, b.xh_d, b.out,
+                self.multi_down.ptrs_trellis, self.multi_down.ptrs_suh,
+                self.multi_down.ptrs_svh, b.ids, self.multi_down.K, self.mgemm_cb)
+            final_hidden_states = moe_reduce(b.out, routing_weights).view(x.shape)
+
         # Torch/C++/fused path
         elif (
             (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
@@ -985,10 +1353,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
-                # Count how many assignments per expert. With few enough total assignments no
-                # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
-                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                # Count how many assignments per expert. Consumed on the DEVICE by run_fused
+                # below, and on the host only where the tier plan needs the split, so the count
+                # itself must not sync -- see _expert_counts. With few enough total assignments
+                # no expert can exceed the fused kernel's row capacity, so the readback (a CPU
+                # sync per layer, ~33% idle at MTP verify shapes) is skipped as well
+                expert_count = _expert_counts(flat_expert_local, E)
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
                 else:

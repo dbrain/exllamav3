@@ -7,8 +7,10 @@ import random
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
+import os
+_test_device = os.environ.get("EXL_TEST_DEVICE", "cuda:0")
 devices = [
-    "cuda:0"
+    _test_device
 ]
 
 page_size = 256

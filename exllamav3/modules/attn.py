@@ -1108,7 +1108,8 @@ class Attention(Module):
 
         if qsa_sparse:
             qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
-            o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
+            o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table,
+                                               qsa_seqlens_cpu, cache_seqlens)
         else:
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
             # quantized-cache prefill size its staging to the window instead of the job's pages

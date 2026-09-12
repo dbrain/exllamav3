@@ -1,5 +1,7 @@
 #include <cuda_fp16.h>
+#if !defined(USE_ROCM)
 #include <cuda_fp16.hpp>
+#endif
 #include "activation.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -9,6 +11,7 @@
 #include "graph.cuh"
 #include "gdn.cuh"
 #include <cmath>
+#include <cstdlib>
 
 using bfloat16 = __nv_bfloat16;
 #define MAX_K_HEADS 32
@@ -716,6 +719,23 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     __shared__ float sh_dot2[SUBK][HEAD_DIM];
     __shared__ float sh_g[CHANNELWISE ? HEAD_DIM : 1];
 
+    // The block's slice of the state -- rows [bt * BTS, bt * BTS + BTS), column v_start + t --
+    // carried in registers for the whole sequence. Every timestep after the first would
+    // otherwise re-read from global exactly what the previous one wrote there: with
+    // save_history that is history slot s, written as slot s at step s - 1, and without it the
+    // single final_state. So the slice is fetched once and each later step costs one write
+    // instead of two reads and a write.
+    const bool active = t < V_CHUNK_DIM;
+    float st[BTS];
+    if (active)
+    {
+        // s == 0 reads final_state in both save_history branches
+        const float* rs0 = final_state + head * HEAD_STATE_SIZE + v_start + t + bt * BTS * HEAD_DIM;
+        #pragma unroll
+        for (int n = 0; n < BTS; ++n)
+            st[n] = rs0[n * HEAD_DIM];
+    }
+
     for (int s = 0; s < seqlen; ++s)
     {
         const bfloat16* gl_q = mixed_qkv + k_head * HEAD_DIM;
@@ -723,22 +743,16 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * HEAD_DIM) + head * HEAD_DIM + v_start;
         bfloat16* out = core_attn_out + head * HEAD_DIM + v_start;
 
-        float* gl_rs_r;
         float* gl_rs_w;
         if constexpr (save_history)
         {
-            bool first = (s == 0);
             bool last = (s == seqlen - 1);
-            float* history_r = first ? nullptr : slot_state + (size_t) s * state_size;
-            float* history_w = last  ? final_state : slot_state + (size_t) (s + 1) * state_size;
-            gl_rs_r = first ? final_state + head * HEAD_STATE_SIZE
-                            : history_r   + head * HEAD_STATE_SIZE;
-            gl_rs_w = history_w           + head * HEAD_STATE_SIZE;
+            float* history_w = last ? final_state : slot_state + (size_t) (s + 1) * state_size;
+            gl_rs_w = history_w + head * HEAD_STATE_SIZE;
         }
         else
         {
-            gl_rs_r = final_state + head * HEAD_STATE_SIZE;
-            gl_rs_w = gl_rs_r;
+            gl_rs_w = final_state + head * HEAD_STATE_SIZE;
         }
 
         float q = __bfloat162float(gl_q[t]);
@@ -777,31 +791,26 @@ void cuda_recurrent_gated_delta_rule_kernel_128
 
         __syncthreads();
 
-        if (t < V_CHUNK_DIM)
+        if (active)
         {
             float sum = 0.0f;
-            float* sh_k_rd = sh_k + bt * BTS;
-            float* sh_g_rd = sh_g + bt * BTS;
-            float* rs_rd = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
+            const float* sh_k_rd = sh_k + bt * BTS;
+            const float* sh_g_rd = sh_g + bt * BTS;
 
             #pragma unroll
-            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            for (int n = 0; n < BTS; ++n)
             {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++, sh_g_rd++)
-                {
-                    if constexpr (CHANNELWISE)
-                        // Decay folded per k-channel: kv_mem reads the decayed state
-                        sum = sum + *sh_k_rd * *sh_g_rd * *rs_rd;
-                    else
-                        sum = sum + *sh_k_rd * *rs_rd;
-                }
+                if constexpr (CHANNELWISE)
+                    // Decay folded per k-channel: kv_mem reads the decayed state
+                    sum = sum + sh_k_rd[n] * sh_g_rd[n] * st[n];
+                else
+                    sum = sum + sh_k_rd[n] * st[n];
             }
             sh_dot1[bt][t] = sum;
         }
         __syncthreads();
 
-        if (t < V_CHUNK_DIM)
+        if (active)
         {
             float g_h = CHANNELWISE ? 1.0f : __expf(g[head]);
             float beta_h = __bfloat162float(beta[head]);
@@ -811,23 +820,25 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             for (int s = 0; s < SUBK; ++s) dot1 += sh_dot1[s][t];
             float v = __bfloat162float(gl_v[t]) - dot1 * g_h;
             float v_out = 0.0f;
-            float* sh_k_rd = sh_k + bt * BTS;
-            float* sh_g_rd = sh_g + bt * BTS;
-            float* sh_q_rd = sh_q + bt * BTS;
-            float* rs_r = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
-            float* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
+            const float* sh_k_rd = sh_k + bt * BTS;
+            const float* sh_g_rd = sh_g + bt * BTS;
+            const float* sh_q_rd = sh_q + bt * BTS;
 
             #pragma unroll
-            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            for (int n = 0; n < BTS; ++n)
             {
+                st[n] = st[n] * (CHANNELWISE ? sh_g_rd[n] : g_h) + sh_k_rd[n] * v * beta_h;
+                v_out = v_out + sh_q_rd[n] * st[n];
+            }
+
+            // Without save_history every step overwrites the same final_state, so only the
+            // last one is observable
+            if (save_history || s == seqlen - 1)
+            {
+                float* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
                 #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_g_rd++, sh_q_rd++)
-                {
-                    float state = *rs_r;
-                    state = state * (CHANNELWISE ? *sh_g_rd : g_h) + *sh_k_rd * v * beta_h;
-                    *rs_w = state;
-                    v_out = v_out + *sh_q_rd * state;
-                }
+                for (int n = 0; n < BTS; ++n)
+                    rs_w[n * HEAD_DIM] = st[n];
             }
             sh_dot2[bt][t] = v_out;
         }
@@ -926,6 +937,20 @@ void cuda_recurrent_gated_delta_rule_gr
     }
 
     int v_split = (bsz == 1 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
+    // EXL3_GDN_V_SPLIT: read per call so both arms interleave in one process. v_split 4
+    // quarters each block's slice of the state columns and quadruples the grid, but leaves
+    // 3/4 of the 128-wide x dimension inactive in the state loops (`active = t < V_CHUNK_DIM`)
+    // while those threads still hold registers, run the q/k norm and hit every __syncthreads.
+    // Which side of that trade wins is a per-part occupancy question. Only 1 and 4 exist --
+    // the launcher's template dispatch is a 4-or-1 branch and threads.x is sized from the same
+    // value, so anything else would run the wrong kernel against the wrong block shape. Never
+    // force 4 where the guard above chose 1 (bsz > 1 or a non-128 head dim); that is a
+    // correctness condition, not a heuristic.
+    if (const char* vs = getenv("EXL3_GDN_V_SPLIT"))
+    {
+        int want = atoi(vs);
+        if (want == 1 || (want == 4 && v_split == 4)) v_split = want;
+    }
     TORCH_CHECK(v_head_dim % v_split == 0, "v_head_dim must be divisible by v_split");
 
     dim3 blocks(bsz, num_v_heads, v_split);  // group * num_k_heads

@@ -1207,7 +1207,7 @@ def mla_attn_triton_prefill(
     if block_m is None:
         block_m = 32 if qc is None else 16
     if block_n is None:
-        block_n = 32 if qc is None else 64
+        block_n = 32 if qc is None else (_qc_bn_override or 64)
     if num_stages is None:
         num_stages = 2 if qc is None else 1
 

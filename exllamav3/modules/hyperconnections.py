@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from .module import Module
@@ -7,6 +8,100 @@ from .rmsnorm import RMSNorm
 from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
+
+# The fused hc_*/gr_* entry points are absent from builds that exclude hc_mix.cu
+# (exllamav3_ext/build_config.py). Each call site below carries a torch equivalent, so gate
+# on the kernel existing, not just on the shape and dtype it wants.
+_HAS_HC_MIX = hasattr(ext, "hc_mix")
+_HAS_HC_APPLY = hasattr(ext, "hc_apply")
+_HAS_HC_HEAD = hasattr(ext, "hc_head")
+_HAS_GR_MIX = hasattr(ext, "gr_mix")
+_HAS_GR_MIX_Q = hasattr(ext, "gr_mix_q")
+
+# (fn bits, up bits). The two GatedResidual kernels read one weight each, so the widths are
+# independent: int4fn / int4up exist because 4 bits costs very differently on the two sides --
+# fn feeds the 320-wide bottleneck AND the inject gates, up only feeds a sigmoid per channel.
+_Q_MODES = {"off": None, "int8": (8, 8), "int4": (4, 4), "int4fn": (4, 8), "int4up": (8, 4)}
+_HC_QUANT = (os.environ.get("EXL3_HC_QUANT") or "off").strip().lower()
+if _HC_QUANT not in _Q_MODES:
+    raise ValueError(f"EXL3_HC_QUANT: unknown mode {_HC_QUANT!r}, "
+                     f"expected one of {sorted(_Q_MODES)}")
+
+# Row count above which the mix takes the GEMM path instead of the fused kernels. The fp16
+# gr_mix grids on (., R) with r = blockIdx.y, so block (j, r) reads fn row j for stream row
+# r: the weight is re-read once PER STREAM ROW, and a speculative verify mixing R = ndt + 1
+# rows pays it R times, while the GEMM path reads proj_h / up_h once whatever R is. int8 no
+# longer pays that -- gr_mix_q tiles GR_R_TILE rows inside the block (hc_mix.cu) and reads
+# the weight ceil(R / GR_R_TILE) times -- so this knob is a live lever only for
+# EXL3_HC_QUANT=off. It stays because it is the only way to put the two paths against each
+# other inside one process.
+#
+# Read PER CALL, never at import: specdepth applies A/B env deltas per sample inside ONE
+# process because the cross-process spread (4.3%) swamps the effects being measured, and a
+# knob resolved at import silently no-ops as an arm while still emitting a plausible row.
+def fused_max_r(default: int) -> int:
+    v = os.environ.get("EXL3_HC_FUSED_MAX_R")
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except ValueError as e:
+        raise ValueError(f"EXL3_HC_FUSED_MAX_R: expected an integer, got {v!r}") from e
+
+
+# Reduction-axis group sizes for int4. Q4_UP_GROUP is fixed at 64 by the finalize kernel's
+# warp-strided rank walk (32 rank PAIRS per warp step = one group per step, no division);
+# Q4_FN_GROUP is free as long as it is 16 << k, one thread step being 16 codes.
+Q4_FN_GROUP = int(os.environ.get("EXL3_HC_Q4_FN_GROUP", "128"))
+Q4_UP_GROUP = 64
+
+
+def _q4_sym(t: torch.Tensor, dim: int, group: int):
+    """Symmetric int4 with fp16 scales per `group` elements along `dim` (the reduction axis).
+    Returns codes in [-7, 7] shaped like t, and the scale with `dim` folded to n_groups."""
+    n = t.shape[dim]
+    assert n % group == 0, f"q4: axis {n} not divisible by group {group}"
+    dim = dim % t.dim()
+    shape = t.shape[:dim] + (n // group, group) + t.shape[dim + 1:]
+    tg = t.reshape(shape)
+    s = (tg.float().abs().amax(dim = dim + 1, keepdim = True) / 7.0).clamp_(min = 2.0 ** -24).half()
+    q = (tg.float() / s.float()).round_().clamp_(-7.0, 7.0).to(torch.int8)
+    return q.reshape(t.shape).contiguous(), s.squeeze(dim + 1)
+
+
+def _q4_pack_fn(codes: torch.Tensor):
+    """(M, H, D) int4 codes -> (M, H * D / 2) uint8, byte k = code 2k | code 2k+1 << 4."""
+    m, h, d = codes.shape
+    c = codes.reshape(m, h, d // 2, 2).to(torch.int16) + 8
+    return (c[..., 0] | (c[..., 1] << 4)).to(torch.uint8).reshape(m, h * d // 2).contiguous()
+
+
+def _q4_unpack_fn(packed: torch.Tensor, d: int):
+    m = packed.shape[0]
+    b = packed.reshape(m, -1, d // 2).to(torch.int16)
+    return torch.stack(((b & 0xF) - 8, (b >> 4) - 8), dim = -1).reshape(m, -1, d).to(torch.int8)
+
+
+def _q4_pack_upx(codes: torch.Tensor):
+    """(H, D/4, LR, 4) int4 codes -> (H, D/4, LR/2, 4) uint8, pairing ranks 2p | 2p+1."""
+    h, dq, lr, four = codes.shape
+    c = codes.reshape(h, dq, lr // 2, 2, four).to(torch.int16) + 8
+    return (c[:, :, :, 0] | (c[:, :, :, 1] << 4)).to(torch.uint8).contiguous()
+
+
+def _q4_unpack_upx(packed: torch.Tensor, lr: int):
+    b = packed.to(torch.int16)
+    return torch.stack(((b & 0xF) - 8, (b >> 4) - 8), dim = 3) \
+        .reshape(packed.shape[0], packed.shape[1], lr, packed.shape[3]).to(torch.int8)
+
+
+def _q8_sym(t: torch.Tensor, dim: int):
+    # Rounds against the fp16-ROUNDED scale, so q * scale in the kernel is the exact product
+    # this quantized to and the error bound is the int8 grid alone
+    s = (t.float().abs().amax(dim = dim, keepdim = True) / 127.0).clamp_(min = 2.0 ** -24).half()
+    q = (t.float() / s.float()).round_().clamp_(-127.0, 127.0).to(torch.int8)
+    return q.contiguous(), s
+
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -118,7 +213,8 @@ class HyperConnection(Module):
         (both block consumers cast it immediately); the torch fallback keeps fp32."""
         hc = self.hc_mult
         b, s, H, D = streams.shape
-        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous():
+        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous() \
+                and _HAS_HC_MIX:
             R = b * s
             st = streams.view(R, H, D)
             chunks = ext.hc_mix_num_chunks(R, H * D)
@@ -177,7 +273,8 @@ class HyperConnection(Module):
         path: the capture and advance passes forward the SAME stored input states twice."""
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
-        if not converting and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
+        if not converting and _HAS_HC_APPLY \
+                and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
@@ -265,6 +362,12 @@ class GatedResidual(Module):
         self.inject_h = None        # (hc_mult, hc_mult * hidden) half (site form)
         self.proj_h = None          # cat(down, inject) half, unfolded (GEMM path)
         self.fn_h = None            # cat(down, inject) * w half, folded (fused path)
+        self.fn_q = None            # fn_h int8 (EXL3_HC_QUANT=int8), fn_qs (M, hc_mult) half
+        self.fn_qs = None
+        self.upx_q = None           # upx_h int8, upx_qs (hc_mult * hidden) half
+        self.upx_qs = None
+        self.fn_rows = 0
+        self.qbits = _Q_MODES[_HC_QUANT] if _HAS_GR_MIX_Q else None
         self.rank = 0
 
     @override
@@ -307,12 +410,44 @@ class GatedResidual(Module):
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
+        self.fn_rows = M
+        if self.qbits:
+            # Scale axis = the NON-reduction axis of each matmul at 8 bits, so dequant is a
+            # single post-accumulation multiply and costs nothing per element: fn is dotted
+            # along H * D but gr_dots reduces the H stream slices separately, so the finer
+            # (row, stream) scale is free, and up is dotted along the rank, so its scale is
+            # per output channel, laid out like w and folded into the finalize kernel's
+            # existing half4 read. At 4 bits that does not hold -- 15 levels cannot span a
+            # 2560- or 320-long row -- so the scale moves ONTO the reduction axis in groups
+            # and the dequant moves inside the accumulation loop.
+            fn_bits, up_bits = self.qbits
+            if fn_bits == 8:
+                fn_q, fn_qs = _q8_sym(self.fn_h.view(M, H, Dh), -1)
+                self.fn_q = fn_q.view(M, H * Dh)
+                self.fn_qs = fn_qs.reshape(M * H).contiguous()
+            else:
+                fn_c, fn_s = _q4_sym(self.fn_h.view(M, H, Dh), -1, Q4_FN_GROUP)
+                self.fn_q = _q4_pack_fn(fn_c)
+                self.fn_qs = fn_s.reshape(-1).contiguous()
+            if up_bits == 8:
+                self.upx_q, upx_qs = _q8_sym(self.upx_h, -2)
+                self.upx_qs = upx_qs.reshape(H * Dh).contiguous()
+            else:
+                upx_c, upx_s = _q4_sym(self.upx_h, -2, Q4_UP_GROUP)
+                self.upx_q = _q4_pack_upx(upx_c)
+                # group-major so the finalize kernel still reads a quad's four channels in
+                # one half4
+                self.upx_qs = upx_s.permute(2, 0, 1, 3).reshape(-1, H * Dh).contiguous()
+            # Only the fused decode path reads these; the GEMM path and get_tensors go through
+            # proj_h / up_h, which stay fp16
+            self.fn_h = self.upx_h = None
 
     @override
     def unload(self):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = self.fn_h = None
+        self.fn_q = self.fn_qs = self.upx_q = self.upx_qs = None
 
     @override
     def get_tensors(self):
@@ -360,7 +495,7 @@ class GatedResidual(Module):
             s3 = s3.contiguous()
         dev = s3.device
 
-        if R <= self.FUSED_MAX_R:
+        if _HAS_GR_MIX and R <= fused_max_r(self.FUSED_MAX_R):
             # Decode/MTP-class row counts (the fused path's whole domain) take bucketed
             # workspaces from the per-device static cache, shared by every GatedResidual site
             # on the device: a site's outputs are consumed (block input, apply_) before the
@@ -371,11 +506,15 @@ class GatedResidual(Module):
                 if cached:
                     return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
                 return torch.empty((numel,), dtype = dtype, device = dev)
-            M = self.fn_h.shape[0] + 1
+            M = self.fn_rows + 1
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+            if self.qbits:
+                ext.gr_mix_q(s3, self.fn_q, self.fn_qs, self.upx_q, self.upx_qs, self.w_h,
+                             self.rms_eps, dots, post, mixed)
+            else:
+                ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         else:
             post = torch.empty((R, H), dtype = torch.float, device = dev) \
                 if self.use_combine else None
@@ -408,7 +547,7 @@ class GatedResidual(Module):
         """Residual update for one sublayer site, in place: x <- x + post (x) y (comb unused).
         Conversion must NOT run the in-place path: the capture and advance passes forward the
         SAME stored input states twice (mHC apply_ has the same guard)."""
-        if "quant_preserve" in params or "capture" in params:
+        if "quant_preserve" in params or "capture" in params or not _HAS_HC_APPLY:
             return x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
         b, s = x.shape[:2]
         y2 = y.reshape(b * s, self.hidden_size)
@@ -569,7 +708,7 @@ class HyperHead(Module):
         if self.mean:
             return x.mean(dim = 2)
         b, s, H, D = x.shape
-        if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
+        if _HAS_HC_HEAD and H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)
             partials = g_tensor_cache.get_bucketed(

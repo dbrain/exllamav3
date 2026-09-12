@@ -5,7 +5,7 @@ if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
 import numpy as np
-from .pagetable import Sequence, tensor_hash_checksum, random_hash
+from .pagetable import Sequence, random_hash
 from .filter import Filter
 import random
 import time
@@ -646,42 +646,7 @@ class Job:
             # Hash completed page
             if page_after > page_before:
                 assert page_after == page_before + 1
-
-                page = seq.allocated_pages[page_before]
-
-                if page_before > 0:
-                    last_page = seq.allocated_pages[page_before - 1]
-                    last_hash = last_page.phash
-                else:
-                    last_hash = None
-
-                page_ids = seq.sequence_ids.torch_slice(page_before * PAGE_SIZE, page_after * PAGE_SIZE)
-                new_hash = tensor_hash_checksum(page_ids, last_hash)
-
-                # If another referenced page has the same hash, switch to referencing that instead
-                if new_hash in self.pagetable.referenced_pages:
-                    new_serial = page.access_serial
-                    page.sub_ref()
-                    page = self.pagetable.referenced_pages[new_hash]
-                    assert page.kv_position == PAGE_SIZE
-                    seq.allocated_pages[page_before] = page
-                    seq.build_block_index_tensor()
-                    page.add_ref(new_serial)
-
-                else:
-                    # If an unreferenced page has the same hash, clear that page
-                    if new_hash in self.pagetable.unreferenced_pages:
-                        up = self.pagetable.unreferenced_pages[new_hash]
-                        up.clear()
-
-                    # Update the hash
-                    page.update_hash(new_hash)
-
-                # Allow completing the final page without starting a new one (for requeue)
-                if page_after < len(seq.allocated_pages):
-                    page = seq.allocated_pages[page_after]
-                    page.prev_hash = new_hash
-                    page.can_revert = False
+                seq.commit_page(self.pagetable, page_before)
 
         # Stream output
 
@@ -1464,6 +1429,9 @@ class Job:
                 if recurrent_last_page:
                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
 
+                if seq.prefill_complete:
+                    self.register_tail_checkpoint(seq)
+
 
         if progress:
             r = {
@@ -1510,12 +1478,15 @@ class Job:
                 else:
                     self.recurrent_state = self.generator.cache.new_from_stashed(
                         stashed_recurrent_state,
-                        position = cached_pages * PAGE_SIZE,
+                        # The resume point, which a partial-tail hit puts past the page-aligned
+                        # prefix; unstash() asserts it matches the checkpoint's own position
+                        position = seq.kv_position,
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
 
             # Metrics
             self.cached_pages += cached_pages
+            self.cached_tokens += seq.tail_restored
             self.total_pages += allocated_pages
             self.non_sequential_pages += non_sequential_pages
 
@@ -1577,6 +1548,19 @@ class Job:
             return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
         else:
             return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
+
+
+    def register_tail_checkpoint(self, seq = None):
+        """
+        Make the sequence's partial tail page a resume point. maybe_stash_recurrent only checkpoints
+        page boundaries, which leaves the prompt's last 0..PAGE_SIZE-1 tokens unreachable from the
+        prompt cache and re-prefilled on every warm request.
+        """
+        if self.generator.recurrent_cache is None or self.recurrent_state is None:
+            return
+        for s in (self.sequences if seq is None else [seq]):
+            if s.allocated_pages:
+                s.register_tail(self.pagetable, self.generator.recurrent_cache, self.recurrent_state)
 
 
     def mm_exact_spans(self, seq):

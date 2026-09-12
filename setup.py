@@ -19,11 +19,26 @@ if precompile and not torch:
 windows = os.name == "nt"
 
 extra_cflags = []
-extra_cuda_cflags = [
-    "-lineinfo", "-O3", "--use_fast_math",
-    "-Xcudafe", "--diag_suppress=177",
-    "-Xcudafe", "--diag_suppress=20012",
-]
+extra_cuda_cflags = []
+
+if torch and torch_version.hip:
+    extra_cuda_cflags += ["-O3", "-DUSE_ROCM"]
+    extra_cflags += ["-DUSE_ROCM"]
+    # HIP's runtime headers define __noinline__ as an object-like macro. libstdc++ 16
+    # spells an attribute [[__gnu__::__noinline__]] in <format>, and the macro eats the
+    # identifier, so any TU that reaches <format> *after* a HIP header fails to parse
+    # ("expected an identifier for the attribute name"). ATen/hip/HIPContext.h does
+    # exactly that: it pulls hip_runtime_api.h, then ATen/Context.h -> <chrono> ->
+    # <format>. Forcing <format> in ahead of everything is order-independent, the same
+    # reasoning as NOMINMAX below.
+    extra_cflags += ["-include", "format"]
+    extra_cuda_cflags += ["-include", "format"]
+else:
+    extra_cuda_cflags += [
+        "-lineinfo", "-O3", "--use_fast_math",
+        "-Xcudafe", "--diag_suppress=177",
+        "-Xcudafe", "--diag_suppress=20012",
+    ]
 
 if windows:
     # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
@@ -48,6 +63,10 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
 
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+    # ROCm 7.14 ships clang 22, which treats the deprecated `register` keyword as
+    # a hard error in C++17 mode (older ROCm toolchains only warned).
+    extra_cflags += ["-Wno-register"]
+    extra_cuda_cflags += ["-Wno-register"]
 
 extra_compile_args = {
     "cxx": extra_cflags,
@@ -56,12 +75,14 @@ extra_compile_args = {
 
 library_dir = "exllamav3"
 sources_dir = os.path.join(library_dir, extension_name)
-sources = [
-    os.path.relpath(os.path.join(root, file), start=os.path.dirname(__file__))
-    for root, _, files in os.walk(sources_dir)
-    for file in files
-    if file.endswith(('.c', '.cpp', '.cu'))
-]
+
+from exllamav3.exllamav3_ext.build_config import get_sources as _get_sources
+
+is_rocm = bool(torch and torch_version.hip)
+if is_rocm:
+    from exllamav3.util.arch_list import maybe_set_arch_list_env
+    maybe_set_arch_list_env()
+sources = _get_sources(sources_dir, is_rocm, base_dir=os.path.dirname(__file__))
 
 setup_kwargs = (
     {
@@ -70,6 +91,7 @@ setup_kwargs = (
                 extension_name,
                 sources,
                 extra_compile_args=extra_compile_args,
+                include_dirs=[sources_dir],
                 libraries=["cublas"] if windows else [],
             )
         ],

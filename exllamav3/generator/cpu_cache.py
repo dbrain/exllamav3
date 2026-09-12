@@ -4,6 +4,8 @@ import threading
 import torch
 from collections import deque
 from ..constants import PAGE_SIZE
+from .disk_cache import DiskPageTier
+from .disk_store import store_fingerprint
 
 
 def _align(n: int, a: int) -> int:
@@ -36,6 +38,9 @@ class CPUPageCache:
         self,
         caches: list,
         max_size: int,
+        disk_dir: str | None = None,
+        disk_size: int = 0,
+        disk_identity: dict | None = None,
     ):
         """
         :param caches:
@@ -50,6 +55,19 @@ class CPUPageCache:
         :param max_size:
             Capacity in bytes of pinned system memory. Slots are allocated lazily as pages are pushed, so this
             is a ceiling, not an up-front allocation
+
+        :param disk_dir:
+            Root directory of a durable third tier (DiskPageTier), None to disable. Pages are written there as
+            well as to host RAM and survive the process, so a returning context is paged back in instead of
+            re-prefilled
+
+        :param disk_size:
+            Capacity in bytes of the durable tier
+
+        :param disk_identity:
+            Fields identifying the model and build that produced these pages (model directory, quantization,
+            cache dtype, EXL3_HC_QUANT, ...). Combined with the measured page layout into the fingerprint that
+            scopes the store on disk
         """
 
         # A draft cache belongs to the draft model, with its own workers and its own view of which cache ids
@@ -109,6 +127,30 @@ class CPUPageCache:
 
         self.pagetable = None
 
+        # Durable tier. The fingerprint combines the caller's model/build identity with the page layout measured
+        # above, so a restore across any change that moves bytes within a slot refuses instead of reinterpreting
+        self.disk = None
+        self.pending_disk = set()
+        if disk_dir and disk_size:
+            assert not self.tp, "Durable page cache tier is not supported in tensor-parallel mode."
+            assert self.segments, "No local cache tensors to build a durable page cache tier from."
+            identity = disk_identity or {}
+            fingerprint = store_fingerprint({
+                **identity,
+                "page_size": PAGE_SIZE,
+                "slab_size": self.slab_size,
+                "layout": [[list(shape), str(dtype), off] for _, off, shape, dtype in self.segments],
+            })
+            self.disk = DiskPageTier(
+                disk_dir, fingerprint, disk_size, self.slab_size, store_fingerprint(identity)
+            )
+            # Staging buffers for pages persisted while they are still live in VRAM. Deliberately separate from
+            # the slot table: a page that is resident in VRAM needs no host copy, so routing write-through
+            # through the slots would evict host entries for contexts that do need one
+            self.staging_free = deque()
+            self.staging_count = 0
+            self.max_staging = max(4, 2 * self.disk.writer.q.maxsize)
+
         # phash -> {slot, prev_hash, access_serial, tokens}
         self.entries = {}
         self.slot_slabs = []
@@ -129,6 +171,7 @@ class CPUPageCache:
             "restores": 0,      # pages copied back into the GPU cache at allocation
             "evictions": 0,     # tier entries dropped to make room
             "cold_allocs": 0,   # pushes that had to pin a slab synchronously (spare pool was empty)
+            "disk_restores": 0, # pages paged back in from the durable tier
         }
         # cold_allocs is the sum of the two halves, since a slot can have a local slab and per-rank buffers
         self._local_cold_allocs = 0
@@ -151,11 +194,30 @@ class CPUPageCache:
 
 
     def __contains__(self, phash: bytes):
-        return phash in self.entries
+        return phash in self.entries or (self.disk is not None and phash in self.disk)
 
 
     def __len__(self):
-        return len(self.entries)
+        return len(self.entries) + (len(self.disk) if self.disk is not None else 0)
+
+
+    def prev_hash_of(self, phash: bytes):
+        """
+        (present, prev_hash) for a stored page, across both tiers. The durable tier can drop an entry between a
+        membership test and this call, so presence is reported rather than assumed.
+        """
+        e = self.entries.get(phash)
+        if e is not None:
+            return True, e["prev_hash"]
+        if self.disk is not None:
+            return self.disk.prev_hash(phash)
+        return False, None
+
+
+    def prev_hash_links(self) -> dict:
+        links = self.disk.links() if self.disk is not None else {}
+        links.update({h: e["prev_hash"] for h, e in self.entries.items()})
+        return links
 
 
     def _make_slab(self):
@@ -222,10 +284,16 @@ class CPUPageCache:
                 self._build_order()
                 deferred = 0
             h = self._order.popleft()
-            if protect and h in protect and deferred < len(self.entries):
+            e = self.entries.get(h)
+            pending = e is not None and e["slot"] in self.pending_disk
+            if (pending or (protect and h in protect)) and deferred < len(self.entries):
                 self._order.append(h)
                 deferred += 1
                 continue
+            if pending:
+                # Nothing unprotected is left, and handing out a slot the writer is still reading would turn a
+                # record into a blend of two pages; waiting for the writer is the only safe option
+                self.disk.drain()
             self._order_pops += 1
             e = self.entries.pop(h, None)
             if e is not None:
@@ -293,6 +361,7 @@ class CPUPageCache:
         if e is not None:
             e["access_serial"] = serial
             self.metrics["dedup_hits"] += 1
+            self._persist(page.phash, e)
             return
         slot = self._new_slot(protect)
         for v, (t, _, _, _) in zip(self.slot_views[slot] if self.segments else (), self.segments):
@@ -305,22 +374,65 @@ class CPUPageCache:
                 m.tp_cpu_cache_store(ids, slot, page.page_index) for m, ids in self.tp_groups
             )
             self.metrics["cold_allocs"] = self._local_cold_allocs + self._tp_cold_allocs
-        self.entries[page.phash] = {
+        entry = {
             "slot": slot,
             "prev_hash": page.prev_hash,
             "access_serial": serial,
             "tokens": page.sequence.clone(),
         }
+        self.entries[page.phash] = entry
         self.metrics["pushes"] += 1
+        self._persist(page.phash, entry)
 
 
-    def fetch(self, phash: bytes, page_index: int, serial: int) -> dict:
+    def _persist(self, phash: bytes, entry: dict):
+        if self.disk is None:
+            return
+        slot = entry["slot"]
+        if slot in self.pending_disk:
+            return
+        event = torch.cuda.Event()
+        event.record()
+        self.pending_disk.add(slot)
+        self.disk.schedule(
+            phash, entry["prev_hash"], entry["tokens"], self.slot_slabs[slot], event,
+            lambda s = slot: self.pending_disk.discard(s),
+        )
+
+
+    def _page_in(self, phash: bytes, protect: set | None) -> dict | None:
+        """
+        Bring one page back from the durable tier into a host slot. Returns the new entry, or None if the
+        record is gone or failed verification.
+        """
+        slot = self._new_slot(protect)
+        loaded = self.disk.load(phash, self.slot_slabs[slot])
+        if loaded is None:
+            self.free_slots.append(slot)
+            return None
+        prev_hash, tokens = loaded
+        entry = {
+            "slot": slot,
+            "prev_hash": prev_hash,
+            "access_serial": 0,
+            "tokens": tokens,
+        }
+        self.entries[phash] = entry
+        self.metrics["disk_restores"] += 1
+        return entry
+
+
+    def fetch(self, phash: bytes, page_index: int, serial: int, protect: set | None = None) -> dict | None:
         """
         Copy a stored page back into the GPU cache at page_index (host-to-device, async on the current stream).
         The entry remains in the tier; the restored copy may well be evicted again before this one goes stale.
         Returns the entry so the caller can restore page metadata (token IDs).
         """
-        e = self.entries[phash]
+        e = self.entries.get(phash)
+        if e is None:
+            e = self._page_in(phash, protect)
+            if e is None:
+                return None
         e["access_serial"] = serial
         for v, (t, _, _, _) in zip(self.slot_views[e["slot"]] if self.segments else (), self.segments):
             t[page_index].copy_(v, non_blocking = True)
@@ -328,3 +440,55 @@ class CPUPageCache:
             m.tp_cpu_cache_fetch(ids, e["slot"], page_index)
         self.metrics["restores"] += 1
         return e
+
+
+    def _take_staging(self):
+        if self.staging_free:
+            return self.staging_free.popleft()
+        if self.staging_count >= self.max_staging:
+            return None
+        self.staging_count += 1
+        return self._make_slab()
+
+
+    def persist(self, page) -> bool:
+        """
+        Write one complete, content-addressed page to the durable tier without disturbing the host tier, for
+        pages that are still live in VRAM and would otherwise only be persisted when they are evicted. Returns
+        False if the page is already stored or no staging buffer is free; the caller retries on a later sweep.
+        """
+        if self.disk is None or self.disk.will_store(page.phash):
+            return False
+        buf = self._take_staging()
+        if buf is None:
+            return False
+        slab, views = buf
+        for v, (t, _, _, _) in zip(views, self.segments):
+            v.copy_(t[page.page_index], non_blocking = True)
+        event = torch.cuda.Event()
+        event.record()
+        return self.disk.schedule(
+            page.phash, page.prev_hash, page.sequence.clone(), slab, event,
+            lambda b = buf: self.staging_free.append(b),
+        )
+
+
+    def staging_capacity(self) -> int:
+        if self.disk is None:
+            return 0
+        q = self.disk.writer.q
+        return min(
+            len(self.staging_free) + (self.max_staging - self.staging_count),
+            q.maxsize - q.qsize(),
+        )
+
+
+    def drain_disk(self):
+        if self.disk is not None:
+            self.disk.drain()
+
+
+    def close(self):
+        if self.disk is not None:
+            self.disk.drain()
+            self.disk.close()

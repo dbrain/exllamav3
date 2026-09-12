@@ -14,7 +14,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
-from compare_deepseek_v4_hf_ import make_checkpoint, TINY
+from util import skip_module
+
+try:
+    from compare_deepseek_v4_hf_ import make_checkpoint, TINY
+except ImportError:
+    skip_module("tests/compare_deepseek_v4_hf_.py (tiny DSv4 checkpoint generator) "
+                "is not part of this repo")
+
 from exllamav3 import Config, Model
 from exllamav3.modules.dsv4 import DSV4CompressorState
 

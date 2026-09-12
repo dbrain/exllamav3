@@ -3,10 +3,15 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
 from exllamav3 import Config, Model
+from util import resolve_device, skip_module
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-test_model = "/mnt/str/eval_models/llama3.1-8b-instruct/exl3/3.0bpw/"
+test_model = os.environ.get("EXL3_TEST_MODEL",
+                            "/mnt/str/eval_models/llama3.1-8b-instruct/exl3/3.0bpw/")
+
+if not os.path.isdir(test_model):
+    skip_module(f"quantized reference model not available: {test_model}")
 
 test_keys = [
     ("model.layers.0.self_attn.q_proj", "model.layers.0.input_layernorm"),
@@ -20,7 +25,7 @@ test_keys = [
 ]
 
 devices = [
-    "cuda:2"
+    resolve_device()
 ]
 
 batch_sizes = [1, 2, 8, 16, 17, 31, 32, 33, 256, 2048]

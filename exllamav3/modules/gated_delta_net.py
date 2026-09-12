@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -26,6 +27,37 @@ from ..cache.recurrent import (
 )
 from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
+
+
+_BA_GEMV_MODES = {"0": 0, "1": 1, "split": 2}
+
+# Merge (or just re-kernel) the small b/a projections in the Torch split-projection path.
+# Both are LinearFP16 with out_dtype = float against a half weight, so fp16.py:96 issues
+# ext.hgemm: 2 launches per layer for a (M, hidden) x (hidden, num_v_heads) GEMV whose
+# weight is 246 KB. ext.gdn_ba_gemv is what the C++ BC path runs for the same thing
+# (libtorch/gated_delta_net.cpp:210) and it is compiled on ROCm even though the BC classes
+# are not.
+#
+# Read PER CALL, never at import: the A/B harnesses apply env deltas per sample inside ONE
+# process because the cross-process spread swamps the effect, and a mode resolved at import
+# silently no-ops as an arm while still emitting a plausible row.
+# Largest row count at which gdn_ba_gemv still beats the two hgemm calls it replaces on
+# gfx1150 at this shape (K 2560, N 48). Measured break-even: at 64 rows both modes still win
+# with disjoint ranges (1.13x merged / 1.47x split), at 96 both ranges overlap the baseline
+# and at 128 the merged mode is 0.71x. Above it the kernel's per-row weight re-read dominates
+# and a tiled GEMM is the right shape. perf/exl3/ledger-gdnba-breakeven.csv
+_BA_GEMV_MAX_ROWS = 64
+
+
+def _ba_gemv_mode() -> int:
+    v = os.environ.get("EXL3_GDN_BA_GEMV")
+    if v is None or v == "":
+        return 0
+    v = v.strip().lower()
+    if v not in _BA_GEMV_MODES:
+        raise ValueError(f"EXL3_GDN_BA_GEMV: unknown mode {v!r}, "
+                         f"expected one of {sorted(_BA_GEMV_MODES)}")
+    return _BA_GEMV_MODES[v]
 
 
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
@@ -689,7 +721,7 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
-            self.bc_split = True
+            self.bc_split = self.bc is not None
 
             # Sliced qkv+z bundle: both projections read x and are cut into equal-width column
             # slices run as one launch (SlicedMultiLinear); the graph object gets the tables, the
@@ -946,6 +978,63 @@ class GatedDeltaNet(Module):
         )
 
 
+    def _fill_ba_weight(self):
+        # b rows then a rows, the order BC_GatedDeltaNetSplit packs for gdn_ba_gemv. Filled
+        # from forward rather than from load(): under deferred loading the projections are
+        # not materialized when the module is prepared, so a copy there would fetch garbage
+        if self.ba_weight_filled:
+            return
+        nv = self.num_v_heads
+        b_bias = self.b_proj.inner.get_bias_tensor()
+        a_bias = self.a_proj.inner.get_bias_tensor()
+        if self.ba_weight_t is None:
+            self.ba_weight_t = torch.empty(
+                (2 * nv, self.hidden_size), dtype = torch.half, device = self.device
+            )
+        if self.ba_bias is None and (b_bias is not None or a_bias is not None):
+            self.ba_bias = torch.empty((2 * nv,), dtype = torch.half, device = self.device)
+        self.ba_weight_t.copy_(torch.cat([
+            self.b_proj.inner.get_weight_tensor(),
+            self.a_proj.inner.get_weight_tensor(),
+        ], dim = -1).T)
+        if self.ba_bias is not None:
+            if b_bias is None: b_bias = torch.zeros(nv, dtype = torch.half, device = self.device)
+            if a_bias is None: a_bias = torch.zeros(nv, dtype = torch.half, device = self.device)
+            self.ba_bias.copy_(torch.cat([b_bias, a_bias]))
+        self.ba_weight_filled = True
+
+
+    def _ba_proj(self, x: torch.Tensor, params: dict, bsz: int, seqlen: int):
+        mode = _ba_gemv_mode()
+        rows = bsz * seqlen
+        # gdn_ba_gemv grids one warp per output feature per input row, so it re-reads the
+        # whole weight for every row and stops paying above _BA_GEMV_MAX_ROWS
+        if mode == 0 or rows > _BA_GEMV_MAX_ROWS:
+            return self.b_proj.forward(x, params), self.a_proj.forward(x, params)
+
+        self._fill_ba_weight()
+        nv = self.num_v_heads
+        xf = x.view(rows, x.shape[-1])
+        bias = self.ba_bias
+
+        if mode == 2:
+            b = torch.empty((rows, nv), dtype = torch.float, device = self.device)
+            a = torch.empty((rows, nv), dtype = torch.float, device = self.device)
+            ext.gdn_ba_gemv(xf, self.ba_weight_t[:nv], None if bias is None else bias[:nv], b)
+            ext.gdn_ba_gemv(xf, self.ba_weight_t[nv:], None if bias is None else bias[nv:], a)
+            return b.view(bsz, seqlen, nv), a.view(bsz, seqlen, nv)
+
+        ba = torch.empty((rows, 2 * nv), dtype = torch.float, device = self.device)
+        ext.gdn_ba_gemv(xf, self.ba_weight_t, bias, ba)
+        if rows == 1:
+            return ba[:, :nv].view(bsz, seqlen, nv), ba[:, nv:].view(bsz, seqlen, nv)
+        # gated_delta_net_fused_op_2 indexes b and a as dense [B,S,H] off data_ptr and checks
+        # only their shapes (gdn.cu:256), so the packed halves have to be physically split.
+        # One strided copy of 2*rows*nv floats, against the hgemm launch it replaces
+        ba = ba.view(rows, 2, nv).transpose(0, 1).contiguous()
+        return ba[0].view(bsz, seqlen, nv), ba[1].view(bsz, seqlen, nv)
+
+
     @override
     def forward(
         self,
@@ -1003,18 +1092,7 @@ class GatedDeltaNet(Module):
             self.kda_gb_t.copy_(self.g_b_proj.inner.get_weight_tensor().T)
             self.ba_weight_filled = True
         elif self.bc_split and not self.ba_weight_filled:
-            self.ba_weight_t.copy_(torch.cat([
-                self.b_proj.inner.get_weight_tensor(),
-                self.a_proj.inner.get_weight_tensor(),
-            ], dim = -1).T)
-            if self.ba_bias is not None:
-                nv = self.num_v_heads
-                b_bias = self.b_proj.inner.get_bias_tensor()
-                a_bias = self.a_proj.inner.get_bias_tensor()
-                if b_bias is None: b_bias = torch.zeros(nv, dtype = torch.half, device = self.device)
-                if a_bias is None: a_bias = torch.zeros(nv, dtype = torch.half, device = self.device)
-                self.ba_bias.copy_(torch.cat([b_bias, a_bias]))
-            self.ba_weight_filled = True
+            self._fill_ba_weight()
 
         # Fused C++ path for decode with split projections, generalized over (bsz, seqlen) up to
         # (_BC_MAX_BSZ, _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
@@ -1089,8 +1167,7 @@ class GatedDeltaNet(Module):
                 qkv = self.qkv_proj.forward(x, params)
                 z = self.z_proj.forward(x, params)
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
-            b = self.b_proj.forward(x, params)
-            a = self.a_proj.forward(x, params)
+            b, a = self._ba_proj(x, params, bsz, seqlen)
 
             mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
 

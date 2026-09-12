@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
+from .disk_cache import DiskCheckpointTier
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
 from .filter import Filter
@@ -39,6 +41,9 @@ class Generator:
         show_visualizer: bool = False,
         enable_defrag: bool = True,
         cpu_cache_size: int = 0,
+        disk_cache_dir: str | None = None,
+        disk_cache_size: int = 0,
+        disk_checkpoint_size: int | None = None,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
@@ -119,6 +124,21 @@ class Generator:
             Size in bytes of a second-tier page cache in pinned system memory, 0 (default) to disable. Complete
             K/V pages evicted from the GPU cache are stored there and restored on prompt-cache hits instead of
             being recomputed by prefill. Not currently supported in tensor-parallel mode
+
+        :param disk_cache_dir:
+            Root directory of a durable third tier, None (default) to disable. Complete K/V pages and, on hybrid
+            models, the recurrent checkpoints that anchor them are written there as well as to host RAM, so a
+            context returning in a later process is paged back in instead of re-prefilled. Requires
+            cpu_cache_size, since disk records are paged in through the host tier's pinned slots. Records are
+            scoped on disk by a fingerprint over the model files, the draft model, the cache layout and
+            EXL3_HC_QUANT, so a store written by a different build is never read, only ignored
+
+        :param disk_cache_size:
+            Capacity in bytes of the durable tier's K/V pages, 0 (default) to disable
+
+        :param disk_checkpoint_size:
+            Capacity in bytes of the durable tier's recurrent checkpoints. Default is one eighth of
+            disk_cache_size, which is roughly the ratio the two occupy at the default checkpoint interval
 
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
@@ -205,13 +225,25 @@ class Generator:
                 pin_memory = False
             )
 
-        # CPU page cache tier
+        # CPU page cache tier, and the durable tier beneath it
+        self.disk_cache_dir = disk_cache_dir
+        self.disk_cache_size = disk_cache_size if disk_cache_dir else 0
         self.cpu_page_cache = None
         if cpu_cache_size:
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
-            self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
+            self.cpu_page_cache = CPUPageCache(
+                tier_caches,
+                cpu_cache_size,
+                disk_dir = disk_cache_dir,
+                disk_size = self.disk_cache_size,
+                disk_identity = self.disk_identity(),
+            )
             self.cpu_page_cache.attach(self.pagetable)
             self.pagetable.cpu_tier = self.cpu_page_cache
+        else:
+            assert not self.disk_cache_size, \
+                "Durable page cache tier requires cpu_cache_size: disk records are paged in through the " \
+                "host tier's pinned slots."
 
         # Visualizer
         if show_visualizer:
@@ -225,7 +257,17 @@ class Generator:
         # Recurrent cache
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
-            self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
+            disk_checkpoints = None
+            if self.disk_cache_size:
+                if disk_checkpoint_size is None:
+                    disk_checkpoint_size = max(1, self.disk_cache_size // 8)
+                disk_checkpoints = DiskCheckpointTier(
+                    disk_cache_dir,
+                    self.disk_identity(),
+                    self.recurrent_geometry(),
+                    disk_checkpoint_size,
+                )
+            self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size, disk = disk_checkpoints)
             self.recurrent_cache.pagetable = self.pagetable
             # The new page table owns every page, so every state slot is ours too
             cache.reset_states()
@@ -259,6 +301,50 @@ class Generator:
         self._draft_conf_round = None
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
+
+    def disk_identity(self) -> dict:
+        """
+        What the durable tier's records are scoped by. The weight files are included by size and mtime because
+        a re-quantization in place leaves the directory path unchanged while making every stored K/V value
+        wrong, which is indistinguishable from corruption once the bytes are back in the cache.
+        """
+        def model_id(model):
+            if model is None:
+                return None
+            d = os.path.realpath(model.config.directory)
+            files = []
+            try:
+                for name in sorted(os.listdir(d)):
+                    if name.endswith(".safetensors"):
+                        st = os.stat(os.path.join(d, name))
+                        files.append([name, st.st_size, st.st_mtime_ns])
+            except OSError:
+                files = None
+            return [d, model.config.architecture, model.config.vocab_size, files]
+
+        return {
+            "model": model_id(self.model),
+            "draft": model_id(self.draft_model),
+            "cache_layer": self.cache.layer_type.__name__,
+            "hc_quant": (os.environ.get("EXL3_HC_QUANT") or "off").strip().lower(),
+        }
+
+
+    def recurrent_geometry(self) -> list:
+        """
+        Shape and dtype of every recurrent layer's state, so a checkpoint is never restored into a differently
+        shaped model
+        """
+        geometry = []
+        for instance, layer in self.cache.get_all_recurrent_layers().items():
+            get_tensors = getattr(layer, "get_state_tensors", None)
+            spec = (
+                [[list(t.shape[1:]), str(t.dtype)] for t in get_tensors()]
+                if get_tensors is not None else None
+            )
+            geometry.append([str(instance), layer.get_checkpoint_size(), spec])
+        return geometry
 
 
     def num_remaining_jobs(self):
@@ -311,6 +397,8 @@ class Generator:
             pt.last_defrag_serial,
             len(tier) if tier is not None else 0,
             (tier.metrics["pushes"], tier.metrics["evictions"]) if tier is not None else None,
+            (tier.disk.metrics["writes"], tier.disk.metrics["restores"])
+            if tier is not None and tier.disk is not None else None,
         )
         memo_signature, memo = self._cache_stats_memo
         if signature == memo_signature:
@@ -322,7 +410,7 @@ class Generator:
             for h, page in pages.items():
                 if is_content_hash(h):
                     gpu_links[h] = page.prev_hash
-        tier_links = {h: e["prev_hash"] for h, e in tier.entries.items()} if tier is not None else {}
+        tier_links = tier.prev_hash_links() if tier is not None else {}
 
         # A page is reusable when its whole chain is present in either tier
         resumable = {}
@@ -344,6 +432,11 @@ class Generator:
 
         cached = sum(1 for h in gpu_links if is_resumable(h))
         tier_cached = sum(1 for h in tier_links if h not in gpu_links and is_resumable(h))
+        disk_cached = (
+            sum(1 for h in tier_links
+                if h not in gpu_links and h not in tier.entries and is_resumable(h))
+            if tier is not None and tier.disk is not None else 0
+        )
         used = len(pt.referenced_pages)
         free = sum(1 for h in pt.unreferenced_pages if not is_content_hash(h))
         alloc = pt.metrics["alloc_pages"]
@@ -357,6 +450,8 @@ class Generator:
             "free_tokens": free * PAGE_SIZE,
             "tier_cached_tokens": tier_cached * PAGE_SIZE,
             "tier_max_tokens": tier.max_slots * PAGE_SIZE if tier is not None else 0,
+            "disk_cached_tokens": disk_cached * PAGE_SIZE,
+            "disk_max_bytes": tier.disk.store.max_size if tier is not None and tier.disk is not None else 0,
             "alloc_pages": alloc,
             "alloc_cached_pages": alloc_cached,
             "alloc_tier_pages": alloc_tier,
@@ -553,6 +648,11 @@ class Generator:
         else:
             self.iterate_gen(results)
 
+        # Hand newly completed pages to the durable tier. Bounded and non-blocking: whatever does not fit in
+        # the staging buffers or the writer queue is picked up by a later round or by eviction
+        if self.disk_cache_size:
+            self.pagetable.persist_complete_pages()
+
         # Visualization
         if self.visualizer:
             self.update_visualizer()
@@ -571,6 +671,15 @@ class Generator:
         """
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
+        if self.disk_cache_size:
+            # Pick up what the per-round sweeps could not fit. Waiting on the writer here is the cheapest place
+            # to do it, but a request arriving during the idle transition still waits behind it, so the catch-up
+            # is capped rather than run to completion; the next round continues where the cursor left off
+            deadline = time.monotonic() + 0.25
+            while self.pagetable.persist_complete_pages(examine = self.pagetable.max_pages):
+                self.cpu_page_cache.drain_disk()
+                if time.monotonic() >= deadline:
+                    break
         self.pagetable.defrag()
         # Dynamic expert placement: apply any pending swap sweep now, between generations —
         # a placement change perturbs the logits slightly (same expert, different device
@@ -578,6 +687,22 @@ class Generator:
         from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
         run_pending_swap_sweeps(self.model.config.infer_params)
         malloc_trim()
+
+
+    @torch.inference_mode()
+    def flush_disk_cache(self):
+        """
+        Persist every complete page and wait for the writer. Both the per-round sweep and the idle catch-up are
+        deliberately bounded so neither can delay a request, which leaves the deepest pages of a just-finished
+        context unwritten if the process exits immediately afterwards; a controlled shutdown should call this.
+        """
+        if not self.disk_cache_size:
+            return
+        while self.pagetable.persist_complete_pages(examine = self.pagetable.max_pages):
+            self.cpu_page_cache.drain_disk()
+        self.cpu_page_cache.drain_disk()
+        if self.recurrent_cache is not None and self.recurrent_cache.disk is not None:
+            self.recurrent_cache.disk.drain()
 
 
     def recurrent_checkpoint(self):
@@ -612,18 +737,7 @@ class Generator:
         if batch_size == 0:
             return None
 
-        # Create block index table for batch
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
-        batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                batch += 1
+        block_index, cache_seqlens = self._draft_batch_tables(batch_size, max_seq_len)
 
         # Indexed embeddings not supported when drafting
         # TODO: Allow multimodal draft model, perhaps with dummy embeddings?
@@ -663,7 +777,11 @@ class Generator:
             else:
                 new_ids = torch.argmax(batch_logits, dim = -1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
+            # Feed the next step from the host copy just made rather than a
+            # second device-to-host copy of the same value. Each one is a full
+            # sync, and syncs are what leave the GPU idle while the host
+            # re-dispatches the next draft step
+            batch_ids.copy_(self.draft_ids_pinned[:batch_size, idx:idx+1])
             cache_seqlens += 1
             if cal is not None:
                 c = conf.float().cpu()
@@ -708,18 +826,7 @@ class Generator:
         if batch_size == 0:
             return None
 
-        # Create block index table for batch
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
-        batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                batch += 1
+        block_index, cache_seqlens = self._draft_batch_tables(batch_size, max_seq_len)
 
         # Collect input IDs
         input_ids_list = []
@@ -763,7 +870,11 @@ class Generator:
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
+            # Feed the next step from the host copy just made rather than a
+            # second device-to-host copy of the same value. Each one is a full
+            # sync, and syncs are what leave the GPU idle while the host
+            # re-dispatches the next draft step
+            batch_ids.copy_(self.draft_ids_pinned[:batch_size, idx:idx+1])
             cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
@@ -808,18 +919,7 @@ class Generator:
         # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
         window = self.num_draft_tokens
 
-        # Create block index table for batch
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
-        batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                batch += 1
+        block_index, cache_seqlens = self._draft_batch_tables(batch_size, max_seq_len)
 
         # Collect input IDs
         input_ids_list = []
@@ -924,6 +1024,32 @@ class Generator:
             buf = torch.zeros(shape, dtype = dtype, pin_memory = True)
             self.staging_buffers[key] = buf
         return buf[:rows]
+
+
+    def _draft_batch_tables(self, batch_size: int, max_seq_len: int):
+        """
+        Block table and cache lengths for one draft round, in pinned staging.
+
+        Same contract as iterate_gen's: pinned, so every upload of them is
+        stream-ordered instead of a blocking pageable copy, and the width padded
+        to 16 pages, so a growing context crosses a width boundary once every
+        PAGE_SIZE * 16 tokens instead of every PAGE_SIZE -- which is what keeps
+        one captured decode-graph signature alive across a generation.
+        """
+        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
+        batch = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            for seq in job.sequences:
+                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+                cache_seqlens[batch] = seq.kv_position
+                batch += 1
+        return block_index, cache_seqlens
 
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
@@ -1325,6 +1451,8 @@ class Generator:
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
                 job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
+            # Before deallocate_pages(), which drops the page references the registration rests on
+            job.register_tail_checkpoint()
             job.deallocate_pages()
             self.active_jobs.remove(job)
 

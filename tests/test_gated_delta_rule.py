@@ -7,7 +7,9 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-device = "cuda:1"
+from util import resolve_device
+
+device = resolve_device()
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6):
@@ -141,6 +143,24 @@ def _run_chunk_gated_delta_rule(
     return out.to(torch.bfloat16), final_state
 
 
+@pytest.fixture(params = ["default", "4", "1"], autouse = True)
+def gdn_v_split(request, monkeypatch):
+    """EXL3_GDN_V_SPLIT selects the recurrent kernel's grid.z / column split at launch.
+
+    The two geometries partition the SAME 128 k-rows across the SAME SUBK y-threads and
+    differ only in which block owns which v columns, so both must reproduce the reference.
+    v_split 4 is the stock heuristic; v_split 1 is what ships here (it leaves no inactive
+    threads holding registers through the q/k norm and every __syncthreads). The launcher
+    refuses to raise 1 -> 4 where the shape guard chose 1, so "4" is a request, not an
+    override -- bsz > 1 and non-128 head dims stay at 1 under every value.
+    """
+    if request.param == "default":
+        monkeypatch.delenv("EXL3_GDN_V_SPLIT", raising = False)
+    else:
+        monkeypatch.setenv("EXL3_GDN_V_SPLIT", request.param)
+    return request.param
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
 @pytest.mark.parametrize("history", [False, True])
 @pytest.mark.parametrize(
@@ -149,6 +169,8 @@ def _run_chunk_gated_delta_rule(
         (1, 1, 1, 1, 64, 64),
         (2, 5, 2, 4, 64, 64),
         (3, 7, 2, 4, 128, 128),
+        (1, 7, 16, 48, 128, 128),
+        (1, 8, 16, 48, 128, 128),
         (1, 15, 16, 32, 128, 128),
         (2, 17, 16, 32, 128, 128),
         (1, 128, 4, 8, 256, 256),
@@ -308,3 +330,198 @@ def test_cuda_recurrent_gated_delta_rule_is_bit_reproducible(bsz, seqlen, num_k_
                                        num_k_heads, num_v_heads, k_head_dim, v_head_dim) for _ in range(4)]
     for out, state in runs[1:]:
         assert torch.equal(out, runs[0][0]) and torch.equal(state, runs[0][1])
+
+def _torch_channelwise_delta_rule(
+    mixed_qkv: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    slots: torch.Tensor | None,
+    history: bool,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_dim: int,
+):
+    bsz, seqlen, _ = mixed_qkv.shape
+    group = num_v_heads // num_k_heads
+    k_dim = num_k_heads * head_dim
+    v_dim = num_v_heads * head_dim
+    scale = head_dim ** -0.5
+
+    q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+    q = _l2norm(q.float().view(bsz, seqlen, num_k_heads, head_dim))
+    k = _l2norm(k.float().view(bsz, seqlen, num_k_heads, head_dim))
+    v = v.float().view(bsz, seqlen, num_v_heads, head_dim)
+    g = g.float().exp()
+    beta = beta.float()
+
+    out = torch.empty((bsz, seqlen, num_v_heads, head_dim), dtype = torch.bfloat16, device = mixed_qkv.device)
+    state_out = recurrent_state.clone()
+
+    for bi in range(bsz):
+        slot = int(slots[bi].item()) if slots is not None else bi
+        state = state_out[slot, 0].clone()
+
+        for t in range(seqlen):
+            next_state = torch.empty_like(state)
+
+            for vh in range(num_v_heads):
+                kh = vh // group
+                decayed = state[vh] * g[bi, t, vh].unsqueeze(-1)
+                kv_mem = (decayed * k[bi, t, kh].unsqueeze(-1)).sum(dim = -2)
+                v_t = v[bi, t, vh] - kv_mem
+                next_state[vh] = decayed + \
+                    k[bi, t, kh].unsqueeze(-1) * v_t.unsqueeze(-2) * beta[bi, t, vh]
+                out[bi, t, vh] = ((next_state[vh] * q[bi, t, kh].unsqueeze(-1)).sum(dim = -2) * scale).bfloat16()
+
+            state = next_state
+            if history and t < seqlen - 1:
+                state_out[slot, t + 1].copy_(state)
+
+        state_out[slot, 0].copy_(state)
+
+    return out, state_out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize("seqlen", [1, 2, 7])
+@pytest.mark.parametrize("num_heads", [4, 48])
+@torch.inference_mode()
+def test_cuda_channelwise_gated_delta_rule_matches_torch(history, seqlen, num_heads):
+    torch.manual_seed(4321)
+    head_dim = 128
+    bsz = 1
+
+    qkv_dim = 2 * num_heads * head_dim + num_heads * head_dim
+    state_len = seqlen if history else 1
+    num_slots = bsz + 2
+
+    mixed_qkv = (torch.randn((bsz, seqlen, qkv_dim), dtype = torch.float, device = device) * 0.25).bfloat16()
+    g = torch.randn((bsz, seqlen, num_heads, head_dim), dtype = torch.float, device = device) * 0.5 - 1.0
+    beta = torch.sigmoid(torch.randn((bsz, seqlen, num_heads), dtype = torch.float, device = device)).bfloat16()
+    recurrent_state = torch.randn(
+        (num_slots, state_len, num_heads, head_dim, head_dim),
+        dtype = torch.float,
+        device = device,
+    ) * 0.05
+    slots = torch.arange(bsz, dtype = torch.int32, device = device) + 1
+
+    ref_out, ref_state = _torch_channelwise_delta_rule(
+        mixed_qkv, g, beta, recurrent_state, slots, history,
+        num_heads, num_heads, head_dim,
+    )
+    cuda_out, cuda_state = _run_cuda_gated_delta_rule(
+        mixed_qkv, g, beta, recurrent_state, slots, history,
+        num_heads, num_heads, head_dim, head_dim,
+    )
+
+    torch.testing.assert_close(cuda_out, ref_out, rtol = 5e-2, atol = 5e-2)
+    torch.testing.assert_close(cuda_state[:, :state_len], ref_state[:, :state_len], rtol = 5e-2, atol = 5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+@pytest.mark.parametrize("seqlen", [2, 4, 7, 8])
+@torch.inference_mode()
+def test_cuda_gated_delta_rule_history_slots_are_per_step(seqlen):
+    """Speculative rewind reads slot t+1 to restore the state after t accepted tokens, so
+    every intermediate slot -- not just the final one -- has to be the real running state.
+    A kernel that carries the state in registers across timesteps loses exactly this if it
+    stops writing a slot, and the final state stays correct while the rewind silently does
+    not."""
+    torch.manual_seed(99)
+    bsz, num_k_heads, num_v_heads, head_dim = 1, 16, 48, 128
+    qkv_dim = 2 * num_k_heads * head_dim + num_v_heads * head_dim
+    num_slots = 3
+
+    mixed_qkv = (torch.randn((bsz, seqlen, qkv_dim), dtype = torch.float, device = device) * 0.25).bfloat16()
+    g = torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device) * 0.5 - 1.0
+    beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
+    recurrent_state = torch.randn(
+        (num_slots, seqlen, num_v_heads, head_dim, head_dim), dtype = torch.float, device = device,
+    ) * 0.05
+    slots = torch.tensor([1], dtype = torch.int32, device = device)
+
+    ref_out, ref_state = _torch_gated_delta_rule(
+        mixed_qkv, g, beta, recurrent_state, slots, True,
+        num_k_heads, num_v_heads, head_dim, head_dim,
+    )
+    cuda_out, cuda_state = _run_cuda_gated_delta_rule(
+        mixed_qkv, g, beta, recurrent_state, slots, True,
+        num_k_heads, num_v_heads, head_dim, head_dim,
+    )
+
+    torch.testing.assert_close(cuda_out, ref_out, rtol = 5e-2, atol = 5e-2)
+    for t in range(seqlen):
+        # slot 0 is the final state; slot t (t >= 1) is the state after step t - 1
+        torch.testing.assert_close(
+            cuda_state[1, t], ref_state[1, t], rtol = 5e-2, atol = 5e-2,
+            msg = lambda m, t = t: f"history slot {t} (of {seqlen}) diverged\n{m}",
+        )
+
+    # A slot left holding its input, or one step's state copied into every slot, would pass
+    # every assert above if the reference were degenerate. It is not.
+    untouched = recurrent_state[1, 1:]
+    assert not torch.allclose(cuda_state[1, 1:], untouched, rtol = 1e-3, atol = 1e-3), \
+        "history slots were not written at all"
+    for t in range(1, seqlen - 1):
+        assert not torch.allclose(cuda_state[1, t], cuda_state[1, t + 1], rtol = 1e-3, atol = 1e-3), \
+            f"history slots {t} and {t + 1} are identical; the per-step state is not advancing"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize(
+    "bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
+    [
+        (1, 7, 16, 48, 128, 128),   # the deployed ndt6 verify
+        (1, 1, 16, 48, 128, 128),   # plain decode
+        (1, 8, 16, 48, 128, 128),
+        (1, 15, 16, 32, 128, 128),
+    ],
+)
+@torch.inference_mode()
+def test_v_split_geometries_agree(
+    monkeypatch,
+    gdn_v_split,
+    history,
+    bsz,
+    seqlen,
+    num_k_heads,
+    num_v_heads,
+    k_head_dim,
+    v_head_dim,
+):
+    """v_split 1 and 4 must produce the same output and the same state.
+
+    They are the same arithmetic in a different block decomposition, so this is a much
+    tighter gate than either arm's 5e-2 agreement with the torch reference. It is not a
+    bitwise gate: sh_dot1/sh_dot2 are LDS atomicAdd fan-ins over SUBK contributors in
+    unspecified order, which is a float reassociation present in BOTH arms equally.
+    """
+    torch.manual_seed(4321)
+    qkv_dim = 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim
+    state_len = seqlen if history else 1
+    num_slots = bsz + 2
+
+    mixed_qkv = (torch.randn((bsz, seqlen, qkv_dim), dtype = torch.float, device = device) * 0.25).bfloat16()
+    g = torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device) * 0.5 - 1.0
+    beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
+    state0 = torch.randn(
+        (num_slots, state_len, num_v_heads, k_head_dim, v_head_dim),
+        dtype = torch.float,
+        device = device,
+    ) * 0.05
+    slots = torch.arange(bsz, dtype = torch.int32, device = device) + 1
+
+    outs = {}
+    for want in ("1", "4"):
+        monkeypatch.setenv("EXL3_GDN_V_SPLIT", want)
+        outs[want] = _run_cuda_gated_delta_rule(
+            mixed_qkv, g, beta, state0.clone(), slots, history,
+            num_k_heads, num_v_heads, k_head_dim, v_head_dim,
+        )
+
+    torch.testing.assert_close(outs["1"][0], outs["4"][0], rtol = 1e-3, atol = 1e-3)
+    torch.testing.assert_close(outs["1"][1][:, :state_len], outs["4"][1][:, :state_len],
+                               rtol = 1e-3, atol = 1e-3)

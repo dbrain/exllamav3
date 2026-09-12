@@ -8,12 +8,27 @@
 #include "cuda_host.h"
 #include "hadamard.h"
 
+// norm.cu builds on ROCm too (ple.cu needs rms_norm), so its declarations are
+// hoisted above the CUDA-only include block.
 #include "norm.cuh"
-#include "hgemm.cuh"
-#include "rope.cuh"
+#include "dsa_topk.cuh"
+#include "hc_mix.cuh"
+#include "ple.cuh"
+#include "ngram.cuh"
+
+// activation.cu, softcap.cu and routing.cu build on ROCm, so their declarations are
+// hoisted above the CUDA-only include block.
 #include "activation.cuh"
 #include "softcap.cuh"
 #include "routing.cuh"
+
+// gdn.cu builds on ROCm, so its declarations sit above the CUDA-only block
+#include "gdn.cuh"
+
+#if !defined(USE_ROCM)
+
+#include "hgemm.cuh"
+#include "rope.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
 
@@ -62,14 +77,31 @@
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
 #include "dsv4_pool_quant.cuh"
-#include "dsa_topk.cuh"
-#include "hc_mix.cuh"
-#include "ple.cuh"
-#include "ngram.cuh"
 
 #include "attention.cuh"
 
 #include "sam.h"
+
+#else
+
+#include "hgemm.cuh"
+#include "rope.cuh"
+#include "gdn.cuh"
+#include "add.cuh"
+
+#include "quant/pack.cuh"
+#include "quant/reconstruct.cuh"
+#include "quant/hadamard.cuh"
+
+#include "generator/strings.h"
+#include "generator/sampling_basic.cuh"
+#include "generator/sampling_extra.cuh"
+#include "generator/gumbel.cuh"
+#include "generator/rep_pen.cuh"
+#include "generator/dry.cuh"
+#include "generator/cache.cuh"
+
+#endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -87,38 +119,71 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
+    // norm.cu builds on ROCm (ple.cu depends on rms_norm), so these bind unconditionally
     m.def("rms_norm", &rms_norm, "rms_norm",
         py::arg("x"), py::arg("w"), py::arg("y"), py::arg("epsilon"),
         py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
         py::arg("add_residual"), py::arg("w_groups") = 1);
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
-    m.def("softcap", &softcap, "softcap");
 
+    // ple.cu and ngram.cu build on ROCm; Flash-Next (qwen4_exp) needs both
+    m.def("ple_gate", &ple_gate, "ple_gate");
+    m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
+    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
+    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
+    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
+
+    // dsa_topk.cu and hc_mix.cu build on ROCm; Flash-Next needs QSA + mHC
+    m.def("dsa_topk", &dsa_topk, "dsa_topk");
+    m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
+    m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
+    m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_head", &hc_head, "hc_head");
+    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
+    m.def("hc_apply", &hc_apply, "hc_apply");
+    m.def("gr_mix", &gr_mix, "gr_mix");
+    m.def("gr_mix_q", &gr_mix_q, "gr_mix_q");
+
+    // activation.cu, softcap.cu and routing.cu build on ROCm
+    m.def("silu_mul", &silu_mul, "silu_mul");
+    m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
+    m.def("gelu_mul", &gelu_mul, "gelu_mul");
+    m.def("relu2_mul", &relu2_mul, "relu2_mul");
+    m.def("relu_mul", &relu_mul, "relu_mul");
+    m.def("xielu", &xielu, "xielu");
+    m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
+    m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
+    m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
+    m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
+    m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
+    m.def("deinterleave_qg", &deinterleave_qg, "deinterleave_qg");
+    m.def("softcap", &softcap, "softcap");
+    m.def("routing_std", &routing_std, "routing_std");
+    m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
+
+    // gdn.cu builds on ROCm (cuda_recurrent_gated_delta_rule comes from it), so the
+    // recurrent rewind bindings belong above the CUDA-only block. Speculative decoding
+    // rewinds conv and SSM state whenever a draft token is rejected, so a recurrent
+    // model cannot spec-decode without them.
+    py::class_<ConvRewindJob>(m, "ConvRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
+    py::class_<StateRewindJob>(m, "StateRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+
+#if !defined(USE_ROCM)
+
     m.def("moe_split_map", &moe_split_map, "moe_split_map");
     m.def("moe_split_issue", &moe_split_issue, "moe_split_issue");
     m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_pool_quant_scatter", &dsv4_pool_quant_scatter, "dsv4_pool_quant_scatter");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
-    m.def("dsa_topk", &dsa_topk, "dsa_topk");
-    m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
-    m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
-    m.def("hc_mix", &hc_mix, "hc_mix");
-    m.def("ple_gate", &ple_gate, "ple_gate");
-    m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
-    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
-    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
-    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
-    m.def("hc_head", &hc_head, "hc_head");
-    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
-    m.def("hc_apply", &hc_apply, "hc_apply");
-    m.def("gr_mix", &gr_mix, "gr_mix");
-    m.def("routing_std", &routing_std, "routing_std");
-    m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");
@@ -183,18 +248,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
-    m.def("silu_mul", &silu_mul, "silu_mul");
-    m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
-    m.def("gelu_mul", &gelu_mul, "gelu_mul");
-    m.def("relu2_mul", &relu2_mul, "relu2_mul");
-    m.def("relu_mul", &relu_mul, "relu_mul");
-    m.def("xielu", &xielu, "xielu");
-    m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
-    m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
-    m.def("deinterleave_qg", &deinterleave_qg, "deinterleave_qg");
-    m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
-    m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
-    m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
@@ -213,12 +266,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         { kda_gate_op_gr(qkv, b, f, dt_bias, a_log, mixed_qkv, beta, g, lower_bound, beta_scale, nullptr); },
         "kda_gate_op");
 
-    py::class_<ConvRewindJob>(m, "ConvRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
-    py::class_<StateRewindJob>(m, "StateRewindJob")
-        .def(py::init<uintptr_t, uintptr_t, int64_t>());
-    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
-    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
@@ -269,4 +316,44 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/dsv4_compressor_bc.h"
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"
+#else
+    m.def("had_paley", &had_paley, "had_paley");
+    m.def("had_paley2", &had_paley2, "had_paley2");
+
+    m.def("hgemm", &hgemm, "hgemm");
+    m.def("rope", &rope, "rope");
+    m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
+    m.def("reconstruct", &reconstruct, "reconstruct");
+    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
+    m.def("had_r_128", &had_r_128, "had_r_128");
+    m.def("pack_trellis", &pack_trellis, "pack_trellis");
+    m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
+    m.def("pack_signs", &pack_signs, "pack_signs");
+
+    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
+    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
+    m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
+    m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
+    m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
+    m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+
+    m.def("argmax_sample", &argmax_sample, "argmax_sample");
+    m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
+    m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");
+    m.def("gumbel_noise_f32", &gumbel_noise_f32, "gumbel_noise_f32");
+    m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
+    m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
+    // dry.cu is not ROCm-excluded and uses only plain atomics, so bind it here too
+    m.def("dry_penalty", &dry_penalty, "dry_penalty");
+    m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
+    m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
+
+    m.def("cache_rotate", &cache_rotate, "cache_rotate");
+    m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
+
+    m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
+    m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
+#endif
 }

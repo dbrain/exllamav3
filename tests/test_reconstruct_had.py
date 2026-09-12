@@ -4,11 +4,17 @@
 # sign/order/scale error in the fused kernel shows up directly. Also checks forward-path
 # equivalence: had(x*su) @ W_hat -> had -> *sv (old pipeline) vs x @ W_fused.
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 from exllamav3.ext import exllamav3_ext as ext
+from util import resolve_device
 
 torch.manual_seed(0)
-device = "cuda:1"
+device = resolve_device()
 torch.cuda.set_device(device)
 
 

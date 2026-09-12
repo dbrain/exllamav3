@@ -1,4 +1,37 @@
+import os
+import sys
+
 import torch
+
+
+def _unavailable(reason):
+    # Under pytest this must be a clean skip; as a plain script these files are run
+    # directly (python tests/test_reconstruct_had.py), where Skipped would be noise.
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.skip(reason, allow_module_level = True)
+    raise RuntimeError(reason)
+
+
+def resolve_device(default = "cuda:0"):
+    """EXL_TEST_DEVICE, or `default`, skipping the module if that device is absent.
+
+    Several tests were written on a box with three GPUs and hardcode cuda:1 / cuda:2,
+    which is an "invalid device ordinal" AcceleratorError anywhere else. The kernels
+    under test are device-agnostic, so the ordinal is incidental.
+    """
+    name = os.environ.get("EXL_TEST_DEVICE", default)
+    if not torch.cuda.is_available():
+        _unavailable("no CUDA (or ROCm) device")
+    index = torch.device(name).index or 0
+    if index >= torch.cuda.device_count():
+        _unavailable(f"{name} not present (device_count = {torch.cuda.device_count()})")
+    return name
+
+
+def skip_module(reason):
+    _unavailable(reason)
+
 
 def assert_close_mr(
         actual: torch.Tensor,

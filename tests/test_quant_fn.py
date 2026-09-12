@@ -5,15 +5,20 @@ import torch
 from exllamav3 import Config, Model
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.modules.quant.exl3_lib.quantize import quantize_tiles
-from util import assert_close_mr
+from util import assert_close_mr, resolve_device, skip_module
 import torch.nn.functional as F
 import torch.testing
 import math
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-device = "cuda:2"
-test_model = "/mnt/str/models/llama3.1-8b-instruct/hf/"
+device = resolve_device()
+test_model = os.environ.get("EXL3_TEST_MODEL", "/mnt/str/models/llama3.1-8b-instruct/hf/")
+
+if not os.path.isdir(test_model):
+    skip_module(f"unquantized reference model not available: {test_model}")
+if not hasattr(ext, "decode"):
+    skip_module("EXL3 quantizer kernels (quant/quantize.cu) are in ROCM_EXCLUDE_FILES")
 test_keys = [
     "model.layers.0.self_attn.q_proj",
     "model.layers.0.self_attn.k_proj",

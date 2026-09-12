@@ -6,11 +6,15 @@ Needs two CUDA devices; the P2P failure is simulated by patching the probe.
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 from exllamav3.util import device_copy as dc
 from exllamav3.util.device_copy import to_device
+from util import skip_module
 
-assert torch.cuda.device_count() >= 2, "needs two CUDA devices"
+if torch.cuda.device_count() < 2:
+    skip_module(f"needs two CUDA devices (device_count = {torch.cuda.device_count()})")
 d0, d1 = torch.device("cuda:0"), torch.device("cuda:1")
 
 def reset():

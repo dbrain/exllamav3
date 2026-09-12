@@ -7,6 +7,24 @@ from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
 import uuid
 
+
+def mgemm_kernels_available() -> bool:
+    """Whether the native MGEMM/GEMM kernels may be used, honouring EXL3_NO_MGEMM
+    (default on under ROCm).
+
+    The symbol's mere presence is load-bearing elsewhere: building
+    quant/exl3_gemm.cu flips BlockSparseMLP's _HAS_MGEMM, which turns off the
+    grouped Triton path and with it the caps["graph_capturable"] override that is
+    the only thing letting graph_decode capture a BlockSparseMLP step. That pairing
+    measured 2.28x on MoE decode, so presence alone must not switch the paths over."""
+
+    from ..ext import exllamav3_ext as ext
+    if not hasattr(ext, "exl3_mgemm"):
+        return False
+    import torch
+    default = "1" if torch.version.hip else "0"
+    return os.environ.get("EXL3_NO_MGEMM", default) == "0"
+
 @dataclass
 class InferParams:
     """
@@ -59,6 +77,8 @@ class InferParams:
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
+        if not mgemm_kernels_available():
+            return False
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:
