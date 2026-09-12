@@ -7,7 +7,17 @@ alternates a small participant cap with the full pool, the configuration in whic
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
+import torch
 from exllamav3.ext import exllamav3_ext as ext
+
+# cpu/moe_mul1.cpp (the Pool under test, plus the AVX trellis kernels it exists to feed) and
+# cpu/moe_handoff.cu are both in ROCM_EXCLUDE_FILES, so there is no pool to race here. The
+# fallback in ext_fallbacks.py raises instead of faking one.
+pytestmark = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="CPU MoE expert offload not ported to ROCm"
+)
 
 
 def test_pool_dispatch_exactly_once():

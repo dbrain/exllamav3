@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import torch
 from ..model.config import Config
@@ -42,6 +43,14 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 
 
 PREFETCH_ENABLED = os.environ.get("EXL3_NGRAM_PREFETCH", "1") != "0"   # debug/A-B switch
+# Rows of the streamed table to keep resident, 0 to disable. Each row is `words_per_row(K)`
+# int16 (122 B for this checkpoint), so 1M rows is ~122 MB. The table is immutable, so this
+# changes which preads happen and nothing else.
+ROW_CACHE_ROWS = int(os.environ.get("EXL3_NGRAM_ROW_CACHE", "0"))
+# Measurement control ONLY: skip the row read entirely, leaving whatever the staging buffer
+# held. Produces garbage embeddings on purpose -- it exists to bound what removing this read
+# could ever be worth end to end. Never set it for anything you intend to read the output of.
+SKIP_READ = os.environ.get("EXL3_NGRAM_SKIP_READ", "0") != "0"
 PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines (decode-sized)
 MAX_PIN_SETS = 2            # staging sets: one with the last forward's uploads in flight, one being staged
 
@@ -119,6 +128,13 @@ class NGramEmbedding(Module):
         self._executor = None
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
         self._row_dtype = None      # stored row dtype of the unquantized table
+        self._cache_rows = ROW_CACHE_ROWS
+        self._cache_slab = None     # (cap, row_words) resident copy of recently read rows
+        self._cache_ring = None     # slot -> uid, for evicting the map entry a slot recycles
+        self._cache_map = {}        # uid -> slot
+        self._cache_next = 0
+        self._cache_lock = threading.Lock()
+        self._cache_stats = {"hit": 0, "miss": 0}
 
         self.caps.update({"prefer_cpu": True})
 
@@ -255,6 +271,10 @@ class NGramEmbedding(Module):
         self.tables = None
         self.handles = None
         self._pins = []
+        self._cache_slab = None
+        self._cache_ring = None
+        self._cache_map = {}
+        self._cache_next = 0
         self._row_dtype = None
         self.head_bias = None
         self.head_offsets = None
@@ -442,9 +462,77 @@ class NGramEmbedding(Module):
                 return e
         return None
 
+    def _cache_lookup(self, uids: torch.Tensor, out: torch.Tensor):
+        """Serve whatever `uids` the row cache already holds directly into `out`. Returns the
+        positions in `uids` that missed, or None if every row was served. The copy happens under
+        the lock so a concurrent insert cannot recycle a slot between lookup and read."""
+        hit_dst, hit_src, miss = [], [], []
+        with self._cache_lock:
+            slab, cmap = self._cache_slab, self._cache_map
+            for i, u in enumerate(uids.tolist()):
+                slot = cmap.get(u)
+                if slot is None:
+                    miss.append(i)
+                else:
+                    hit_dst.append(i)
+                    hit_src.append(slot)
+            self._cache_stats["hit"] += len(hit_dst)
+            self._cache_stats["miss"] += len(miss)
+            if hit_dst:
+                out.index_copy_(0, torch.tensor(hit_dst, dtype = torch.int64),
+                                slab.index_select(0, torch.tensor(hit_src, dtype = torch.int64)))
+        return None if not miss else torch.tensor(miss, dtype = torch.int64)
+
+    def _cache_insert(self, uids: torch.Tensor, rows: torch.Tensor):
+        """Write freshly read rows into the ring. Table rows are immutable, so a cached row is
+        the row: the cache changes only which syscalls happen, never the values."""
+        n = uids.numel()
+        cap = self._cache_slab.shape[0]
+        if n >= cap:
+            # a gather bigger than the ring would wrap onto itself; nothing to keep
+            return
+        with self._cache_lock:
+            pos = self._cache_next
+            slots = (torch.arange(pos, pos + n, dtype = torch.int64) % cap)
+            self._cache_next = (pos + n) % cap
+            ring, cmap = self._cache_ring, self._cache_map
+            sl = slots.tolist()
+            for slot in sl:
+                old = ring[slot]
+                if old >= 0 and cmap.get(old) == slot:
+                    del cmap[old]
+            self._cache_slab.index_copy_(0, slots, rows)
+            for slot, u in zip(sl, uids.tolist()):
+                ring[slot] = u
+                cmap[u] = slot
+
     def _gather_rows(self, uids: torch.Tensor, out: torch.Tensor):
         """Gather the (sorted) unique rows into the pinned staging buffer, routing shard
         segments (contiguous in the sorted list) to their tensor/handle."""
+        if self._cache_rows and self.handles is not None:
+            with self._cache_lock:
+                # the prefetch worker and an inline stage can both land here
+                if self._cache_slab is None or self._cache_slab.shape[1] != out.shape[1] \
+                        or self._cache_slab.dtype != out.dtype:
+                    self._cache_slab = torch.empty((self._cache_rows, out.shape[1]),
+                                                   dtype = out.dtype)
+                    self._cache_ring = [-1] * self._cache_rows
+                    self._cache_map = {}
+                    self._cache_next = 0
+            miss = self._cache_lookup(uids, out)
+            if miss is None:
+                return
+            m_uids = uids.index_select(0, miss).contiguous()
+            tmp = torch.empty((miss.numel(), out.shape[1]), dtype = out.dtype)
+            self._gather_rows_direct(m_uids, tmp)
+            out.index_copy_(0, miss, tmp)
+            self._cache_insert(m_uids, tmp)
+            return
+        self._gather_rows_direct(uids, out)
+
+    def _gather_rows_direct(self, uids: torch.Tensor, out: torch.Tensor):
+        if SKIP_READ:
+            return
         stores = self.tables if self.tables is not None else self.handles
         i0 = 0
         for s, store in enumerate(stores):

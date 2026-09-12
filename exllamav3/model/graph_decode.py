@@ -2,6 +2,8 @@ from __future__ import annotations
 import os
 import torch
 
+from ..constants import PAGE_SIZE
+
 # Whole-step CUDA/HIP graph capture for single-token decode.
 #
 # Motivation (measured on gfx1150 / ROCm 7.2.4, qwen3-0.6b-4bpw, Triton EXL3
@@ -39,15 +41,18 @@ enabled = os.environ.get("EXL3_DECODE_GRAPH", "0") != "0"
 _WARMUP_STEPS = int(os.environ.get("EXL3_DECODE_GRAPH_WARMUP", "2"))
 
 # Distinct shape signatures to keep captured at once. The generator rounds the
-# block-table width up to a multiple of 16 pages (generator.py, iterate_gen),
-# so the signature changes once every PAGE_SIZE*16 = 4096 tokens of context.
+# block-table width up to a multiple of 16 pages (generator.py, iterate_gen and
+# _draft_batch_tables), so the signature changes once every PAGE_SIZE*16 = 4096
+# tokens of context.
 _MAX_GRAPHS = int(os.environ.get("EXL3_DECODE_GRAPH_CACHE", "4"))
 
 # After capturing a span, replay it and compare bitwise against an eager run of
-# the same span from the same input. A mismatch means something in it was not
-# static, so the whole signature is discarded and never retried. Cheap and the
-# only thing standing between a subtly dynamic module and silently wrong
-# logits. Do not turn this off outside benchmarking.
+# the same span -- once from the input it was captured with, once from a
+# perturbed one (see _verify_span_varied; the same-input pass alone cannot see a
+# baked input). A mismatch means something in it was not static, so the whole
+# signature is discarded and never retried. Cheap and the only thing standing
+# between a subtly dynamic module and silently wrong logits. Do not turn this
+# off outside benchmarking.
 _VERIFY = os.environ.get("EXL3_DECODE_GRAPH_VERIFY", "1") != "0"
 
 _DEBUG = os.environ.get("EXL3_DECODE_GRAPH_DEBUG", "0") != "0"
@@ -130,14 +135,15 @@ _UNCAPTURABLE_TYPES = frozenset({
 # eventually produce a different token. Graph replay was measured
 # indistinguishable from that control -- same divergence step, same state delta
 # -- but it does mean bit-identical decode is unattainable on these models by
-# ANY route. See _Span.exempt for how verification handles it.
+# ANY route. See _Span.exempt and _verify_span for how verification handles it.
 _CAPTURABLE_RECURRENT_TYPES = frozenset({
     "GatedDeltaNet",
 })
 
 
-# QSA (Flash-Next full-attention layers) is capturable in ONE of its two
-# regimes, so it is decided per step rather than once per model.
+# QSA (Flash-Next full-attention layers) is capturable in both of its regimes,
+# but the sparse one only up to a context bound, so it is decided per step
+# rather than once per model.
 #
 # Attention.forward picks the regime with
 #     qsa_sparse = int(cache_seqlens.max()) + seqlen > indexer.sparse_threshold()
@@ -147,40 +153,102 @@ _CAPTURABLE_RECURRENT_TYPES = frozenset({
 # recaptures -- exactly like the block-table width boundary.
 #
 #   DENSE regime (position < sparse_threshold, 2051 tokens on Flash-Next):
-#     CAPTURABLE. Only QSAIndexer.update_planes runs, and it is fully device
-#     resident -- it reads cache_seqlens as a DEVICE tensor, its grids are
-#     functions of (bsz, seqlen) only, and its workspaces come from
+#     only QSAIndexer.update_planes runs, and it is fully device resident -- it
+#     reads cache_seqlens as a DEVICE tensor, its grids are functions of
+#     (bsz, seqlen) only, and its workspaces come from
 #     g_tensor_cache.get_bucketed at a constant numel, so the same buffer comes
 #     back every call. Its in-place writes to layer.raw_k / layer.pooled are
 #     idempotent at a fixed position, like the KV cache. Attention then takes
 #     the ordinary paged-decode path.
 #
-#   SPARSE regime (position >= sparse_threshold): NOT CAPTURABLE. The extra
-#     work is QSAIndexer.select_indices_paged, which does
-#         pos0 = int(cache_seqlens_cpu[b])
-#     and then feeds that per-step position into _select_rows as a KERNEL
-#     ARGUMENT (dsa_indexer_scores, _dsa_pool_expand_kernel), as a topk bound
-#     (ext.dsa_topk with min(block_topk, T_slab)), and as a workspace SHAPE
-#     (s_stride = cdiv(T_slab, 128) * 128). pos0 advances every token, so no
-#     signature can cover it -- it would need a fresh graph per position.
-#     Making this capturable is a kernel-signature change (read the position
-#     from the device tensor, allocate the scores workspace at an upper bound,
-#     move the topk bound device-side), not something the capture layer can fix.
+#   SPARSE regime (position >= sparse_threshold): the extra work is
+#     QSAIndexer.select_indices_paged. At bsz == seqlen == 1 it dispatches to
+#     _select_static, which derives the cache position and the visible pool
+#     count into a device int32 pair and hands the scoring, top-k and expansion
+#     kernels POINTERS to it. Scores land in the fixed-width tile the eager path
+#     already uses, and the grid covers every pool the block table can address,
+#     so the launch is the same at every position and only the tensor CONTENTS
+#     advance -- capturable, on the same terms as the KV cache.
+#
+#     The bound: that one score tile has to span the whole addressable pool
+#     range. Past indexer.static_capture_limit() (SEL_TILE * compress_ratio,
+#     32768 tokens by default; raise EXL3_QSA_SCORE_TILE to move it) selection
+#     needs the host-side tile loop, whose trip count follows the position, and
+#     the QSA layers go back to being eager islands.
 _QSA_TYPES = frozenset({"QSAIndexer"})
 
 
-def _module_capturable(module, qsa_dense: bool = False) -> bool:
+# Per-step INPUT tensors that reach the step through params instead of through
+# input_ids. Like cache_seqlens and the block table their CONTENTS change every
+# step while their shape does not, so they are bound to persistent device buffers
+# that _refresh_step refills. Anything per-step left unbound is read from the
+# params dict that happened to be current at capture time, which a captured graph
+# bakes as an address and an eager span reads out of a frozen snapshot.
+#
+#   target_hidden   the target model's state for the token being drafted,
+#                   consumed by the MTP input layers (arch_specific/
+#                   qwen4_exp_mtp.py, qwen3_5_mtp.py). It advances on EVERY draft
+#                   step within a verification round, so a stale one collapses
+#                   draft acceptance to noise while every other signal -- the
+#                   capture, the verify, the logits' plausibility -- looks fine.
+_STEP_INPUT_KEYS = ("target_hidden",)
+
+
+# Keys a caller sets to ask a module for state it reads back OUT of params after the forward
+# returns. No graph-served step can deliver one: a captured span runs no Python at all, and
+# every span is handed _bind's COPY of params, so the module's write lands in a dict the
+# caller never looks at. Both of these are speculative-decode plumbing on a step shaped
+# exactly like the ones captured here:
+#
+#   export_state_norm_keys / export_state_layers
+#                   the target's hidden states for the MTP/DFlash draft cache. iterate_gen
+#                   indexes the result unconditionally (`p_export_states[-1]`), so losing it
+#                   is a TypeError on None -- which is how it was found, after three warm
+#                   turns, once a restored tail page left MTP reseeding its carry state from
+#                   a single-token target step every turn (EXL3_TAIL_CACHE). An ndt0 arm,
+#                   which drafts nothing and so takes that step every time, was already dead
+#                   on arrival with no tail cache involved.
+#   export_draft_conf
+#                   the draft head's per-step confidence, read by the dynamic-draft
+#                   calibrator. That one is GUARDED at the read, so losing it silently
+#                   disables early draft truncation and starves the calibrator of labels
+#                   instead of raising.
+_OUT_PARAM_REQUESTS = ("export_state_norm_keys", "export_state_layers", "export_draft_conf")
+
+
+def _module_capturable(module, qsa_ok: bool = False) -> bool:
     cap = module.caps.get("graph_capturable")
     if cap is not None:
         return bool(cap)
     name = type(module).__name__
     if name in _QSA_TYPES:
-        return qsa_dense
+        return qsa_ok
     if name in _UNCAPTURABLE_TYPES:
         return False
     if module.caps.get("recurrent_cache"):
         return name in _CAPTURABLE_RECURRENT_TYPES
     return True
+
+
+def _perturb(t: torch.Tensor) -> torch.Tensor:
+    """A different value in every element, for the varied-input verification pass.
+
+    A roll along the last axis permutes the tensor's own values, so it cannot
+    manufacture an inf/nan/out-of-range mismatch the real workload would never
+    produce. A degenerate (constant or single-element) input rolls to itself and
+    the varied pass simply adds no coverage for that span.
+    """
+    return t.roll(1, -1) if t.numel() > 1 else t
+
+
+def _step_inputs(params) -> list:
+    """The _STEP_INPUT_KEYS tensors this step actually carries, in a fixed order."""
+    out = []
+    for k in _STEP_INPUT_KEYS:
+        t = params.get(k)
+        if isinstance(t, torch.Tensor):
+            out.append((k, t))
+    return out
 
 
 def _recurrent_state_tensors(params) -> list:
@@ -224,9 +292,9 @@ class _Span:
         self.end = end
         # exempt: this span contains a kernel that is not deterministic run to
         # run AND advances state, so an eager reference re-run is neither
-        # reproducible nor idempotent. Verification is skipped for it. This is
-        # per SPAN, not per model: a dense span in a hybrid model is still
-        # checked bitwise.
+        # reproducible nor idempotent. It is gated against its own measured
+        # noise floor instead of bitwise (_verify_span). This is per SPAN, not
+        # per model: a dense span in a hybrid model is still checked bitwise.
         self.exempt = exempt
         self.graph = None
         self.static_in = None
@@ -238,9 +306,11 @@ class _Span:
 
 
 class _CapturedStep:
-    def __init__(self, spans, dev_seqlens, host_seqlens, dev_block_table, cache, params):
+    def __init__(self, spans, dev_seqlens, host_seqlens, dev_block_table, step_inputs, cache, params):
         self.spans = spans
         self.dev_seqlens = dev_seqlens
+        # key -> persistent device buffer for a _STEP_INPUT_KEYS tensor
+        self.step_inputs = step_inputs
         # Pinned host mirror of the cache lengths. Attention's QSA branch reads
         # get_for_device(params, "cache_seqlens", "cpu"); binding only a device
         # tensor would turn that into a D2H copy, which is a sync and cannot be
@@ -275,9 +345,10 @@ class DecodeGraphs:
         self.seen = {}          # signature -> eager steps observed so far
         self.rejected = set()   # signatures that failed verification
         self.device = None
-        self.layouts = {}       # qsa_dense -> list of (captured, start, end, exempt)
+        self.layouts = {}       # qsa_ok -> list of (captured, start, end, exempt)
         self.layout = None      # the most recently used layout, for debugging
         self.qsa_threshold = None
+        self.qsa_limit = 0
         self._eligible = None
         self._reason = ""
         # Instrumentation: a caller can assert replays actually happened rather
@@ -322,8 +393,8 @@ class DecodeGraphs:
         self.device = dev
 
         self.qsa_threshold = self._find_qsa_threshold()
-        for regime in ((True, False) if self.qsa_threshold is not None else (False,)):
-            self.layouts[regime] = self._build_layout(regime)
+        for qsa_ok in ((True, False) if self.qsa_threshold is not None else (False,)):
+            self.layouts[qsa_ok] = self._build_layout(qsa_ok)
         self.layout = self.layouts[max(self.layouts)]
         if not any(any(sp[0] for sp in lay) for lay in self.layouts.values()):
             return False, "no capturable span"
@@ -337,27 +408,29 @@ class DecodeGraphs:
 
         if self.qsa_threshold is None:
             return True, _desc(self.layouts[False])
-        return True, (f"QSA threshold {self.qsa_threshold}; "
-                      f"dense regime: {_desc(self.layouts[True])} | "
-                      f"sparse regime: {_desc(self.layouts[False])}")
+        return True, (f"QSA threshold {self.qsa_threshold}, static selection to "
+                      f"{self.qsa_limit}; captured: {_desc(self.layouts[True])} | "
+                      f"eager indexer: {_desc(self.layouts[False])}")
 
 
     def _find_qsa_threshold(self):
-        """Position at which every QSA layer flips to the uncapturable sparse
-        regime, or None when the model has no indexer."""
+        """Position at which every QSA layer flips to the sparse regime, or None
+        when the model has no indexer. Also records the context bound past which
+        the sparse regime stops being capturable."""
         for module, _, _ in self.model.fwd_modules:
             for sub in module:
                 idx = getattr(sub, "qsa_indexer", None)
+                if idx is None and type(sub).__name__ in _QSA_TYPES:
+                    idx = sub
                 if idx is not None:
+                    self.qsa_limit = int(idx.static_capture_limit())
                     return int(idx.sparse_threshold())
-                if type(sub).__name__ in _QSA_TYPES:
-                    return int(sub.sparse_threshold())
         return None
 
 
     def _qsa_regime(self, params) -> bool:
-        """True when this step is below the QSA sparse threshold, i.e. the QSA
-        layers can be captured. Mirrors the test in Attention.forward.
+        """True when this step is below the QSA sparse threshold. Mirrors the
+        test in Attention.forward.
 
         Read from the caller's staging buffer, which is pinned host memory on
         the generator path, so this costs no device sync. If it ever arrives on
@@ -371,7 +444,20 @@ class DecodeGraphs:
         seqlen = 1
         return int(cs.max()) + seqlen <= self.qsa_threshold
 
-    def _build_layout(self, qsa_dense: bool):
+    def _qsa_capturable(self, params) -> bool:
+        """Whether the QSA layers can be captured for this step. Dense always;
+        sparse while one score tile still spans everything the block table can
+        address. Both terms are already implied by the capture signature (the
+        regime directly, the bound through the block-table shape), so this needs
+        no signature entry of its own."""
+        if self.qsa_threshold is None:
+            return False
+        if self._qsa_regime(params):
+            return True
+        bt = params.get("block_table")
+        return bt is not None and bt.shape[-1] * PAGE_SIZE <= self.qsa_limit
+
+    def _build_layout(self, qsa_ok: bool):
         """Split fwd_modules into alternating captured / eager runs."""
         fwd = self.model.fwd_modules
         flags = []
@@ -381,7 +467,7 @@ class DecodeGraphs:
                 and not module.caps.get("prefer_cpu")
                 and not module.caps.get("x_cpu")
             )
-            flags.append(on_dev and all(_module_capturable(sub, qsa_dense) for sub in module))
+            flags.append(on_dev and all(_module_capturable(sub, qsa_ok) for sub in module))
 
         layout, i = [], 0
         while i < len(flags):
@@ -410,6 +496,8 @@ class DecodeGraphs:
             tuple(input_ids.shape),
             tuple(bt.shape), bt.dtype,
             tuple(cs.shape), cs.dtype,
+            # Bound per-step inputs: contents vary freely, shape and dtype may not
+            tuple((k, tuple(t.shape), t.dtype) for k, t in _step_inputs(params)),
             id(params.get("cache")),
             params.get("causal", True),
             params.get("last_tokens_only"),
@@ -431,6 +519,8 @@ class DecodeGraphs:
         if params.get("position_ids") is not None:
             return False
         if params.get("sim_kvq") is not None or "ovr" in params:
+            return False
+        if any(params.get(k) for k in _OUT_PARAM_REQUESTS):
             return False
         return True
 
@@ -485,6 +575,11 @@ class DecodeGraphs:
         p["block_table"] = cap.dev_block_table
         p["positions"] = cap.dev_seqlens
         p.pop("position", None)
+        # Per-step params inputs (target_hidden): point at the persistent buffers
+        # _refresh_step refills, so a captured span bakes an address that stays
+        # valid and an eager span in a replayed step reads this step's values
+        for k, buf in cap.step_inputs.items():
+            p[k] = buf
         # Seed the host mirror so Attention's QSA branch, which asks for
         # get_for_device(params, "cache_seqlens", "cpu"), gets a pinned CPU
         # tensor instead of a D2H copy off the bound device buffer (that copy
@@ -509,8 +604,11 @@ class DecodeGraphs:
         cap.host_seqlens.copy_(src_cs)
         src_bt = params["block_table"]
         cap.dev_block_table.copy_(src_bt, non_blocking = src_bt.is_pinned())
+        for k, buf in cap.step_inputs.items():
+            src = params[k]
+            buf.copy_(src, non_blocking = src.device.type == "cpu" and src.is_pinned())
 
-    def _walk(self, cap, input_ids):
+    def _walk(self, cap, input_ids, params):
         """One decode step: replay captured spans, run eager ones in between."""
         x = input_ids
         for span in cap.spans:
@@ -521,14 +619,107 @@ class DecodeGraphs:
                 span.graph.replay()
                 x = span.out
             else:
-                x = self._run_range(x, span.start, span.end, cap.params)
+                x = self._run_range(x, span.start, span.end, params)
         return x
 
     def _replay(self, cap, input_ids, params):
         self._refresh_step(cap, params)
-        x = self._walk(cap, input_ids)
+        # Rebind against THIS step's params. A captured span reads only the
+        # persistent buffers refreshed above, but the eager spans between them
+        # run ordinary module code, and binding once at capture time would hand
+        # them the capture-time params dict forever
+        x = self._walk(cap, input_ids, self._bind(params, cap))
         self.n_replays += 1
         return x
+
+    # ------------------------------------------------------------ verification
+
+    def _span_eager(self, span, x_in, p, restore):
+        """One eager run of a span from x_in and a restored state."""
+        restore()
+        span.static_in.copy_(x_in)
+        out = self._run_range(span.static_in, span.start, span.end, p)
+        torch.cuda.synchronize()
+        return out.clone()
+
+    def _span_replay(self, span, x_in, p, restore):
+        restore()
+        span.static_in.copy_(x_in)
+        span.graph.replay()
+        torch.cuda.synchronize()
+        return span.out
+
+    def _verify_span(self, span, x_in, p, restore, ref = None):
+        """Compare a replay of `span` from x_in against an eager run of the same
+        span from the same input and state. Returns None, or why they differ.
+
+        `ref` is a precomputed eager output for x_in; exempt spans ignore it and
+        recompute, since they need several samples to size their noise floor.
+        """
+        if span.exempt:
+            # This span holds kernels that are not deterministic run to run, so
+            # neither "graph == eager" nor "graph == graph" holds even when the
+            # capture is perfectly correct. Measured on qwen35-35b-a3b with
+            # capture OFF: repeating one decode step from byte-identical state
+            # gave bitwise-identical logits only 2 times in 7, and 8 full greedy
+            # decodes produced 3 distinct token sequences.
+            #
+            # So calibrate instead of assuming: run the span eagerly
+            # _NOISE_SAMPLES times from the same restored state to measure this
+            # span's own noise floor, then accept the graph only if it lands
+            # inside it. Self-calibrating, and it neither rubber-stamps (the old
+            # skip) nor refuses every hybrid (a bitwise gate would).
+            refs = [self._span_eager(span, x_in, p, restore).float()
+                    for _ in range(_NOISE_SAMPLES)]
+            noise = max(
+                (refs[a] - refs[b]).abs().max().item()
+                for a in range(len(refs)) for b in range(a + 1, len(refs))
+            )
+            got = self._span_replay(span, x_in, p, restore)
+            delta = (got.float() - refs[0]).abs().max().item()
+            # Allow a few multiples of the observed spread, plus a small absolute
+            # floor so a span that happens to measure zero noise is not held to
+            # exact equality.
+            budget = max(noise * _NOISE_TOLERANCE, 1e-3)
+            if delta > budget:
+                return (f"graph differs from eager by {delta:.3e}, outside this "
+                        f"span's measured noise floor {noise:.3e} "
+                        f"(budget {budget:.3e})")
+            _log(f"span {span} verified against its own noise floor: delta "
+                 f"{delta:.3e} <= budget {budget:.3e} "
+                 f"(eager-vs-eager spread {noise:.3e})")
+            return None
+
+        if ref is None:
+            ref = self._span_eager(span, x_in, p, restore)
+        got = self._span_replay(span, x_in, p, restore)
+        if not torch.equal(got, ref):
+            return f"max abs diff {(got.float() - ref.float()).abs().max().item():.3e}"
+        return None
+
+    def _verify_span_varied(self, cap, span, x_in, p, restore):
+        """Second verification pass, from a DIFFERENT input.
+
+        Replaying the input a graph was captured from can only prove the graph
+        reproduces the step it recorded. What makes a graph wrong is an input it
+        BAKED instead of re-reading, and that stays invisible for exactly as long
+        as the input does not change -- which is why an MTP draft whose every
+        step carries a fresh target_hidden decoded to noise while this check
+        passed. So vary both channels a step's inputs arrive on: the span input,
+        and every per-step params buffer. The params buffers are rewritten IN
+        PLACE, since a bound buffer is precisely the address a correct capture
+        reads through; anything that grabbed a different tensor stays stale and
+        shows up as a mismatch here.
+        """
+        saved = {k: b.clone() for k, b in cap.step_inputs.items()}
+        try:
+            for k, b in cap.step_inputs.items():
+                b.copy_(_perturb(saved[k]))
+            why = self._verify_span(span, _perturb(x_in), p, restore)
+        finally:
+            for k, b in cap.step_inputs.items():
+                b.copy_(saved[k])
+        return None if why is None else f"varied input: {why}"
 
     def _capture(self, sig, input_ids, params):
         dev = self.device
@@ -541,13 +732,15 @@ class DecodeGraphs:
         # pool keeps the whole step's captured allocations in one arena that the
         # normal allocator never hands out.
         pool = torch.cuda.graph_pool_handle() if _SHARED_POOL else None
-        regime = self._qsa_regime(params)
-        layout = self.layouts.get(regime, self.layouts.get(False))
+        layout = self.layouts.get(self._qsa_capturable(params), self.layouts[False])
         self.layout = layout
         spans = [_Span(c, s, e, x) for c, s, e, x in layout]
         host_seqlens = params["cache_seqlens"].detach().to("cpu").clone().pin_memory()
+        step_inputs = {
+            k: t.to(dev).contiguous().clone() for k, t in _step_inputs(params)
+        }
         cap = _CapturedStep(spans, dev_seqlens, host_seqlens, dev_block_table,
-                            params.get("cache"), None)
+                            step_inputs, params.get("cache"), None)
         cap.params = self._bind(params, cap)
         p = cap.params
         self._refresh_step(cap, params)
@@ -606,69 +799,21 @@ class DecodeGraphs:
                 return None
             span.graph = graph
 
-        # 3) Verify each span against its eager output, from the same input
+        # 3) Verify each span twice: from the input it was captured with, and
+        #    from a DIFFERENT one
         if _VERIFY:
             for k, span in enumerate(spans):
                 if not span.captured:
                     continue
-                if span.exempt:
-                    # This span holds kernels that are not deterministic run to
-                    # run, so neither "graph == eager" nor "graph == graph"
-                    # holds even when the capture is perfectly correct. Measured
-                    # on qwen35-35b-a3b with capture OFF: repeating one decode
-                    # step from byte-identical state gave bitwise-identical
-                    # logits only 2 times in 7, and 8 full greedy decodes
-                    # produced 3 distinct token sequences.
-                    #
-                    # So calibrate instead of assuming: run the span eagerly
-                    # _NOISE_SAMPLES times from the same restored state to
-                    # measure this span's own noise floor, then accept the graph
-                    # only if it lands inside it. Self-calibrating, and it
-                    # neither rubber-stamps (the old skip) nor refuses every
-                    # hybrid (a bitwise gate would). Three samples, not two: the
-                    # noise is intermittent (a pair can measure exactly 0 while
-                    # other pairs on the same span measure 2e-2), so one pair
-                    # under-estimates the floor and false-rejects a sound graph.
-                    refs = []
-                    for _ in range(_NOISE_SAMPLES):
-                        restore(); span.static_in.copy_(ins[k])
-                        r = self._run_range(span.static_in, span.start, span.end, p)
-                        torch.cuda.synchronize()
-                        refs.append(r.float().clone())
-                    noise = max(
-                        (refs[a] - refs[b]).abs().max().item()
-                        for a in range(len(refs)) for b in range(a + 1, len(refs))
-                    )
-                    r1 = refs[0]
-
-                    restore(); span.static_in.copy_(ins[k])
-                    span.graph.replay(); torch.cuda.synchronize()
-                    delta = (span.out.float() - r1).abs().max().item()
-
-                    # Allow a few multiples of the observed spread, plus a small
-                    # absolute floor so a span that happens to measure zero
-                    # noise on one pair is not held to exact equality.
-                    budget = max(noise * _NOISE_TOLERANCE, 1e-3)
-                    if delta > budget:
-                        _log(f"VERIFY FAILED for {sig} span {span}: graph differs "
-                             f"from eager by {delta:.3e}, outside this span's "
-                             f"measured noise floor {noise:.3e} (budget "
-                             f"{budget:.3e}); falling back to eager")
-                        self.rejected.add(sig)
-                        restore()
-                        return None
-                    _log(f"span {span} verified against its own noise floor: "
-                         f"delta {delta:.3e} <= budget {budget:.3e} "
-                         f"(eager-vs-eager spread {noise:.3e})")
-                    continue
-                restore()
-                span.static_in.copy_(ins[k])
-                span.graph.replay()
-                torch.cuda.synchronize()
-                if not torch.equal(span.out, outs[k]):
-                    d = (span.out.float() - outs[k].float()).abs().max().item()
-                    _log(f"VERIFY FAILED for {sig} span {span}: max abs diff "
-                         f"{d:.3e}; falling back to eager")
+                why = self._verify_span(
+                    span, ins[k], p, restore,
+                    ref = None if span.exempt else outs[k],
+                )
+                if why is None:
+                    why = self._verify_span_varied(cap, span, ins[k], p, restore)
+                if why is not None:
+                    _log(f"VERIFY FAILED for {sig} span {span}: {why}; "
+                         f"falling back to eager")
                     self.rejected.add(sig)
                     restore()
                     return None
@@ -677,7 +822,7 @@ class DecodeGraphs:
         #    passes above were all rolled back, so the state advances exactly
         #    once, as it would have on the eager path
         restore()
-        out = self._walk(cap, input_ids)
+        out = self._walk(cap, input_ids, p)
 
         if len(self.graphs) >= _MAX_GRAPHS:
             self.graphs.pop(next(iter(self.graphs)))

@@ -149,6 +149,25 @@ if has_triton:
             tl.store(prow + offs_p, y_ps)
 
 
+    @triton.jit(do_not_specialize = ["q_len", "stride"])
+    def _qsa_sel_state_kernel(
+        cache_seqlens,       # (bsz,) i32, pre-append counts
+        state,               # (2, stride) i32 out
+        q_len,
+        stride,
+        P: tl.constexpr,
+    ):
+        """Selection bounds derived on device: row 0 = the sequence's cache position (the
+        causal origin the scoring and expansion kernels count from), row 1 = its complete-pool
+        count after the append (the scoring scan width and the top-k bound). The selection
+        kernels take these as POINTERS, which is what keeps a decode selection launch free of
+        the per-step position and therefore replayable from a captured graph."""
+        b = tl.program_id(0)
+        sl = tl.load(cache_seqlens + b)
+        tl.store(state + b, sl)
+        tl.store(state + stride + b, (sl + q_len) // P)
+
+
     @triton.jit(do_not_specialize = ["k_len", "num_pages_per_seq", "num_splits", "split_len"])
     def _qsa_sparse_split_kernel(
         q,                   # (bsz, 1, n_q_heads, head_dim) fp16, normed + roped

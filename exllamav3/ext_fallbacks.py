@@ -16,6 +16,15 @@ import math
 import torch
 import torch.nn.functional as F
 
+from .ext_fallback_qcache import (
+    quant_cache_cont,
+    dequant_cache_cont,
+    quant_cache_paged,
+    dequant_cache_paged,
+    dequant_cache_paged_window,
+)
+from .ext_fallback_sam import BC_SAM
+
 
 # -- Activation fused ops (activation.cu) -------------------------------------
 
@@ -362,3 +371,73 @@ def routing_sel_norm(
     o = _routing_act(logits.gather(-1, selected.long()), act_fn)
     o = o * (scaling_factor / (o.sum(dim = -1, keepdim = True) + 1e-20))
     weights.copy_(o.to(weights.dtype))
+
+
+# -- Grammar logit bitmask (generator/sampling_fused.cu) -----------------------
+
+def apply_logit_bitmask(
+    logits_in: torch.Tensor,
+    logits_out: torch.Tensor,
+    bitmask: torch.Tensor,
+) -> None:
+    dim = logits_in.shape[-1]
+    words = bitmask.shape[-1]
+    nbits = words * 32
+    shifts = torch.arange(32, device = bitmask.device, dtype = torch.int32)
+    # Token i is bit (i & 31) of word (i >> 5), LSB first. torch's shift on signed int32 is
+    # arithmetic, which still leaves the wanted bit in position 0, so words with bit 31 set
+    # (negative as int32) unpack correctly.
+    keep = ((bitmask.view(-1, words).unsqueeze(-1) >> shifts) & 1).to(torch.bool).view(-1, nbits)
+    if nbits >= dim:
+        keep = keep[:, :dim]
+    else:
+        # Tokens at or beyond the mask width count as masked out, matching the kernel's
+        # `i < nbits` guard and the -inf padding of the dense mask path.
+        keep = torch.cat([keep, keep.new_zeros(keep.shape[0], dim - nbits)], dim = 1)
+    logits_out.copy_(torch.where(keep, logits_in, logits_in.new_full((), -math.inf)))
+
+
+# -- CPU MoE expert offload (cpu/moe_handoff.cu, cpu/moe_mul1.cpp) -------------
+#
+# No fallback: moe_mul1.cpp is ~2.3k lines of AVX2/AVX512-VNNI/VBMI trellis GEMM plus a
+# lock-free worker pool, and moe_handoff.cu drives it with cuStreamWaitValue32 doorbells that
+# have no HIP equivalent. A PyTorch transcription would be slower than simply keeping the
+# experts on the GPU, which is what ROCm does. So: the tuning setters no-op (nothing consumes
+# the flags), the ISA probes report no tier, and anything that would actually dispatch work
+# raises at the call site instead of corrupting a forward pass.
+
+def _moe_cpu_absent(name: str):
+    def _raise(*args: Any, **kwargs: Any):
+        raise NotImplementedError(
+            f"{name}: CPU MoE expert offload is not built on ROCm "
+            f"(cpu/moe_handoff.cu and cpu/moe_mul1.cpp are in ROCM_EXCLUDE_FILES). "
+            f"Keep the experts on the GPU."
+        )
+    return _raise
+
+
+def exl3_moe_cpu_set_memops(enabled: bool) -> None:
+    pass
+
+
+def exl3_moe_cpu_set_prof(enabled: bool) -> None:
+    pass
+
+
+def exl3_moe_cpu_has_avx2() -> bool:
+    return False
+
+
+def exl3_moe_cpu_has_avx512_vnni() -> bool:
+    return False
+
+
+def exl3_moe_cpu_has_avx512_vbmi() -> bool:
+    return False
+
+
+exl3_moe_cpu_make_layer = _moe_cpu_absent("exl3_moe_cpu_make_layer")
+exl3_moe_cpu_free_layer = _moe_cpu_absent("exl3_moe_cpu_free_layer")
+exl3_moe_cpu_forward = _moe_cpu_absent("exl3_moe_cpu_forward")
+exl3_moe_cpu_worker_run = _moe_cpu_absent("exl3_moe_cpu_worker_run")
+exl3_moe_cpu_pool_stress = _moe_cpu_absent("exl3_moe_cpu_pool_stress")

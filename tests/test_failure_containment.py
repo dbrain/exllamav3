@@ -72,6 +72,10 @@ def make_generator(pending, active=(), max_batch_size=16):
     generator.pending_jobs = list(pending)
     generator.active_jobs = list(active)
     generator.max_batch_size = max_batch_size
+    # Every attribute iterate() reads has to be declared here, which is what makes this fixture a contract:
+    # a new dependency that is only satisfied by __init__ would otherwise raise out of iterate() and defeat
+    # the containment these tests exist to pin
+    generator.disk_cache_size = 0
     return generator
 
 

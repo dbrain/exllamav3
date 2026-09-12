@@ -53,9 +53,8 @@ def test_preexisting_constraints_still_reject(over):
     assert _supports(has_mgemm = True, **over) is False
 
 
-def test_flags_track_the_actual_build():
+def test_moe_flag_tracks_the_actual_build():
     from exllamav3.ext import exllamav3_ext as ext
-    assert bsm._HAS_MGEMM == hasattr(ext, "exl3_mgemm")
     assert bsm._HAS_MOE == hasattr(ext, "exl3_moe")
 
 
@@ -96,3 +95,75 @@ def test_grouped_needs_triton_module():
 ])
 def test_grouped_rejects_unsupported(over):
     assert _supports_grouped(**over) is False
+
+
+# -- EXL3_NO_MGEMM: containing a build that exposes exl3_mgemm ------------------
+
+class _ExtWithMgemm:
+    """Proxies the real extension, forcing exl3_mgemm present or absent."""
+
+    def __init__(self, real, present):
+        self._real = real
+        self._present = present
+
+    def __getattr__(self, name):
+        if name == "exl3_mgemm":
+            if not self._present:
+                raise AttributeError(name)
+            return lambda *a, **kw: None
+        return getattr(self._real, name)
+
+
+def _patch_build(monkeypatch, present, env, hip):
+    import torch
+    from exllamav3 import ext as ext_mod
+    monkeypatch.setattr(ext_mod, "exllamav3_ext",
+                        _ExtWithMgemm(ext_mod.exllamav3_ext, present))
+    monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+    if env is None:
+        monkeypatch.delenv("EXL3_NO_MGEMM", raising = False)
+    else:
+        monkeypatch.setenv("EXL3_NO_MGEMM", env)
+
+
+@pytest.mark.parametrize("present, env, hip, expected", [
+    (False, None, "7.0", False),
+    (True,  None, "7.0", False),   # ROCm default: symbol present, path still off
+    (True,  "0",  "7.0", True),    # explicit opt-in
+    (True,  "1",  None,  False),   # explicit opt-out on CUDA
+    (True,  None, None,  True),    # CUDA default unchanged
+    (False, "0",  "7.0", False),   # opt-in cannot conjure a missing kernel
+])
+def test_mgemm_kernels_available(monkeypatch, present, env, hip, expected):
+    from exllamav3.model import config as cfg
+    _patch_build(monkeypatch, present, env, hip)
+    assert cfg.mgemm_kernels_available() is expected
+
+
+def test_use_mgemm_follows_the_gate(monkeypatch):
+    from exllamav3.model.config import InferParams, mgemm_kernels_available
+    _patch_build(monkeypatch, present = True, env = None, hip = "7.0")
+    assert mgemm_kernels_available() is False
+    assert InferParams().use_mgemm(4, 4096) is False
+
+
+def test_grouped_moe_survives_a_build_exposing_the_symbol(monkeypatch):
+    """The regression this gate exists for: _HAS_MGEMM flipping True drops both
+    _supports_grouped_mgemm and, with it, caps["graph_capturable"]."""
+    import importlib
+    _patch_build(monkeypatch, present = True, env = None, hip = "7.0")
+    mod = importlib.reload(bsm)
+    try:
+        assert mod._HAS_MGEMM is False
+        assert mod._supports_grouped_mgemm(
+            is_quantized = True, gated = True, activation_fn = "silu",
+            gates = [_Lin()], ups = [_Lin()], downs = [_Lin()],
+            num_local_experts = 8, num_experts = 8) is True
+    finally:
+        monkeypatch.undo()
+        importlib.reload(bsm)
+
+
+def test_flags_track_the_gate():
+    from exllamav3.model.config import mgemm_kernels_available
+    assert bsm._HAS_MGEMM == mgemm_kernels_available()

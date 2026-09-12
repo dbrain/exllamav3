@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 from ..util.device_copy import to_device
 import weakref
@@ -25,6 +26,42 @@ No reference implementation exists for this head; the input-combine stream handl
 (Qwen4ExpMTPInputLayer.stream_tap) is a semantic guess that must be confirmed by acceptance
 rate on the full model.
 """
+
+
+def build_sliced_head(head, cut: int):
+    """The first `cut` columns of an EXL3 lm_head, as a standalone head for DRAFTING.
+
+    A draft step reads the whole 248320-column head -- 455 MiB of the ~567 MiB it touches --
+    only to argmax it, while ids < 98304 cover 99.88-100% of real corpora. The target still
+    scores the full vocabulary, so a token the slice cannot propose is a rejected draft,
+    never a wrong token: this trades a little acceptance for draft-step bandwidth and cannot
+    change what the model emits.
+
+    `cut` must land on a 128 boundary because the output Hadamard is block-diagonal over
+    aligned 128-column groups; a cut inside a group would silently return wrong logits. The
+    trellis slice is COPIED contiguous: the kernels derive their strides from the shape, so a
+    view would be read as interleaved garbage rather than failing.
+    """
+    from ..modules.quant.exl3 import LinearEXL3
+    assert cut % 128 == 0, \
+        f"vocab cut {cut} must be a multiple of 128 (the output Hadamard's group width)"
+    assert 0 < cut <= head.out_features, \
+        f"vocab cut {cut} outside [1, {head.out_features}]"
+    return LinearEXL3(
+        None,
+        head.in_features,
+        cut,
+        None,
+        None,
+        None,
+        head.suh,
+        head.svh[:cut].contiguous(),
+        head.trellis[:, :cut // 16, :].contiguous(),
+        head.mcg_tensor,
+        head.mul1_tensor,
+        head.bias[:cut].contiguous() if head.bias is not None else None,
+        head.out_dtype,
+    )
 
 
 class Qwen4ExpMTPStackOut(Module):
@@ -122,6 +159,9 @@ class Qwen4ExpMTPModel(Model):
         self.target_embed = None
         self.target_lm_head = None
         self.attached_model = None
+        # Vocab-sliced copy of the target's head, built by attach_to only when
+        # EXL3_MTP_HEAD_VOCAB is set; None means drafting uses the target's full head.
+        self.draft_head = None
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
@@ -150,6 +190,16 @@ class Qwen4ExpMTPModel(Model):
         assert isinstance(target.modules[-1], Linear), "Expected Linear lm_head as last target module"
         self.target_lm_head = weakref.ref(target.modules[-1])
 
+        # EXL3_MTP_HEAD_VOCAB=<cut>: draft through the first <cut> columns of the target's
+        # head only. Read once here rather than per step, because the slice is a one-time
+        # ~188 MB copy at 98304 of 248320 columns, not something an arm can flip mid-run.
+        cut = int(os.environ.get("EXL3_MTP_HEAD_VOCAB", "0") or 0)
+        inner = getattr(target.modules[-1], "inner", None)
+        if cut and inner is not None and getattr(inner, "quant_type", None) == "exl3":
+            self.draft_head = build_sliced_head(inner, cut)
+            print(f" -- MTP draft head sliced to {cut} of {inner.out_features} vocab columns",
+                  flush = True)
+
         target_mixer = target.modules[target.logit_layer_idx - 1]
         assert isinstance(target_mixer, GatedResidual) and not target_mixer.use_combine, \
             "Expected the trunk's combine-less mixer immediately before lm_head"
@@ -173,10 +223,19 @@ class Qwen4ExpMTPModel(Model):
         bsz, seq, _ = state.shape
         stack = to_device(state, mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
-        ll = self.attached_model().logit_layer_idx
-        lm = self.attached_model().modules[ll]
-        logits = lm.prepare_for_device(state, params)
-        logits = lm.forward(logits, params)
+        # The slice itself is built once at load (a ~188 MB copy), but WHICH head drafts is
+        # read per call: the effect is a few percent and the cross-process spread here is
+        # 4.3%, so both arms have to run interleaved inside one process to be comparable.
+        if self.draft_head is not None and os.environ.get("EXL3_MTP_HEAD_SLICE", "1") != "0":
+            # A bare LinearEXL3 is not a Module, so it has no prepare_for_device; move the
+            # state here instead. Its kernels also assert contiguity on the input.
+            logits = to_device(state, self.draft_head.trellis.device).contiguous()
+            logits = self.draft_head.forward(logits, params)
+        else:
+            ll = self.attached_model().logit_layer_idx
+            lm = self.attached_model().modules[ll]
+            logits = lm.prepare_for_device(state, params)
+            logits = lm.forward(logits, params)
         if params.get("export_draft_conf"):
             logits = logits[..., :self.attached_model().config.vocab_size]
             conf, ids = torch.max(logits, dim = -1)

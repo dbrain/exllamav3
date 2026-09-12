@@ -15,6 +15,22 @@ on the decode path):
                                              # -> fused dequant-gemm -> hadamard
                                              # (+ optional bias)
 
+A decode linear costs three launches by default. Two flags remove one each:
+
+    EXL3_FUSE_INPUT_HAD   folds the input Hadamard into the GEMM's K loop
+                          (pass ``suh`` to exl3_gemm_triton). Costs no tile
+                          quality, but is only BIT-EXACT for bits 1, 2 and 8:
+                          the heavy-accumulator widths change fp32 reduction
+                          rounding under the added register pressure. See
+                          _fuse_input_had.
+    EXL3_FUSE_OUTPUT_HAD  folds the output Hadamard + post-scale into the
+                          GEMM's store (pass ``svh``). NOT free: it needs
+                          BLOCK_N % 128 == 0, which forfeits the narrow decode
+                          tiles the heavy-accumulator widths want, so
+                          _fuse_output_had gates it on N. On the split-K route
+                          it never engages -- _m1_split_reduce_had already
+                          folds the same transform into the reduce.
+
 The fused kernel decodes the EXL3 trellis tile-by-tile inside the K-loop
 without materializing the weight matrix. Every bit width K = 1..8 has a
 dedicated M==1 fast decode whose per-element word/shift lookup is realized
@@ -149,9 +165,15 @@ def _had_r_128_kernel(
 # using the C++ kernel through pybind.
 #
 # Scope note: its kernel time matches or beats the C++ kernel at every shape
-# (measured via CUDA-graph replay), but an EAGER call from Python pays the
-# Python launch path. It exists for the graph-captured path, where launch
-# overhead does not apply; don't adopt it on uncaptured hot paths.
+# (measured via CUDA-graph replay), but every call — captured or not — costs a
+# launch, and on this part a launch is ~16 us of fixed DEVICE cost (Triton
+# pure-stream fit t = 16.3us + bytes/76.6GB/s, R^2 0.999999) plus host power.
+# At decode these transforms move 5-40 KB, so the launch IS the cost: a
+# 2560-wide input Hadamard is ~0.07 us of stream against ~16 us of fixed cost.
+# The decode path avoids the input one when EXL3_FUSE_INPUT_HAD is set
+# (_fuse_input_had / _had_x_tile) and the output one on the split-K route
+# (_m1_split_reduce_had) or under EXL3_FUSE_OUTPUT_HAD (_store_out_had); don't
+# adopt this kernel anywhere a fusion is available instead.
 # ---------------------------------------------------------------------------
 
 _RSCALE_128 = 0.088388347648  # 1/sqrt(128), matches the C++ literal
@@ -502,7 +524,118 @@ def _prefer_warps(configs):
     return want if want else configs
 
 
-def _exl3_gemm_early_prune(configs, named_args, **kwargs):
+# Measured tile winners for the DENSE pool, keyed like the autotune key's shape
+# part: (K_dim, N, K_BITS, M_BUCKET) -> (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M,
+# num_warps, num_stages).
+#
+# Same rationale as _MGEMM_PINNED in exl3_mgemm_triton.py: on gfx1150 the pool
+# is benchmarked on a cold clock and the candidates sit within noise, so the
+# pick is not reproducible -- the dense b6 pool chose BLOCK_K 256 one run and
+# 128 the next. Non-deterministic tile selection is not just a reproducibility
+# annoyance: it changes the fp32 accumulator reduction order, so it decides
+# whether a result is bit-exact or ~1 ULP off, and it perturbs graph-capture
+# engagement. Pinning makes the shipped kernel a function of the shape alone.
+#
+# Escape hatches, in precedence order:
+#   EXL3_GEMM_CONFIGS=...     explicit pool, bypasses the table (manual sweeps)
+#   EXL3_GEMM_PIN=0           ignore the table, benchmark the pool as before
+#   EXL3_GEMM_PIN=strict      never benchmark: on a table miss take the first
+#                             config the prune leaves, a pure function of the
+#                             shape. Covers shapes nobody has measured yet,
+#                             which a table cannot.
+_GEMM_PINNED = {
+    # (K_dim,     N, bits, M_bucket): (BM,  BN,  BK, GM, nw, ns)
+    # Flash-Next 4.05bpw dense decode (M == 1). Winners of a 13-tile sweep,
+    # 3 interleaved reps, cache warm, GPU edge gated, zero compiles inside any
+    # timing window (llm-fondling/perf/exl3/ledger-gemm.csv). Every entry is a
+    # member of the pool the autotuner would have chosen from anyway, so pinning
+    # cannot pick a tile production could not already have landed on -- it only
+    # stops the choice being a coin flip.
+    #
+    # Confirmed end to end through this code path, not just as isolated arms
+    # (ledger-dpin.csv, 3 reps, fresh process per arm, depth 4096):
+    #   EXL3_GEMM_PIN=0   9.472 t/s   105.6 ms/tok   rep spread 1.55% / 6.12%
+    #   pinned           10.037       99.6           rep spread 0.18% / 0.04%
+    #   strict           10.226       97.7           rep spread 2.02% / 2.09%
+    # (the two spreads are sync=none / sync=token). +6.0% from the table alone.
+    # Note the isolated per-shape sweep predicted -7.5 ms and the real gain was
+    # -4.3 ms: kernel rates measured in isolation do not fully carry into decode.
+    ( 2560,  10240, 6, 1): ( 16,  64, 128, 1, 2, 3),  # gdn.in_proj_qkv 35.4 vs 32.1
+    ( 2560,   6144, 6, 1): ( 16,  64, 128, 1, 2, 3),  # gdn.in_proj_z   35.2 vs 31.9
+    ( 2560,  12288, 6, 1): ( 16, 128,  64, 1, 2, 3),  # attn.q_proj     38.0 vs 33.5
+    ( 2560,    640, 6, 1): ( 16,  16,  64, 1, 2, 3),  # shared.gate/up  15.6 vs 13.0
+    ( 2560,    512, 6, 1): ( 16,  16,  64, 1, 2, 3),  # attn.k/v_proj   14.3 vs 12.7
+    ( 2560,    640, 4, 1): ( 16,  32, 256, 1, 2, 2),  # attn.indexer_qk 12.2 vs 11.5
+    ( 2560, 248320, 6, 1): ( 16, 128,  64, 1, 2, 3),  # lm_head         56.2 vs 47.9
+
+    # Flash-Next 4.05bpw SPECULATIVE VERIFY (M_BUCKET 8). An MTP round runs the
+    # target over ndt + 1 tokens, so the deployed ndt 4 and 6 both land here
+    # while plain decode stays at M_BUCKET 1. Without these entries every verify
+    # shape misses the table and `strict` takes the first config the prune
+    # leaves -- and at M > 1 the prune returns the pool UNFILTERED (only the
+    # m == 1 path is N-bucketed, and only it gets _prefer_warps), so out[0] is
+    # decided by the literal order of _exl3_gemm_configs(): the M == 1
+    # CTA-starved decode tile at num_warps 4, handed to all eight sites at once.
+    #
+    # Values are the autotuner's own picks, read out of the live cache of a
+    # fresh EXL3_GEMM_PIN=1 process on this checkpoint
+    # (llm-fondling/perf/exl3/ledger-roundgap-tiles.csv, run 20260910_071434);
+    # the strict process of the same run (20260910_060625) agrees with the
+    # M_BUCKET 1 entries above on every shape and disagrees here on every one.
+    #
+    # End to end, ledger-roundgap-sample.csv -- median of 4 samples per cell,
+    # 2 prompts, 2 interleaved reps, fresh process per pin arm, 0 compilations
+    # in any timed window, both arms opening at Tctl 99 C and closing at 76 C
+    # (the harness's host spin thread is what heats the die; the timed decode is
+    # memory-bound and the package cools through it):
+    #   target verify forward   363.7 -> 263.7 ms (ndt 4), 419.4 -> 313.8 (ndt 6)
+    #   round                   405.2 -> 305.9 ms (ndt 4), 482.1 -> 372.4 (ndt 6)
+    #   plain decode round       98.8 ->  98.7 ms -- unchanged, as it must be
+    #   long_code at acceptance 3.0/4:  9.88 -> 13.08 t/s
+    ( 2560,  10240, 6, 8): ( 16,  32,  32, 1, 1, 2),  # gdn.in_proj_qkv
+    ( 2560,   6144, 6, 8): ( 16,  32,  32, 1, 1, 2),  # gdn.in_proj_z
+    ( 2560,  12288, 6, 8): ( 16,  32,  32, 1, 2, 3),  # attn.q_proj
+    ( 2560,    640, 6, 8): ( 16,  32,  32, 1, 1, 2),  # shared.gate/up
+    ( 2560,    512, 6, 8): ( 16,  32,  32, 1, 1, 2),  # attn.k/v_proj
+    ( 2560, 248320, 6, 8): ( 16,  32,  32, 1, 1, 2),  # lm_head
+    ( 6144,   2560, 6, 8): ( 16,  32,  32, 1, 2, 3),  # gdn.out_proj
+    (  640,   2560, 6, 8): ( 16,  32,  32, 1, 1, 2),  # moe / shared down_proj
+}
+
+_GEMM_PIN_OFF = ("0", "off", "false", "no")
+
+
+def _gemm_pinned_config(named_args, kwargs):
+    """The pinned tile for this shape, or None to fall through to autotune."""
+    if os.environ.get("EXL3_GEMM_PIN", "1").lower() in _GEMM_PIN_OFF:
+        return None
+    if os.environ.get("EXL3_GEMM_CONFIGS"):
+        return None
+
+    def arg(nm):
+        return kwargs.get(nm, named_args.get(nm))
+
+    hit = _GEMM_PINNED.get((arg("K_dim"), arg("N"), arg("K_BITS"),
+                            arg("M_BUCKET")))
+    if hit is None:
+        return None
+    bm, bn, bk, gm, nw, ns = hit
+    # A pin must never override a correctness constraint. A tile that does not
+    # divide the shape lands in the generic gather path with a different
+    # accumulation order -- a different result, not just a slower one -- and the
+    # fused transforms are block-diagonal over aligned 128-element groups.
+    n_, k_ = arg("N"), arg("K_dim")
+    if n_ % bn or k_ % bk:
+        return None
+    if kwargs.get("FUSE_HAD", named_args.get("FUSE_HAD")) and bk % 128:
+        return None
+    if kwargs.get("FUSE_OUT_HAD", named_args.get("FUSE_OUT_HAD")) and bn % 128:
+        return None
+    return triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk,
+                          "GROUP_M": gm}, num_warps=nw, num_stages=ns)
+
+
+def _exl3_gemm_prune_pool(configs, named_args, **kwargs):
     """Restrict the config set per invocation:
     - Other bit widths run the generic tl.gather path, where this Triton
       build's LLVM aborts on large gather tiles.
@@ -524,6 +657,22 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
     k = kwargs.get("K_dim", named_args.get("K_dim"))
     m = kwargs.get("M", named_args.get("M"))
     fast_ok = n % 128 == 0 and k % 128 == 0
+    if kwargs.get("FUSE_HAD", named_args.get("FUSE_HAD")):
+        # The in-kernel input Hadamard needs whole 128-element K groups per
+        # tile, so narrower K tiles cannot serve it. Applied to the base list
+        # so every "empty pool -> configs" fallback below stays legal.
+        configs = [c for c in configs if c.kwargs["BLOCK_K"] % 128 == 0]
+    if kwargs.get("FUSE_OUT_HAD", named_args.get("FUSE_OUT_HAD")):
+        # Same argument on the N axis: the in-kernel output Hadamard can only
+        # finish 128-column groups the CTA owns. This is the fusion's whole
+        # cost -- it forfeits the narrow-BLOCK_N decode tiles that starved-N
+        # shapes want -- which is why _fuse_output_had gates on N, not just on
+        # divisibility.
+        configs = [c for c in configs if c.kwargs["BLOCK_N"] % 128 == 0]
+    else:
+        configs = [c for c in configs
+                   if (c.kwargs["BLOCK_N"], c.kwargs["BLOCK_K"], c.num_warps)
+                   not in _FUSE_OUT_ONLY_CFG]
     if bits == 1:
         # This Triton build's TTGIR pass crashes on the K_BITS=1 decode tiles
         # ([*, 8] per sub-tile) with 8 warps at BLOCK_N=16.
@@ -655,6 +804,14 @@ def _exl3_gemm_configs():
         # M == 1 fallback for shapes outside both pools (never autotuned away:
         # kept so the pruned list is never empty on unusual shapes)
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 1}, num_warps=4, num_stages=3),
+        # M == 1, FUSED-OUTPUT-HADAMARD-ONLY tiles. The output fusion forces
+        # BLOCK_N % 128 == 0, which leaves the stock list with exactly one
+        # member ((128,128) at 8 warps) and no autotune choice at all. These
+        # give it one. They are pruned out of every non-fused invocation
+        # (_FUSE_OUT_ONLY_CFG) so the measured pools above are untouched.
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 1}, num_warps=2, num_stages=3),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 1}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_M": 1}, num_warps=4, num_stages=3),
         # M == 1, bits=3 run-funnel decode: the shared-funnel tile is narrow
         # (8 x BLOCK_N/2), so single-warp narrow blocks win the wide-N stream
         # (measured 484 vs 431 GB/s at 1x5120x248320). Pruned out for every
@@ -671,8 +828,184 @@ def _exl3_gemm_configs():
     ]
 
 
+# (BLOCK_N, BLOCK_K, num_warps) of the pool members that exist ONLY to give the
+# fused-output-Hadamard route something to autotune over. Dropped everywhere
+# else so the measured pools stay exactly as they were.
+_FUSE_OUT_ONLY_CFG = {(128, 128, 2), (128, 128, 4), (128, 256, 4)}
+
+
+_WARNED_UNCURATED = set()
+
+
+def _warn_uncurated_strict(named_args, kwargs, m):
+    """Name the shape once, so it gets pinned rather than silently autotuned."""
+    def g(k):
+        return kwargs.get(k, named_args.get(k))
+    key = (g("K_dim"), g("N"), g("K_BITS"), g("M_BUCKET"))
+    if key in _WARNED_UNCURATED:
+        return
+    _WARNED_UNCURATED.add(key)
+    print(f" !! EXL3_GEMM_PIN=strict: (K_dim, N, K_BITS, M_BUCKET)={key} (M={m}) has "
+          f"no _GEMM_PINNED entry and M > 1 pools are uncurated; autotuning instead "
+          f"of pinning. Measure it and add it to _GEMM_PINNED for a deterministic run.",
+          flush=True)
+
+
+def _exl3_gemm_early_prune(configs, named_args, **kwargs):
+    """Pin, else strict-first, else the measured pool selector.
+
+    Wrapping rather than editing _exl3_gemm_prune_pool's four return paths keeps
+    the pool logic exactly as it was measured, and guarantees the pin applies on
+    every path rather than only the one someone remembered to patch.
+    """
+    pin = _gemm_pinned_config(named_args, kwargs)
+    if pin is not None:
+        # A single config means triton.autotune skips benchmarking entirely, so
+        # the cold-clock race that produced the non-deterministic pick is gone.
+        return [pin]
+    out = _exl3_gemm_prune_pool(configs, named_args, **kwargs)
+    if os.environ.get("EXL3_GEMM_PIN", "1").lower() == "strict" and out:
+        # out[0] is a pure function of the shape either way, but it is only a
+        # GOOD tile where the pool was curated: _exl3_gemm_prune_pool N-buckets
+        # and _prefer_warps-filters the m == 1 branch, and every member of those
+        # pools was measured. Every other M falls through to a bare
+        # `return configs`, where out[0] is just the head of the literal config
+        # list -- an m == 1 decode tile. Collapsing there handed all eight dense
+        # verify sites a CTA-starved tile for ~100 ms/round at ndt 4, and
+        # _m_bucket(9) == 16 re-arms it on any bucket nobody has pinned.
+        # Autotuning an unmeasured shape beats deterministically guessing it.
+        m = kwargs.get("M", named_args.get("M"))
+        if m is None:
+            m = kwargs.get("M_BUCKET", named_args.get("M_BUCKET"))
+        if m == 1:
+            return [out[0]]
+        _warn_uncurated_strict(named_args, kwargs, m)
+    return out
+
+
 _PRUNE = {"early_config_prune": _exl3_gemm_early_prune}
 
+
+@triton.jit
+def _had_x_tile(
+    x_ptr, suh_ptr, k0, stride_xk, K_dim, r_scale,
+    FUSE_HAD: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Input Hadamard for the K-tile this CTA is about to consume, replacing the
+    # separate had_r_128_triton launch. The transform is block-diagonal over
+    # aligned 128-element groups of K, so a CTA owning [k0, k0 + BLOCK_K) can
+    # derive its own slice — hence the BLOCK_K % 128 == 0 and k0 % 128 == 0
+    # requirements enforced by _exl3_gemm_early_prune and _m1_splitk_plan's
+    # NK-aligned k_base. Every CTA along N repeats this work; that is one
+    # BLOCK_K-wide transform against a whole tile of weight decodes, and x is
+    # L2-resident.
+    #
+    # Bit-exactness with _had_r_128_kernel is mandatory (the unfused path feeds
+    # the GEMM a half xh): pre-scale in half, butterfly in fp32, * r_scale,
+    # then round to half HERE — keeping fp32 across the multiply would change
+    # the result.
+    if FUSE_HAD:
+        R: tl.constexpr = BLOCK_K // 128
+        off = k0 + tl.arange(0, R)[:, None] * 128 + tl.arange(0, 128)[None, :]
+        m = off < K_dim
+        xv = tl.load(x_ptr + off * stride_xk, mask=m, other=0.0)
+        pre = tl.load(suh_ptr + off, mask=m, other=0.0)
+        v = (xv * pre).to(tl.float32)
+        v = _had_stage(v, R, 1)
+        v = _had_stage(v, R, 2)
+        v = _had_stage(v, R, 4)
+        v = _had_stage(v, R, 8)
+        v = _had_stage(v, R, 16)
+        v = _had_stage(v, R, 32)
+        v = _had_stage(v, R, 64)
+        v = v * r_scale
+        return tl.reshape(v.to(tl.float16), (BLOCK_K // 16, 16))
+    else:
+        return tl.zeros((BLOCK_K // 16, 16), dtype=tl.float16)
+
+
+@triton.jit
+def _store_out_had(
+    y_ptr, y_off, offs_n, mask_n, acc, svh_ptr, r_scale,
+    FUSE_OUT_HAD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # Output Hadamard for the N-tile this CTA just finished, replacing the
+    # trailing had_r_128_triton launch. Block-diagonal over aligned 128-element
+    # groups of N, so a CTA owning [n0, n0 + BLOCK_N) can finish its own
+    # columns -- hence BLOCK_N % 128 == 0, enforced by _exl3_gemm_early_prune,
+    # and n0 % 128 == 0, which follows from it.
+    #
+    # Bit-exactness with gemm-store + _had_r_128_kernel(POST_SCALED) is
+    # mandatory: the unfused route ROUNDS the fp32 accumulator to half when it
+    # stores y and reads that half back, so the round-trip through half has to
+    # happen here too, before the butterfly. The post-scale is then a half
+    # multiply, matching the C++ kernel's ordering.
+    if FUSE_OUT_HAD:
+        R: tl.constexpr = BLOCK_N // 128
+        v = tl.reshape(acc.to(tl.float16).to(tl.float32), (R, 128))
+        v = _had_stage(v, R, 1)
+        v = _had_stage(v, R, 2)
+        v = _had_stage(v, R, 4)
+        v = _had_stage(v, R, 8)
+        v = _had_stage(v, R, 16)
+        v = _had_stage(v, R, 32)
+        v = _had_stage(v, R, 64)
+        v = v * r_scale
+        post = tl.load(svh_ptr + offs_n, mask=mask_n, other=0.0)
+        out = v.to(tl.float16) * tl.reshape(post, (R, 128))
+        tl.store(y_ptr + y_off, tl.reshape(out, (BLOCK_N,)), mask=mask_n)
+    else:
+        tl.store(y_ptr + y_off, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+
+
+@triton.jit
+def _x_sub16(
+    xhad, x_ptr, ktb, stride_xk,
+    KI: tl.constexpr,
+    NK: tl.constexpr,
+    FUSE_HAD: tl.constexpr,
+):
+    if FUSE_HAD:
+        # Select through the bit pattern, not the value: a float masked sum
+        # would flush a -0.0 element to +0.0.
+        b = tl.cast(xhad, tl.int16, bitcast=True).to(tl.int32)
+        sel = (tl.arange(0, NK) == KI)[:, None]
+        return tl.cast(tl.sum(tl.where(sel, b, 0), 0).to(tl.int16), tl.float16, bitcast=True)
+    else:
+        return tl.load(x_ptr + (ktb * 16 + tl.arange(0, 16)) * stride_xk)
+
+
+# ---------------------------------------------------------------------------
+# Constexpr fast-path gate
+#
+# The decode fast paths are selected on `N % BLOCK_N == 0 and K_dim % BLOCK_K
+# == 0`. N and K_dim are RUNTIME kernel arguments, so that predicate is a
+# Triton tensor, not a Python bool: Triton emits an scf.if and compiles EVERY
+# decode branch into EVERY binary. Measured on gfx1150, bits=6 / BN32 / BK128:
+# the dead generic tl.gather branch is 7808 of 13698 instructions and drags the
+# kernel to 256 VGPR / 291 VGPR spills / 676 B-per-lane scratch / 94 KB code /
+# 4 waves per SIMD. Folding the predicate gives 123 VGPR / 0 spills / 9 KB /
+# 8 waves, executing exactly the same instructions.
+#
+# For power-of-two BLOCK_N, `N % BLOCK_N == 0` <=> `pow2div(N) % BLOCK_N == 0`,
+# so the capped 2-adic valuation of N and K_dim is an EXACT constexpr
+# substitute -- provided BLOCK_N and BLOCK_K do not exceed the cap, which the
+# kernel checks before trusting it. A 0 disables the gate and restores the
+# runtime-argument codegen unchanged, so EXL3_CONSTEXPR_GATE=0 is a real
+# control arm rather than a different slow path.
+# ---------------------------------------------------------------------------
+
+_GATE_CAP = 256
+_GATE_OFF = ("0", "off", "false", "no")
+
+
+def _gate_div(v: int) -> int:
+    # read per call, not at import, so one process can A/B both codegens
+    if os.environ.get("EXL3_CONSTEXPR_GATE", "1").lower() in _GATE_OFF:
+        return 0
+    return min(_GATE_CAP, v & -v)
 
 
 @triton.jit
@@ -744,7 +1077,10 @@ def _decode_u16(w_u32, CB: tl.constexpr):
         return h * k_inv_h + k_bias_h
 
 
-@triton.autotune(configs=_exl3_gemm_configs(), key=["M_BUCKET", "N", "K_dim", "K_BITS", "N_PACKED", "CB"], prune_configs_by=_PRUNE)
+@triton.autotune(configs=_exl3_gemm_configs(),
+                 key=["M_BUCKET", "N", "K_dim", "K_BITS", "N_PACKED", "CB", "FUSE_HAD",
+                      "FUSE_OUT_HAD"],
+                 prune_configs_by=_PRUNE)
 @triton.jit
 def _fused_dequant_gemm_kernel(
     x_ptr, y_ptr,
@@ -766,6 +1102,13 @@ def _fused_dequant_gemm_kernel(
     CB: tl.constexpr,
     M1: tl.constexpr,
     SPLITS: tl.constexpr,
+    N_DIV: tl.constexpr = 0,
+    K_DIV: tl.constexpr = 0,
+    FUSE_HAD: tl.constexpr = False,
+    suh_ptr = None,
+    FUSE_OUT_HAD: tl.constexpr = False,
+    svh_ptr = None,
+    had_r_scale = _RSCALE_128,
 ):
     NK: tl.constexpr = BLOCK_K // 16   # k-sub-tiles per weight tile
     NN: tl.constexpr = BLOCK_N // 16   # n-sub-tiles per weight tile
@@ -774,6 +1117,10 @@ def _fused_dequant_gemm_kernel(
     # funnel (high<<32 | low) >> shift can be computed with 32-bit ops only,
     # avoiding expensive emulated 64-bit arithmetic on RDNA3.
     SHIFT_FITS_32: tl.constexpr = (K_BITS == 1) | (K_BITS == 2) | (K_BITS == 4)
+    if N_DIV > 0 and BLOCK_N <= 256 and BLOCK_K <= 256:
+        FULL = ((N_DIV % BLOCK_N) + (K_DIV % BLOCK_K)) == 0
+    else:
+        FULL = (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0)
 
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -815,7 +1162,7 @@ def _fused_dequant_gemm_kernel(
         k_base = pid_split * tiles_per_split
         n_outer = tl.cdiv(min(tiles_per_split, n_k_tiles_total - k_base), NK)
 
-    if K_BITS == 4 and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+    if K_BITS == 4 and FULL:
         # ------------------------------------------------------------------
         # bits=4 fast path (full tiles only): coalesced staging + gather-free
         # algebraic decode.
@@ -859,6 +1206,8 @@ def _fused_dequant_gemm_kernel(
             r16 = tl.arange(0, 16)
             acc6 = tl.zeros((2, 2, 2, NN, 8, 4), dtype=tl.float32)
             for k_outer in range(n_outer):
+                xhad = _had_x_tile(x_ptr, suh_ptr, (k_base + k_outer * NK) * 16, stride_xk,
+                                   K_dim, had_r_scale, FUSE_HAD, BLOCK_K)
                 for ki in tl.static_range(NK):
                     ktb = k_base + k_outer * NK + ki
                     row = tu32_ptr + ktb * stride_tk_u32 + base_n
@@ -873,7 +1222,7 @@ def _fused_dequant_gemm_kernel(
                     q = ((words[None, :] >> sh[:, None]) |
                          (m1[None, :] << neg_sh[:, None])) & 0xFFFF    # [8, NN*32]
                     w_dec = _decode_u16(q.to(tl.uint32), CB).to(tl.float32)
-                    xk = tl.load(x_ptr + (ktb * 16 + r16) * stride_xk).to(tl.float32)
+                    xk = _x_sub16(xhad, x_ptr, ktb, stride_xk, ki, NK, FUSE_HAD).to(tl.float32)
                     # X over (rh, p, q): r = 8*rh + 2*q + p
                     xpat = tl.permute(tl.reshape(xk, (2, 4, 2)), (0, 2, 1))
                     xb6 = tl.broadcast_to(
@@ -885,7 +1234,8 @@ def _fused_dequant_gemm_kernel(
             s = tl.sum(s, 1)         # rh   -> (ch, nj, cl)
             acc = tl.reshape(tl.permute(s, (1, 0, 2)), (BLOCK_N,))
             if SPLITS == 1:
-                tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+                _store_out_had(y_ptr, offs_n * stride_yn, offs_n, mask_n, acc, svh_ptr,
+                               had_r_scale, FUSE_OUT_HAD, BLOCK_N)
             else:
                 # Split-K partial: row pid_split of the [SPLITS, N] fp32 buffer.
                 # stride_yn is the (unit) column stride of the partials buffer.
@@ -923,7 +1273,7 @@ def _fused_dequant_gemm_kernel(
                 acc.to(y_ptr.dtype.element_ty),
                 mask=mask_m[:, None] & mask_n[None, :],
             )
-    elif K_BITS == 6 and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+    elif K_BITS == 6 and FULL:
         # ------------------------------------------------------------------
         # bits=6 fast path (full tiles only): gather-free algebraic decode,
         # twin of the bits=4 path. Verified against _dq_indices/_get_perm:
@@ -972,6 +1322,8 @@ def _fused_dequant_gemm_kernel(
             acc2 = tl.zeros((2, 2, NN, 8, 2), dtype=tl.float32)
             acc3 = tl.zeros((2, 2, NN, 8, 2), dtype=tl.float32)
             for k_outer in range(n_outer):
+                xhad = _had_x_tile(x_ptr, suh_ptr, (k_base + k_outer * NK) * 16, stride_xk,
+                                   K_dim, had_r_scale, FUSE_HAD, BLOCK_K)
                 for ki in tl.static_range(NK):
                     ktb = k_base + k_outer * NK + ki
                     row = tu32_ptr + ktb * stride_tk_u32 + base_n
@@ -983,7 +1335,7 @@ def _fused_dequant_gemm_kernel(
                     d1 = _decode_u16(_funnel6(wone2, words2, C1 - sh6), CB).to(tl.float32)
                     d2 = _decode_u16(_funnel6(wtwo2, wone2, C2 - sh6), CB).to(tl.float32)
                     d3 = _decode_u16(_funnel6(wtwo2, wone2, C3 - sh6), CB).to(tl.float32)
-                    xk = tl.load(x_ptr + (ktb * 16 + r16) * stride_xk).to(tl.float32)
+                    xk = _x_sub16(xhad, x_ptr, ktb, stride_xk, ki, NK, FUSE_HAD).to(tl.float32)
                     # r = 8*j1 + 4*a0 + 2*b1 + j0  =>  (r3,r2,r1,r0)=(j1,a0,b1,j0)
                     xr = tl.permute(tl.reshape(xk, (2, 2, 2, 2)), (0, 3, 1, 2))
                     x_lo, x_hi = tl.split(xr)
@@ -1003,7 +1355,8 @@ def _fused_dequant_gemm_kernel(
             h1 = s1 + s3
             out = tl.permute(tl.join(h0, h1), (0, 2, 1))
             if SPLITS == 1:
-                tl.store(y_ptr + offs_n * stride_yn, tl.reshape(out, (BLOCK_N,)).to(y_ptr.dtype.element_ty), mask=mask_n)
+                _store_out_had(y_ptr, offs_n * stride_yn, offs_n, mask_n, tl.reshape(out, (BLOCK_N,)),
+                               svh_ptr, had_r_scale, FUSE_OUT_HAD, BLOCK_N)
             else:
                 # Split-K partial (see the bits=4 M1 path): fp32 row of the
                 # [SPLITS, N] buffer, summed + output-Hadamard by the reduce.
@@ -1049,7 +1402,7 @@ def _fused_dequant_gemm_kernel(
                 acc.to(y_ptr.dtype.element_ty),
                 mask=mask_m[:, None] & mask_n[None, :],
             )
-    elif (K_BITS == 1 or K_BITS == 2 or K_BITS == 8) and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+    elif (K_BITS == 1 or K_BITS == 2 or K_BITS == 8) and FULL:
         # ------------------------------------------------------------------
         # Power-of-two widths (K = 1, 2, 8): same gather-free structure as
         # the bits=4 path, generalized. The (r, c) -> (word, shift) lookup is
@@ -1083,6 +1436,8 @@ def _fused_dequant_gemm_kernel(
             else:
                 acc7 = tl.zeros((2, 2, NN, 8, 2, 2, 2), dtype=tl.float32)  # (r3,r0,nj,cl,r2,r1,c3)
             for k_outer in range(n_outer):
+                xhad = _had_x_tile(x_ptr, suh_ptr, (k_outer * NK) * 16, stride_xk,
+                                   K_dim, had_r_scale, FUSE_HAD, BLOCK_K)
                 for ki in tl.static_range(NK):
                     ktb = k_outer * NK + ki
                     row = tu32_ptr + ktb * stride_tk_u32 + base_n
@@ -1094,7 +1449,7 @@ def _fused_dequant_gemm_kernel(
                     q = ((words[None, :] >> sh[:, None]) |
                          (m1[None, :] << neg_sh[:, None])) & 0xFFFF     # [ROWS, NN*N]
                     w_dec = _decode_u16(q.to(tl.uint32), CB).to(tl.float32)
-                    xk = tl.load(x_ptr + (ktb * 16 + r16) * stride_xk).to(tl.float32)
+                    xk = _x_sub16(xhad, x_ptr, ktb, stride_xk, ki, NK, FUSE_HAD).to(tl.float32)
                     if K_BITS == 1:
                         # r = 8*r3 + 4*r2 + 2*r1 + r0
                         xpat = tl.permute(tl.reshape(xk, (2, 2, 2, 2)), (1, 2, 0, 3))
@@ -1124,7 +1479,8 @@ def _fused_dequant_gemm_kernel(
                 # (c3, nj, cl); (0, 2, 1) is only right when NN == 1
                 s = tl.permute(s, (2, 0, 1))
             acc = tl.reshape(tl.permute(s, (1, 0, 2)), (BLOCK_N,))       # n = 16*nj + 8*c3 + cl
-            tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+            _store_out_had(y_ptr, offs_n * stride_yn, offs_n, mask_n, acc, svh_ptr,
+                           had_r_scale, FUSE_OUT_HAD, BLOCK_N)
         else:
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             for k_outer in range(n_outer):
@@ -1162,7 +1518,7 @@ def _fused_dequant_gemm_kernel(
                 acc.to(y_ptr.dtype.element_ty),
                 mask=mask_m[:, None] & mask_n[None, :],
             )
-    elif K_BITS == 3 and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+    elif K_BITS == 3 and FULL:
         # ------------------------------------------------------------------
         # bits=3 fast path (full tiles only). The D-table rows regroup into 8
         # run-groups g = 2v + c3 (rows r = 2v + 8q + p, m = 2q + p) whose four
@@ -1193,6 +1549,8 @@ def _fused_dequant_gemm_kernel(
             # into the shared (g, column) slot with its own x element.
             acc8 = tl.zeros((8, NN * 8), dtype=tl.float32)
             for k_outer in range(n_outer):
+                xhad = _had_x_tile(x_ptr, suh_ptr, (k_outer * NK) * 16, stride_xk,
+                                   K_dim, had_r_scale, FUSE_HAD, BLOCK_K)
                 for ki in tl.static_range(NK):
                     ktb = k_outer * NK + ki
                     row = tu32_ptr + ktb * stride_tk_u32 + base_n3
@@ -1201,7 +1559,7 @@ def _fused_dequant_gemm_kernel(
                     # no 32-bit mask on Q: the extraction masks drop every bit
                     # above 24, including the bit-31 pollution B<<31 at base 0
                     Q = (A >> base_g[:, None]) | (B << neg_g[:, None])
-                    xk = tl.load(x_ptr + (ktb * 16 + r16) * stride_xk).to(tl.float32)
+                    xk = _x_sub16(xhad, x_ptr, ktb, stride_xk, ki, NK, FUSE_HAD).to(tl.float32)
                     # X_m[g] = xk[2*(g//2) + 8*(m//2) + m%2]: pairs (e, o) of
                     # the rows xk[2i+p], then halves v<4 / v>=4, interleaved
                     # over c3 by the final (4, 2) -> 8 broadcast.
@@ -1221,7 +1579,8 @@ def _fused_dequant_gemm_kernel(
             # (v, c3, nj, clc) -> sum v -> n = 16*nj + 8*c3 + clc
             s = tl.sum(tl.reshape(acc8, (4, 2, NN, 8)), 0)   # (c3, nj, clc)
             acc = tl.reshape(tl.permute(s, (1, 0, 2)), (BLOCK_N,))
-            tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+            _store_out_had(y_ptr, offs_n * stride_yn, offs_n, mask_n, acc, svh_ptr,
+                           had_r_scale, FUSE_OUT_HAD, BLOCK_N)
         else:
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             for k_outer in range(n_outer):
@@ -1252,7 +1611,7 @@ def _fused_dequant_gemm_kernel(
                 acc.to(y_ptr.dtype.element_ty),
                 mask=mask_m[:, None] & mask_n[None, :],
             )
-    elif (K_BITS == 5 or K_BITS == 7) and (N % BLOCK_N == 0) and (K_dim % BLOCK_K == 0):
+    elif (K_BITS == 5 or K_BITS == 7) and FULL:
         # ------------------------------------------------------------------
         # Odd widths (K = 3, 5, 7): the (word, shift) lookup does not factor
         # into independent per-axis bit fields (the 16-bit decode window ends
@@ -1282,6 +1641,8 @@ def _fused_dequant_gemm_kernel(
         if M1:
             accm = tl.zeros((32, NN * 8), dtype=tl.float32)
             for k_outer in range(n_outer):
+                xhad = _had_x_tile(x_ptr, suh_ptr, (k_outer * NK) * 16, stride_xk,
+                                   K_dim, had_r_scale, FUSE_HAD, BLOCK_K)
                 for ki in tl.static_range(NK):
                     ktb = k_outer * NK + ki
                     row = tu32_ptr + ktb * stride_tk_u32 + base_n
@@ -1290,7 +1651,7 @@ def _fused_dequant_gemm_kernel(
                     q = ((lo >> sh_vec[:, None]) |
                          (hi << neg_vec[:, None])) & 0xFFFF
                     w_dec = _decode_u16(q.to(tl.uint32), CB).to(tl.float32)
-                    xk = tl.load(x_ptr + (ktb * 16 + r16) * stride_xk).to(tl.float32)
+                    xk = _x_sub16(xhad, x_ptr, ktb, stride_xk, ki, NK, FUSE_HAD).to(tl.float32)
                     xb = tl.reshape(
                         tl.broadcast_to(tl.reshape(xk, (16, 1, 1, 1)), (16, 2, NN, 8)),
                         (32, NN * 8),
@@ -1299,7 +1660,8 @@ def _fused_dequant_gemm_kernel(
             # (r, c3, nj, cl) -> sum over r -> (c3, nj, cl) -> n = 16*nj + 8*c3 + cl
             s = tl.sum(tl.reshape(accm, (16, 2, NN, 8)), 0)
             acc = tl.reshape(tl.permute(s, (1, 0, 2)), (BLOCK_N,))
-            tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+            _store_out_had(y_ptr, offs_n * stride_yn, offs_n, mask_n, acc, svh_ptr,
+                           had_r_scale, FUSE_OUT_HAD, BLOCK_N)
         else:
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             for k_outer in range(n_outer):
@@ -1413,6 +1775,8 @@ def _fused_dequant_gemm_kernel(
         if M1:
             acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
             for k_outer in range(n_outer):
+                xhad = _had_x_tile(x_ptr, suh_ptr, (k_outer * NK) * 16, stride_xk,
+                                   K_dim, had_r_scale, FUSE_HAD, BLOCK_K)
                 for ki in tl.static_range(NK):
                     ktb = k_outer * NK + ki
                     k_ok = ktb < n_k_tiles_total
@@ -1424,12 +1788,19 @@ def _fused_dequant_gemm_kernel(
                     low_u32 = tl.gather(src, idx_low, 1)
                     high_u32 = tl.gather(src, idx_high, 1)
                     w = _decode_word_pair(low_u32, high_u32, shift, SHIFT_FITS_32, CB)
-                    xk = tl.load(
-                        x_ptr + (ktb * 16 + r16) * stride_xk,
-                        mask=k_ok & (r16 < 16), other=0.0,
-                    )
+                    if FUSE_HAD:
+                        # K_dim % 128 == 0 is required for fusion, so a 128
+                        # group is entirely in or out of range and the tile's
+                        # own bounds mask covers k_ok.
+                        xk = _x_sub16(xhad, x_ptr, ktb, stride_xk, ki, NK, FUSE_HAD)
+                    else:
+                        xk = tl.load(
+                            x_ptr + (ktb * 16 + r16) * stride_xk,
+                            mask=k_ok & (r16 < 16), other=0.0,
+                        )
                     acc += tl.sum(w.to(tl.float32) * xk.to(tl.float32)[:, None], 0)
-            tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+            _store_out_had(y_ptr, offs_n * stride_yn, offs_n, mask_n, acc, svh_ptr,
+                           had_r_scale, FUSE_OUT_HAD, BLOCK_N)
         else:
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             for k_outer in range(n_outer):
@@ -1468,6 +1839,8 @@ def exl3_gemm_triton(
     tiles_n: int,
     cb: int = 0,
     splits: int = 1,
+    suh: torch.Tensor | None = None,
+    svh: torch.Tensor | None = None,
 ) -> None:
     if not has_triton:
         raise RuntimeError("exl3_gemm_triton requires Triton")
@@ -1476,6 +1849,16 @@ def exl3_gemm_triton(
     ``splits > 1`` (M == 1 bits=4 full-tile shapes only) runs the split-K GEMV:
     ``y`` must then be the [splits, N] fp32 partials buffer from
     _get_splitk_buf, to be summed by _m1_split_reduce_had afterwards.
+
+    Pass ``suh`` to run the input Hadamard inside the kernel: ``x`` is then the
+    raw (untransformed) input and the caller's had_r_128_triton launch goes
+    away. M == 1 only, and only for shapes whose K is a multiple of 128.
+
+    Pass ``svh`` to run the output Hadamard + post-scale inside the kernel's
+    store, so ``y`` comes out finished and the trailing had_r_128_triton
+    launch goes away too. M == 1, half output, N a multiple of 128, and never
+    together with ``splits > 1`` (that route folds the same transform into
+    _m1_split_reduce_had instead).
     """
     M, K_dim = x.shape
     N = y.shape[1]
@@ -1484,6 +1867,19 @@ def exl3_gemm_triton(
     # let a split request reach any other path.
     if not (M == 1 and K_bits in (4, 6)):
         splits = 1
+
+    if suh is not None:
+        assert M == 1 and K_dim % 128 == 0 and N % 128 == 0, \
+            f"exl3_gemm_triton: fused input Hadamard needs M==1 and 128-divisible N/K, got {M}x{K_dim}x{N}"
+        assert x.dtype == torch.half and suh.dtype == torch.half
+    if svh is not None:
+        assert M == 1 and N % 128 == 0 and splits == 1, \
+            f"exl3_gemm_triton: fused output Hadamard needs M==1, splits==1 and " \
+            f"128-divisible N, got {M}x{K_dim}x{N} splits={splits}"
+        # the epilogue reproduces _had_r_128_kernel's HALF path exactly (round the
+        # accumulator to half, butterfly in fp32, half post-scale); the fp32 I/O
+        # variant has a different rounding order and is not implemented here
+        assert y.dtype == torch.half and svh.dtype == torch.half
 
     grid = lambda meta: (
         triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]) * splits,
@@ -1500,17 +1896,92 @@ def exl3_gemm_triton(
         trellis.stride(0), trellis.stride(1),
         y.stride(0), y.stride(1),
         y.stride(0),
+        N_DIV=_gate_div(N),
+        K_DIV=_gate_div(K_dim),
         K_BITS=K_bits,
         N_PACKED=trellis.shape[-1],
         CB=cb,
         M1=(M == 1),
         SPLITS=splits,
+        FUSE_HAD=suh is not None,
+        suh_ptr=suh,
+        FUSE_OUT_HAD=svh is not None,
+        svh_ptr=svh,
+        had_r_scale=_RSCALE_128,
     )
 
 
 # ---------------------------------------------------------------------------
 # LinearEXL3 composition: had_r_128_triton -> gemm -> had_r_128_triton
 # ---------------------------------------------------------------------------
+
+# Widths whose M1 branch carries a LIGHT accumulator (a single (BLOCK_N,) fp32
+# vector) and so keeps the same fp32 reduction rounding when the fused input
+# transform's registers join the branch. See _fuse_input_had.
+_IN_HAD_EXACT_BITS = (1, 2, 8)
+
+
+def _fuse_input_had(K_bits: int, M: int, in_features: int, out_features: int) -> bool:
+    """Whether to run the input Hadamard inside the GEMM kernel (one launch
+    fewer per linear on the decode path).
+
+    Read per call, not at import, so an A/B harness can flip
+    EXL3_FUSE_INPUT_HAD in one process.
+
+    ONLY bits 1, 2 and 8 are bit-exact, and that restriction is measured, not
+    theoretical. The transform itself is provably exact -- a probe kernel storing
+    _had_x_tile's output matches had_r_128_triton byte for byte at every width
+    tested, including the failing ones. The divergence is entirely in the fp32
+    reduction: with identical x and identical weights, `acc += w * x` rounds
+    differently once the transform's live registers are added to the branch, i.e.
+    the backend's decision to contract the multiply-add into an FMA flips. So the
+    exact widths are exactly the ones with a LIGHT accumulator -- 1/2/8 carry a
+    single (BLOCK_N,) fp32 vector, while 3, 4, 5, 6 and 7 carry 512-2048 fp32
+    elements per CTA and all drift.
+
+    Measured on gfx1150, Triton 3.5.1, pinned tiles (tests/test_exl3_triton_fused_had.py):
+        bits=6 BK128  max|diff| 3.906e-03   bits=5 BK128  max|diff| 4.517e-03
+        bits=4 BK256  max|diff| 7.812e-03 (bits=4 at BK128 happens to be exact,
+                                           but BLOCK_K is an autotune outcome the
+                                           host gate cannot pin, so 4 is excluded)
+        bits=3, bits=7                     the originally documented pair
+
+    The earlier "bits 3 and 7 only" reading came from a test that did not pass
+    N_DIV/K_DIV, so FULL was a runtime predicate and Triton compiled all five
+    decode branches into every binary (291 VGPR spills, campaign brief). Under
+    that much spilling the pressure difference between the arms disappears and
+    the drift hides. With the constexpr gate -- what production actually runs --
+    it does not.
+    """
+    if os.environ.get("EXL3_FUSE_INPUT_HAD", "0").lower() in ("0", "", "off", "no", "false"):
+        return False
+    return (M == 1 and K_bits in _IN_HAD_EXACT_BITS
+            and in_features % 128 == 0 and out_features % 128 == 0)
+
+
+# Below this N the forced BLOCK_N=128 tile costs more than the launch it saves:
+# the grid is N/128 CTAs against 8 WGPs, so N=4096 is 32 CTAs (4 per WGP) and
+# N=1024 is 8 (one each, no latency hiding at all). Starved-N shapes are exactly
+# the ones whose measured M1 winner is a BN32 tile (265-280 vs 242-244 GB/s,
+# ledger-arms2). Overridable for A/B: EXL3_FUSE_OUTPUT_HAD_MIN_N.
+_FUSE_OUT_MIN_N = 4096
+
+
+def _fuse_output_had(K_bits: int, M: int, in_features: int, out_features: int) -> bool:
+    """Whether to run the output Hadamard + post-scale inside the GEMM's store.
+
+    Read per call, not at import, so an A/B harness can flip the flag in one
+    process. Unlike the input fusion this one is not free: it prunes the pool to
+    BLOCK_N % 128 == 0, so it is gated on N being wide enough for a 128-column
+    tile to keep the part busy. Every bit width is bit-exact here -- the
+    epilogue only reads the finished accumulator, so it cannot perturb the
+    decode loop's register pressure the way the input fusion does at bits 3/7.
+    """
+    if os.environ.get("EXL3_FUSE_OUTPUT_HAD", "0").lower() in ("0", "", "off", "no", "false"):
+        return False
+    min_n = int(os.environ.get("EXL3_FUSE_OUTPUT_HAD_MIN_N", _FUSE_OUT_MIN_N))
+    return M == 1 and out_features % 128 == 0 and out_features >= min_n
+
 
 def _linear_exl3_triton(
     x: torch.Tensor,
@@ -1528,16 +1999,25 @@ def _linear_exl3_triton(
 ) -> None:
     """Complete EXL3 linear forward into pre-allocated buffers.
 
-    Writes the Hadamard-transformed input to ``xh`` and the result to ``y``.
-    All tensors must be pre-allocated with stable addresses for CUDA graph
-    capture; nothing is allocated inside this call.
+    Writes the result to ``y``, and the Hadamard-transformed input to ``xh``
+    unless the input Hadamard runs inside the GEMM (see _fuse_input_had), in
+    which case ``xh`` is left untouched — no caller reads it back. All tensors
+    must be pre-allocated with stable addresses for CUDA graph capture;
+    nothing is allocated inside this call.
     """
     # A cast here would allocate and silently break a capturing graph; callers
     # that need dtype conversion must cast before calling.
     assert x.dtype == torch.half, f"_linear_exl3_triton: expected half input, got {x.dtype}"
 
-    # Phase 1: input Hadamard transform -> xh
-    had_r_128_triton(x, xh, suh, None, 1.0)
+    fuse_had = _fuse_input_had(K, x.shape[0], in_features, out_features)
+    fuse_out = (y.dtype == torch.half
+                and _fuse_output_had(K, x.shape[0], in_features, out_features))
+    if fuse_had:
+        gemm_x, gemm_suh = x, suh
+    else:
+        # Phase 1: input Hadamard transform -> xh
+        had_r_128_triton(x, xh, suh, None, 1.0)
+        gemm_x, gemm_suh = xh, None
 
     # Phase 2 + 3: fused dequant + Triton GEMM -> y
     cb = 1 if mcg else (2 if mul1 else 0)
@@ -1547,19 +2027,21 @@ def _linear_exl3_triton(
         # Hadamard (replaces the separate had_r_128_triton launch).
         partials = _get_splitk_buf(out_features, splits, x.device)
         exl3_gemm_triton(
-            xh, trellis, partials,
+            gemm_x, trellis, partials,
             _decode_lut(cb, x.device), _get_perm(x.device),
-            K, trellis.shape[1], cb, splits,
+            K, trellis.shape[1], cb, splits, gemm_suh,
         )
         _m1_split_reduce_had(partials, y, svh, splits)
     else:
         exl3_gemm_triton(
-            xh, trellis, y,
+            gemm_x, trellis, y,
             _decode_lut(cb, x.device), _get_perm(x.device),
-            K, trellis.shape[1], cb,
+            K, trellis.shape[1], cb, 1, gemm_suh,
+            svh if fuse_out else None,
         )
-        # Phase 4: output Hadamard transform (in place)
-        had_r_128_triton(y, y, None, svh, 1.0)
+        if not fuse_out:
+            # Phase 4: output Hadamard transform (in place)
+            had_r_128_triton(y, y, None, svh, 1.0)
 
     if bias is not None:
         y.add_(bias)

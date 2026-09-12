@@ -5,7 +5,7 @@ import torch
 from exllamav3.ext import exllamav3_ext as ext
 from itertools import pairwise
 
-import os; device = os.environ.get("EXL_TEST_DEVICE", "cuda:2")
+from util import resolve_device; device = resolve_device()
 page_size = 256
 
 cache_dims = [

@@ -188,7 +188,7 @@ if torch.version.hip:
         'BC_Attention', 'BC_GatedRMSNorm',
         'BC_LinearEXL3', 'BC_LinearFP16',
         'BC_DSV4Compressor', 'BC_DSV4Attention', 'BC_DSV4BatchAttention',
-        'BC_MLAttention', 'BC_SAM',
+        'BC_MLAttention',
     ]:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, _bc_none)
@@ -203,6 +203,14 @@ if torch.version.hip:
         'rms_norm', 'rms_norm_res_in', 'gated_rms_norm',
         'softcap',
         'routing_std', 'routing_ds3_nogroup', 'routing_sel_norm',
+        'apply_logit_bitmask',
+        'quant_cache_cont', 'dequant_cache_cont',
+        'quant_cache_paged', 'dequant_cache_paged', 'dequant_cache_paged_window',
+        'BC_SAM',
+        'exl3_moe_cpu_set_memops', 'exl3_moe_cpu_set_prof',
+        'exl3_moe_cpu_has_avx2', 'exl3_moe_cpu_has_avx512_vnni', 'exl3_moe_cpu_has_avx512_vbmi',
+        'exl3_moe_cpu_make_layer', 'exl3_moe_cpu_free_layer', 'exl3_moe_cpu_forward',
+        'exl3_moe_cpu_worker_run', 'exl3_moe_cpu_pool_stress',
     ]:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, getattr(_fb, _name))
@@ -214,3 +222,12 @@ if torch.version.hip:
     if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE'):
         setattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE', 0)
     os.environ.setdefault('EXL3_FUSED_SAMPLER', '0')
+
+    # The quantized-cache Triton paths are tuned for ~100 KB of shared memory; RDNA gives 64 KB
+    # of LDS, so the MLA qc kernels at block_n 64 ask for 72 KB and fail to load outright.
+    os.environ.setdefault('EXL3_MLA_QC_BN', '32')
+    # Prefill staging dequantizes the referenced window into an fp16 scratch, which costs ~2% of
+    # the attention kernel with the CUDA kernel and 15x the fp16 gather floor with the PyTorch
+    # fallback (52 ms for a 32k-token window). The in-kernel Triton dequant is the cheaper side
+    # of that trade here.
+    os.environ.setdefault('EXL3_QC_STAGING', '0')

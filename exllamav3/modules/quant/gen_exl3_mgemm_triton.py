@@ -9,12 +9,16 @@ and neither appears inside the copied ranges.
 Per branch the generator takes:
   - the `if/elif/else` condition line, verbatim
   - the pre-`if M1:` setup block, verbatim
-  - the `if M1:` body, dedented by one level (the M1 guard disappears: this
-    kernel is M==1 only)
+  - the `if M1:` body up to (not including) its store, dedented by one level
+    (the M1 guard disappears: this kernel is M==1 only)
   - a store that writes the expert's output row
 
-Line ranges refer to exl3_triton.py as of the revision recorded in _SRC_SHA.
-Rerun with --check to verify the source has not moved under them.
+Branch boundaries are DISCOVERED, not hard-coded line numbers: the earlier
+table rotted every time exl3_triton.py gained a line, and the failure mode was
+a silently stale generated file (the leak guard aborts before the write, so the
+checked-in .py simply stops matching its source). _find_branches locates the
+condition lines of the kernel's `if K_BITS ==` chain, then each branch's
+`if M1:` and the store that ends its body, and asserts the shape it expects.
 """
 import os
 import hashlib
@@ -25,42 +29,61 @@ SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exl3_triton.py")
 TEMPLATE = "exl3_mgemm_triton.py.in"
 OUT = "exl3_mgemm_triton.py"
 
+# The store the generated branches end with. The grouped kernel's y_ptr is
+# already advanced to this expert's row, so the shared epilogue helper takes
+# the same arguments it does in exl3_triton.py.
 STORE_ACC = (
-    "        tl.store(y_ptr + offs_n * stride_yn, "
-    "acc.to(y_ptr.dtype.element_ty), mask=mask_n)\n"
+    "        _store_out_had(y_ptr, offs_n * stride_yn, offs_n, mask_n, acc, svh_ptr,\n"
+    "                       had_r_scale, FUSE_OUT_HAD, BLOCK_N)\n"
 )
 STORE_OUT = (
-    "        tl.store(y_ptr + offs_n * stride_yn, "
-    "tl.reshape(out, (BLOCK_N,)).to(y_ptr.dtype.element_ty), mask=mask_n)\n"
+    "        _store_out_had(y_ptr, offs_n * stride_yn, offs_n, mask_n,\n"
+    "                       tl.reshape(out, (BLOCK_N,)), svh_ptr,\n"
+    "                       had_r_scale, FUSE_OUT_HAD, BLOCK_N)\n"
 )
 
-# (label, cond_line, setup_first, setup_last, body_first, body_last, store)
-BRANCHES = [
-    ("bits=4",     818,  819,  843,  845,  886, STORE_ACC),
-    ("bits=6",     926,  927,  961,  963, 1004, STORE_OUT),
-    ("bits=1/2/8", 1052, 1053, 1075, 1077, 1126, STORE_ACC),
-    ("bits=3",     1165, 1166, 1190, 1192, 1223, STORE_ACC),
-    ("bits=5/7",   1255, 1256, 1281, 1283, 1301, STORE_ACC),
-    ("generic",    1329, 1330, 1412, 1414, 1431, STORE_ACC),
+# The condition lines of the kernel's branch chain, in order. The last entry is
+# the generic gather fallback, whose condition is a bare `else:`.
+CONDS = [
+    ("bits=4",     "    if K_BITS == 4 and FULL:"),
+    ("bits=6",     "    elif K_BITS == 6 and FULL:"),
+    ("bits=1/2/8", "    elif (K_BITS == 1 or K_BITS == 2 or K_BITS == 8) and FULL:"),
+    ("bits=3",     "    elif K_BITS == 3 and FULL:"),
+    ("bits=5/7",   "    elif (K_BITS == 5 or K_BITS == 7) and FULL:"),
+    ("generic",    "    else:"),
 ]
 
-# Anchors that must be found at (line, expected prefix); catches a moved source.
-ANCHORS = [
-    (818, "    if K_BITS == 4 and"),
-    (844, "        if M1:"),
-    (886, "            acc = tl.reshape(tl.permute(s, (1, 0, 2)), (BLOCK_N,))"),
-    (926, "    elif K_BITS == 6 and"),
-    (962, "        if M1:"),
-    (1004, "            out = tl.permute(tl.join(h0, h1), (0, 2, 1))"),
-    (1052, "    elif (K_BITS == 1 or K_BITS == 2 or K_BITS == 8)"),
-    (1076, "        if M1:"),
-    (1165, "    elif K_BITS == 3 and"),
-    (1191, "        if M1:"),
-    (1255, "    elif (K_BITS == 5 or K_BITS == 7)"),
-    (1282, "        if M1:"),
-    (1329, "    else:"),
-    (1413, "        if M1:"),
-]
+# A branch's M1 body ends at the first line of one of these forms; everything
+# from there to the branch's `else:` (the M > 1 half) is dropped and replaced
+# by the generator's own store.
+BODY_END = ("if SPLITS == 1:", "_store_out_had(", "tl.store(")
+
+
+def _find_branches(L):
+    """[(label, cond_i, setup_a, setup_b, body_a, body_b)] as 1-based inclusive
+    line numbers, discovered from the source rather than tabulated."""
+    kern = next(i for i, l in enumerate(L)
+                if l.startswith("def _fused_dequant_gemm_kernel("))
+    out, at = [], kern
+    for label, cond in CONDS:
+        try:
+            ci = L.index(cond, at)
+        except ValueError:
+            raise SystemExit(f"branch {label}: condition line not found: {cond!r}")
+        at = ci + 1
+        try:
+            mi = L.index("        if M1:", ci)
+        except ValueError:
+            raise SystemExit(f"branch {label}: no `if M1:` after line {ci + 1}")
+        # the M1 body runs to the first store-ish line at 12-space depth
+        bi = next((j for j in range(mi + 1, len(L))
+                   if L[j].startswith("            ") and L[j].strip().startswith(BODY_END)),
+                  None)
+        if bi is None:
+            raise SystemExit(f"branch {label}: no store found after `if M1:`")
+        out.append((label, ci + 1, ci + 2, mi, mi + 2, bi))
+    return out
+
 
 # (Historical) The K_BITS==8 M1 reduction left `s` as
 # (nj, c3, cl) where the shared tail expects (c3, nj, cl), so the output tile is
@@ -77,7 +100,11 @@ ANCHORS = [
 # Upstream exl3_triton.py now carries the (2, 0, 1) permute fix, so the M1 branch
 # is copied with no deviation at all.
 FIXES = []
-# Names that only exist in the non-M1 / split-K halves of the source kernel.
+# Names that only exist in the non-M1 / split-K halves of the source kernel and
+# must never appear in a copied branch. The fused-Hadamard names (FUSE_HAD,
+# suh_ptr, svh_ptr, _had_x_tile, _x_sub16, _store_out_had, had_r_scale) are
+# DELIBERATELY copied through: the template defines all of them, resolving the
+# scale vectors per expert out of the same int64 pointer table as the trellis.
 FORBIDDEN = ("BLOCK_M", "offs_m", "mask_m", "pid_split", "stride_ys", "SPLITS", "M1")
 
 
@@ -87,15 +114,7 @@ def main():
     L = text.split("\n")
     sha = hashlib.sha256(text.encode()).hexdigest()[:16]
 
-    bad = False
-    for ln, prefix in ANCHORS:
-        if not L[ln - 1].startswith(prefix):
-            print(f"ANCHOR MISMATCH at line {ln}: expected {prefix!r}, got {L[ln - 1]!r}",
-                  file=sys.stderr)
-            bad = True
-    if bad:
-        print("exl3_triton.py has moved; fix the line ranges in _gen.py", file=sys.stderr)
-        return 1
+    branches = _find_branches(L)
 
     def rng(a, b):
         return "\n".join(L[a - 1:b]) + "\n"
@@ -104,11 +123,14 @@ def main():
         return "\n".join(l[4:] if l.startswith("    ") else l for l in s.split("\n"))
 
     parts = []
-    for label, cond, sa, sb, ba, bb, store in BRANCHES:
+    for label, cond, sa, sb, ba, bb in branches:
+        store = STORE_OUT if "out = tl.permute" in rng(ba, bb) else STORE_ACC
         parts.append(L[cond - 1] + "\n")
         parts.append(rng(sa, sb))
         parts.append(dedent4(rng(ba, bb)))
         parts.append(store)
+        print(f"  {label:11s} cond {cond:5d}  setup {sa}-{sb}  body {ba}-{bb}",
+              file=sys.stderr)
     body = "".join(parts)
 
     for before, after in FIXES:

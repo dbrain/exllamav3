@@ -143,6 +143,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
+    m.def("gr_mix_q", &gr_mix_q, "gr_mix_q");
 
     // activation.cu, softcap.cu and routing.cu build on ROCm
     m.def("silu_mul", &silu_mul, "silu_mul");

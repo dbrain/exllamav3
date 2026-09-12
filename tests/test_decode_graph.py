@@ -195,36 +195,38 @@ def test_recurrent_state_tensors_empty_for_dense():
 
 # ------------------------------------------------------------------- QSA regime
 
-def FakeIndexer(threshold = 2051):
+def FakeIndexer(threshold = 2051, limit = 32768):
     m = FakeMod("QSAIndexer", "blk.attn.indexer")
     m.sparse_threshold = lambda: threshold
+    m.static_capture_limit = lambda: limit
     return m
 
 
-def _qsa_attn(threshold = 2051):
+def _qsa_attn(threshold = 2051, limit = 32768):
     """A full-attention block carrying an indexer, as Flash-Next builds."""
-    idx = FakeIndexer(threshold)
+    idx = FakeIndexer(threshold, limit)
     attn = FakeMod("Attention", "blk.attn", {}, subs = [idx])
     attn.qsa_indexer = idx
     return _blk([attn], key = "blk.full")
 
 
-def test_qsa_module_capturable_only_in_the_dense_regime():
+def test_qsa_module_capturable_follows_the_flag():
     idx = FakeIndexer()
-    assert gd._module_capturable(idx, qsa_dense = True) is True
-    assert gd._module_capturable(idx, qsa_dense = False) is False
+    assert gd._module_capturable(idx, qsa_ok = True) is True
+    assert gd._module_capturable(idx, qsa_ok = False) is False
 
 
-def test_qsa_layers_are_captured_below_the_threshold_and_islands_above():
+def test_qsa_layers_fold_in_when_capturable_and_island_when_not():
     """Flash-Next shape: every 4th block is full attention with an indexer."""
     mods = [_emb(), _blk(), _blk(), _qsa_attn(), _blk(), _head()]
     g, ok, _ = _plan(mods)
     assert ok
-    # dense regime: the QSA block folds into one big span
+    # QSA capturable: the block folds into one big span
     assert _spans(g.layouts[True]) == [("e", 0, 1), ("G", 1, 6)]
-    # sparse regime: it becomes an eager island
+    # QSA not capturable: it becomes an eager island
     assert _spans(g.layouts[False]) == [("e", 0, 1), ("G", 1, 3), ("e", 3, 4), ("G", 4, 6)]
     assert g.qsa_threshold == 2051
+    assert g.qsa_limit == 32768
 
 
 def test_qsa_regime_flips_at_the_threshold():
@@ -242,6 +244,17 @@ def test_qsa_regime_is_in_the_signature():
                       "cache_seqlens": torch.full((1,), n, dtype = torch.int32)}
     assert g._signature(_ID1, p(10)) != g._signature(_ID1, p(4000))
     assert g._signature(_ID1, p(10)) == g._signature(_ID1, p(20))
+
+
+def test_qsa_capturable_until_the_block_table_outgrows_one_score_tile():
+    """Sparse selection is static only while one score tile spans every pool the
+    block table can address; the dense regime is capturable at any width."""
+    g, _, _ = _plan([_emb(), _qsa_attn(limit = 32768), _head()])
+    def p(n, pages): return {"block_table": torch.zeros((1, pages), dtype = torch.int32),
+                             "cache_seqlens": torch.full((1,), n, dtype = torch.int32)}
+    assert g._qsa_capturable(p(4000, 128)) is True     # 128 * 256 == 32768
+    assert g._qsa_capturable(p(4000, 144)) is False    # 144 * 256 > 32768
+    assert g._qsa_capturable(p(10, 144)) is True       # dense, width irrelevant
 
 
 def test_qsa_regime_is_conservative_when_seqlens_are_on_device():

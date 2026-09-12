@@ -36,6 +36,31 @@ def _randomhash():
 tensor_hash_checksum = _tensor_blake2b_checksum
 random_hash = _randomhash
 
+# A prompt's trailing 0..PAGE_SIZE-1 tokens cannot reach the page-keyed prompt cache: a page is only
+# content-hashed once complete, and GDNState.rollback_capacity() is 0, so a hybrid model's resume point
+# has to be a position where a checkpoint was explicitly stashed -- which maybe_stash_recurrent asserts
+# is page-aligned. Registering the partial tail under its own content hash, with a checkpoint at that
+# exact position, is what makes the resumable prefix token-granular.
+TAIL_CACHE = os.environ.get("EXL3_TAIL_CACHE", "0") != "0"
+
+# Registrations kept per parent page hash. One per distinct continuation of the same prefix; the cap
+# bounds the bookkeeping, not the hit rate, since only the longest valid match is ever used.
+TAIL_REGS_PER_CHAIN = 8
+
+
+def _tail_blake2b_checksum(tokens: torch.Tensor, prev_hash: bytes | None, n: int) -> bytes:
+    hasher = hashlib.blake2b(digest_size = 16)
+    # Domain tag and length keep a tail digest from ever colliding with the full-page digest of the
+    # same tokens, which would let a partial page be revived as if it were complete
+    hasher.update(b"tail")
+    hasher.update(n.to_bytes(4, byteorder = "big"))
+    if prev_hash is not None:
+        hasher.update(prev_hash)
+    hasher.update(tokens[..., :n].contiguous().numpy().tobytes())
+    return hasher.digest()
+
+tail_hash_checksum = _tail_blake2b_checksum
+
 def is_content_hash(h: bytes) -> bool:
     # Random (placeholder) hashes are counter values whose top eight bytes stay zero; a blake2b content
     # hash matches that pattern with vanishing probability
@@ -194,6 +219,7 @@ class CachePage:
         self.can_revert = False
         assert self.phash not in self.pagetable.referenced_pages
         self.pagetable.referenced_pages[self.phash] = self
+        self.pagetable._persist_dirty = True
 
     # Clear allocated page to repeat prefill
     def make_unique(self):
@@ -219,6 +245,10 @@ class Sequence:
         self.block_index_tensor = None
         self.live = True
         self.prefill_complete = False
+        self.tail_hash = None
+        self.tail_len = 0
+        self.tail_ids = None
+        self.tail_restored = 0
 
         # Multimodal token spans
         self.multimodal_mask = ids[0] >= FIRST_MM_EMBEDDING_INDEX
@@ -247,6 +277,17 @@ class Sequence:
             unique_hashes.add(r_hash)
 
         self.new_unique_pages = total_pages - context_pages
+
+        self.tail_len = (len(self.sequence_ids) - 1 - context_pages * PAGE_SIZE) if TAIL_CACHE else 0
+        if self.tail_len > 0:
+            self.tail_ids = self.sequence_ids.torch_slice(
+                context_pages * PAGE_SIZE, len(self.sequence_ids) - 1
+            )
+            self.tail_hash = tail_hash_checksum(self.tail_ids, r_hash, self.tail_len)
+        else:
+            self.tail_ids = None
+            self.tail_hash = None
+
         return unique_hashes, self.new_unique_pages
 
     def build_block_index_tensor(self):
@@ -273,8 +314,7 @@ class Sequence:
         if recurrent_cache is not None:
             recurrent_pages = []
             for pi, ph in enumerate(page_hashes):
-                rs = recurrent_cache.get(ph)
-                if rs:
+                if recurrent_cache.has(ph):
                     recurrent_pages.append(pi)
             # CPU-tier restores past the last checkpoint can't advance the resume point; replay prefill
             # rewrites those pages anyway
@@ -294,7 +334,108 @@ class Sequence:
                 stashed_recurrent_state = recurrent_cache.get_stashed(page_hashes[cached_pages - 1])
                 assert stashed_recurrent_state is not None, "Failed to get cached recurrent state"
 
+            if TAIL_CACHE and cached_pages == len(page_hashes) and self.tail_len > 0:
+                tail = self.restore_tail(pagetable, recurrent_cache, cached_pages)
+                if tail is not None:
+                    stashed_recurrent_state = tail
+
         return len(self.allocated_pages), cached_pages, non_sequential_pages, stashed_recurrent_state
+
+
+    def restore_tail(self, pagetable: PageTable, recurrent_cache: RecurrentCache, cached_pages: int):
+        """
+        Page the longest registered partial tail of this prompt's prefix into the tail page, advancing
+        kv_position off the page boundary. Returns the stashed recurrent state covering that exact
+        position, or None if no registration is still backed by both a live page and a checkpoint.
+        """
+        prev_hash = self.page_hashes[cached_pages - 1] if cached_pages else None
+        target = pagetable.match_tail(prev_hash, self.tail_ids, recurrent_cache)
+        if target is None:
+            return None
+
+        n, tail_hash, source = target
+        stashed = recurrent_cache.get_stashed(tail_hash)
+        if stashed is None:
+            return None
+
+        page = self.allocated_pages[cached_pages]
+        caches = [pagetable.cache]
+        draft_cache = getattr(pagetable.generator, "draft_cache", None)
+        if draft_cache is not None:
+            caches.append(draft_cache)
+        for c in caches:
+            c.copy_page(c, source.page_index, page.page_index, n)
+        page.prev_hash = prev_hash
+        page.sequence[:, :n].copy_(self.tail_ids[:, :n])
+        page.kv_position = n
+        page.can_revert = False
+        self.kv_position = cached_pages * PAGE_SIZE + n
+        self.tail_restored = n
+        pagetable.metrics["alloc_tail_tokens"] += n
+        return stashed
+
+
+    def commit_page(self, pagetable: PageTable, page_before: int):
+        """Content-hash the page the sequence just filled, folding it into any existing copy."""
+        page = self.allocated_pages[page_before]
+        last_hash = self.allocated_pages[page_before - 1].phash if page_before > 0 else None
+        page_ids = self.sequence_ids.torch_slice(page_before * PAGE_SIZE, (page_before + 1) * PAGE_SIZE)
+        new_hash = tensor_hash_checksum(page_ids, last_hash)
+
+        if new_hash in pagetable.referenced_pages:
+            new_serial = page.access_serial
+            page.sub_ref()
+            page = pagetable.referenced_pages[new_hash]
+            assert page.kv_position == PAGE_SIZE
+            self.allocated_pages[page_before] = page
+            self.build_block_index_tensor()
+            page.add_ref(new_serial)
+        else:
+            if new_hash in pagetable.unreferenced_pages:
+                # The duplicate is content-identical on the same chain, so it is interchangeable as a
+                # tail anchor. A turn that hit the tail ran no prefill, so register_tail_checkpoint
+                # never re-registered and the only registration still points at the page about to be
+                # cleared -- hand it to the survivor or the resume point dies after one turn.
+                up = pagetable.unreferenced_pages[new_hash]
+                pagetable.rehome_tail_regs(up, page)
+                up.clear()
+            page.update_hash(new_hash)
+
+        # Allow completing the final page without starting a new one (for requeue)
+        if page_before + 1 < len(self.allocated_pages):
+            page = self.allocated_pages[page_before + 1]
+            page.prev_hash = new_hash
+            page.can_revert = False
+
+
+    def register_tail(self, pagetable: PageTable, recurrent_cache: RecurrentCache, state):
+        """
+        Make this sequence's current partial tail page a resume point: index it by content and stash the
+        recurrent state at the matching non-page-aligned position.
+        """
+        if not TAIL_CACHE:
+            return
+        complete_pages = self.kv_position // PAGE_SIZE
+        n = self.kv_position - complete_pages * PAGE_SIZE
+        if n <= 0 or complete_pages >= len(self.allocated_pages):
+            return
+        # Chain off the allocated page rather than page_hashes, which only covers the prompt: the
+        # generation-end entry point registers a tail past the prompt, whose parent was content-hashed
+        # by the page-completion path instead
+        prev_hash = None
+        if complete_pages:
+            parent = self.allocated_pages[complete_pages - 1]
+            if parent.kv_position != PAGE_SIZE or not is_content_hash(parent.phash):
+                return
+            prev_hash = parent.phash
+        tail_ids = self.sequence_ids.torch_slice(complete_pages * PAGE_SIZE, self.kv_position)
+        tail_hash = tail_hash_checksum(tail_ids, prev_hash, n)
+        page = self.allocated_pages[complete_pages]
+        # A registration is a promise the page keeps these tokens; sub_ref() would otherwise revert the
+        # page to its pre-allocation state and silently strand the checkpoint
+        page.can_revert = False
+        pagetable.register_tail(prev_hash, n, tail_hash, page)
+        recurrent_cache.put(tail_hash, state)
 
 
 class PageTable:
@@ -334,6 +475,8 @@ class PageTable:
         # Optional second-tier page cache in system memory (CPUPageCache), set by the Generator. Complete pages
         # are pushed there on eviction and restored from there on allocation
         self.cpu_tier = None
+        self._persist_cursor = 0
+        self._persist_dirty = True
 
         # Cheap always-on counters for cache efficiency analysis
         self.metrics = {
@@ -344,7 +487,13 @@ class PageTable:
             "alloc_cached_pages": 0,      # of those, reused as part of a resumable cached prefix
             "alloc_tier_pages": 0,        # of those, restored from the CPU tier rather than found in VRAM
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
+            "alloc_tail_tokens": 0,       # tokens served from a partial tail registration (EXL3_TAIL_CACHE)
         }
+
+        # Partial-tail resume points: prev page hash -> [(n, tail_hash, page)], plus the reverse index the
+        # recurrent cache's stranded-checkpoint walk needs to resolve a tail hash to its anchor chain
+        self.tail_regs = {}
+        self.tail_by_hash = {}
 
 
     def reset_page_table(self):
@@ -549,6 +698,7 @@ class PageTable:
         """
         allocated_pages = []
         available_pages = None
+        self._persist_dirty = True
 
         def next_evictable():
             # Deferred so allocations served entirely by hash matches never build the eviction order. Pages
@@ -592,11 +742,12 @@ class PageTable:
                         (restore_limit is None or lp < restore_limit) and
                         h in self.cpu_tier
                     ):
-                        entry = self.cpu_tier.fetch(h, op.page_index, self.access_serial)
-                        op.sequence.copy_(entry["tokens"])
-                        op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
-                        op.kv_position = PAGE_SIZE
-                        self.metrics["alloc_tier_pages"] += 1
+                        entry = self.cpu_tier.fetch(h, op.page_index, self.access_serial, protected_hashes)
+                        if entry is not None:
+                            op.sequence.copy_(entry["tokens"])
+                            op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
+                            op.kv_position = PAGE_SIZE
+                            self.metrics["alloc_tier_pages"] += 1
                     allocated_pages.append(op)
 
         # Allocate unique pages
@@ -647,6 +798,81 @@ class PageTable:
         return allocated_pages, kv_position, cached_pages, non_sequential_pages
 
 
+    def persist_complete_pages(self, examine: int = 1024) -> int:
+        """
+        Hand complete, content-addressed pages to the durable tier. Swept rather than hooked at page completion,
+        because a page becomes complete in three different places (prefill, generation advance, a tier restore)
+        and only one of them funnels through update_hash. Eviction persists a page synchronously, so this only
+        has to reach pages that stay resident - without it, a context that never came under cache pressure is
+        never written to disk at all, which is the case the durable tier exists for.
+
+        Bounded and non-blocking: at most one staging buffer's worth is handed over per call, and a sweep that
+        examines the whole table without finding anything latches off until the next page completes.
+        """
+        tier = self.cpu_tier
+        if tier is None or tier.disk is None or not self._persist_dirty:
+            return 0
+        budget = tier.staging_capacity()
+        if budget <= 0:
+            return 0
+        pages = self.all_pages
+        total = len(pages)
+        span = min(examine, total)
+        n = 0
+        for _ in range(span):
+            p = pages[self._persist_cursor % total]
+            self._persist_cursor += 1
+            if p.kv_position == PAGE_SIZE and is_content_hash(p.phash) and tier.persist(p):
+                n += 1
+                if n >= budget:
+                    break
+        if n == 0 and span >= total:
+            self._persist_dirty = False
+        return n
+
+
+    def register_tail(self, prev_hash: bytes | None, n: int, tail_hash: bytes, page: CachePage):
+        regs = self.tail_regs.setdefault(prev_hash, [])
+        for i, (rn, rh, _) in enumerate(regs):
+            if rh == tail_hash:
+                del regs[i]
+                break
+        regs.append((n, tail_hash, page))
+        while len(regs) > TAIL_REGS_PER_CHAIN:
+            _, dropped, _ = regs.pop(0)
+            self.tail_by_hash.pop(dropped, None)
+        self.tail_by_hash[tail_hash] = (prev_hash, n, page)
+
+
+    def rehome_tail_regs(self, src: CachePage, dst: CachePage):
+        for prev_hash, regs in self.tail_regs.items():
+            for i, (n, tail_hash, page) in enumerate(regs):
+                if page is src:
+                    regs[i] = (n, tail_hash, dst)
+                    self.tail_by_hash[tail_hash] = (prev_hash, n, dst)
+
+
+    def match_tail(self, prev_hash: bytes | None, tail_ids: torch.Tensor, recurrent_cache):
+        """
+        Longest registration under prev_hash whose tokens are a prefix of tail_ids and whose backing page
+        still holds that many valid tokens on the same chain. Registrations are never invalidated on
+        eviction; a page that was repurposed fails the chain or token check here instead.
+        """
+        best = None
+        limit = tail_ids.shape[-1]
+        for n, tail_hash, page in self.tail_regs.get(prev_hash, ()):
+            if n <= 0 or n > limit or (best is not None and n <= best[0]):
+                continue
+            if page.prev_hash != prev_hash or page.kv_position < n:
+                continue
+            if ext.count_match_tensor(page.sequence, tail_ids, page.kv_position) < n:
+                continue
+            if not recurrent_cache.has(tail_hash):
+                continue
+            best = (n, tail_hash, page)
+        return best
+
+
     def deallocate_pages(self, allocated_pages: list):
         for page in allocated_pages:
             page.sub_ref()
@@ -663,15 +889,25 @@ class PageTable:
         This is the anchor condition for a recurrent checkpoint stashed under phash.
         """
         h = phash
+        tail = self.tail_by_hash.get(phash)
+        if tail is not None:
+            prev_hash, n, page = tail
+            if page.prev_hash != prev_hash or page.kv_position < n:
+                return False
+            if prev_hash is None:
+                return True
+            h = prev_hash
         steps = 0
         while True:
             page = self.get_live_page(h)
             if page is not None:
                 prev = page.prev_hash
-            elif self.cpu_tier is not None and h in self.cpu_tier:
-                prev = self.cpu_tier.entries[h]["prev_hash"]
             else:
-                return False
+                present, prev = (
+                    self.cpu_tier.prev_hash_of(h) if self.cpu_tier is not None else (False, None)
+                )
+                if not present:
+                    return False
             if prev is None:
                 return True
             h = prev
@@ -703,8 +939,8 @@ class PageTable:
             p = complete.get(h)
             if p is not None:
                 return True, p.prev_hash
-            if self.cpu_tier is not None and h in self.cpu_tier:
-                return True, self.cpu_tier.entries[h]["prev_hash"]
+            if self.cpu_tier is not None:
+                return self.cpu_tier.prev_hash_of(h)
             return False, None
 
         chain_ok = {}

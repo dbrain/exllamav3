@@ -1066,6 +1066,9 @@ def dsa_indexer_scores(
     block_table = None,      # (npr,) or (1, npr) i32 page table of the (single) job
     epp = 0,                 # pool entries per page (paged mode)
     scale = None,            # None: D_i ** -0.5 * H_i ** -0.5 (DSA); QSA passes dk ** -0.5
+    multirow = None,         # device-driven bounds: dict(q_pos0, t = (bsz,) i32 tensors,
+                             # seq = rows per job, npr = block-table row stride,
+                             # t_cap = host upper bound on t)
 ):
     """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
     min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk."""
@@ -1078,6 +1081,17 @@ def dsa_indexer_scores(
         bt, epp = 0, 0
     else:
         bt = block_table.reshape(-1)
+    t_arg, seq_mr, npr_mr = T, 1, 0
+    if multirow is not None:
+        # The kernel loads T / q_pos0 / bound_max per job instead of taking them as arguments,
+        # so nothing that advances with the cache position enters the launch. T here is only
+        # the host upper bound over the positions one launch may serve: it sizes the grid and
+        # validates the backing, and tiles past the device T retire without writing
+        assert R <= 4, "dsa_indexer_scores: device-driven bounds are the few-query path only"
+        t_arg = bound_max = multirow["t"]
+        q_pos0 = multirow["q_pos0"]
+        T = int(multirow["t_cap"])
+        seq_mr, npr_mr = int(multirow["seq"]), int(multirow["npr"])
     dbg = 1 if (dsa_debug_bounds and epp) else 0
     dbg_pages = -(-k_idx.shape[0] // epp) if dbg else 0
     # S_stride is a kernel constexpr (row stride of the score matrix), so every distinct value
@@ -1103,11 +1117,12 @@ def dsa_indexer_scores(
             # the query-tiled kernel degenerates to a serial head loop over padding here
             grid = (R, triton.cdiv(max(T, 1), block_n))
             _dsa_indexer_fewq_kernel[grid](
-                q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0,
+                q_idx, weights, k_idx, scores, t_arg, R, q_pos0, bound_max, bt, npr_mr,
                 H_i = H_i, H_pad = max(triton.next_power_of_2(H_i), 16), D_i = D_i,
                 S_stride = S_stride, compress_rate = compress_rate,
                 scale = scale,
                 BLOCK_N = block_n, EPP = epp,
+                SEQ = seq_mr, MULTIROW = 1 if multirow is not None else 0,
                 DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
                 num_warps = num_warps, num_stages = num_stages,
             )

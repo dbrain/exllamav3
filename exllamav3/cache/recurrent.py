@@ -23,11 +23,16 @@ class RecurrentCache(OrderedDict):
         self,
         model,
         max_size: int = 4 * 1024**3,
+        disk = None,
     ):
         super().__init__()
         self.max_size = max_size
         self.current_size = 0
         self.model = model
+
+        # Durable tier (DiskCheckpointTier). Checkpoints are the other half of a resumable prefix: a K/V chain
+        # restored from disk caps the resumable prefix at zero without a checkpoint to anchor it
+        self.disk = disk
 
         # Optionally set by the Generator; enables stranded-first eviction and staleness metrics
         self.pagetable = None
@@ -39,13 +44,26 @@ class RecurrentCache(OrderedDict):
         }
 
 
+    def has(self, key) -> bool:
+        """
+        Whether a checkpoint for this page hash can be restored, from host RAM or from the durable tier
+        """
+        return key in self or (self.disk is not None and key in self.disk)
+
+
     def get_stashed(self, key, default = None):
         """
-        Fetch state from cache and move it to the end of the queue
+        Fetch state from cache and move it to the end of the queue, paging it in from the durable tier if it is
+        not resident
         """
         if key in self:
             self.move_to_end(key)
             return self[key]
+        if self.disk is not None and key in self.disk:
+            stashed = self.disk.get(key)
+            if stashed is not None:
+                self._insert(key, stashed)
+                return stashed
         return default
 
 
@@ -57,38 +75,44 @@ class RecurrentCache(OrderedDict):
             self.move_to_end(key)
         else:
             stashed_state = state.stash()
-            state_size = stashed_state["checkpoint_size"]
-            while self.update_total_size() + state_size > self.max_size:
-                assert self.current_size >= 0, "Not enough space in cache for single state"
-                pt = self.pagetable
+            self._insert(key, stashed_state)
+            if self.disk is not None:
+                self.disk.put(key, stashed_state)
 
-                # A checkpoint whose anchor page chain has been broken by KV eviction can never be restored by
-                # an allocation, so drop stranded checkpoints (oldest first) before restorable ones. This is a
-                # pure win: if the conversation returns, the replay prefill recreates the same checkpoint at no
-                # extra cost, since the missing pages force a replay past this position either way.
-                popped_key = None
+
+    def _insert(self, key, stashed_state):
+        state_size = stashed_state["checkpoint_size"]
+        while self.update_total_size() + state_size > self.max_size:
+            assert self.current_size >= 0, "Not enough space in cache for single state"
+            pt = self.pagetable
+
+            # A checkpoint whose anchor page chain has been broken by KV eviction can never be restored by
+            # an allocation, so drop stranded checkpoints (oldest first) before restorable ones. This is a
+            # pure win: if the conversation returns, the replay prefill recreates the same checkpoint at no
+            # extra cost, since the missing pages force a replay past this position either way.
+            popped_key = None
+            if pt is not None:
+                for k in self:
+                    if not pt.is_resumable(k):
+                        popped_key = k
+                        break
+            if popped_key is not None:
+                popped = self.pop(popped_key)
+                self.metrics["stash_evictions_stranded"] += 1
+            else:
+                popped_key, popped = self.popitem(last = False)
                 if pt is not None:
-                    for k in self:
-                        if not pt.is_resumable(k):
-                            popped_key = k
-                            break
-                if popped_key is not None:
-                    popped = self.pop(popped_key)
-                    self.metrics["stash_evictions_stranded"] += 1
-                else:
-                    popped_key, popped = self.popitem(last = False)
-                    if pt is not None:
-                        page = pt.referenced_pages.get(popped_key) or pt.unreferenced_pages.get(popped_key)
-                        if page is not None and page.kv_position == PAGE_SIZE:
-                            self.metrics["stash_evictions_live_kv"] += 1
+                    page = pt.referenced_pages.get(popped_key) or pt.unreferenced_pages.get(popped_key)
+                    if page is not None and page.kv_position == PAGE_SIZE:
+                        self.metrics["stash_evictions_live_kv"] += 1
 
-                self.metrics["stash_evictions"] += 1
-                note_freed(popped["checkpoint_size"])
-                if self.model.loaded_tp:
-                    self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
+            self.metrics["stash_evictions"] += 1
+            note_freed(popped["checkpoint_size"])
+            if self.model.loaded_tp:
+                self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
 
-            self[key] = stashed_state
-            self.update_total_size()
+        self[key] = stashed_state
+        self.update_total_size()
 
 
     def prune_stranded(self) -> int:

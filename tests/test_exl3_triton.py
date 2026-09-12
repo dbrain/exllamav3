@@ -406,49 +406,95 @@ def test_m1_splitk_vs_classic(out_dtype):
     assert d < 0.05, f"split vs classic max abs diff {d}"
 
 
-def test_prune_n_bucket_pools():
-    """The M=1 fast-path prune must return non-empty, floor-safe pools."""
+# (BLOCK_N, BLOCK_K) pools per shape, per CU count. Two columns because
+# _prefer_warps narrows the m == 1 pools on parts with <= 16 CUs and is a no-op
+# above that, so there is no single device-independent answer: the pool that ships
+# on a 48-CU discrete part is not the pool that ships on a 16-CU RDNA3.5 APU.
+# Asserting only the 48-CU column is what made this test fail on gfx1150 while the
+# pruning logic was correct.
+_N_BUCKET_POOLS = {
+    #  (M, N, K, bits):                 cu=48 (no _prefer_warps)            cu=16 (nw==2 only)
+    (1,   4224,  4096, 4): ({(32, 128), (32, 256), (64, 128)}, {(32, 128), (32, 256)}),
+    (1,   4096, 12288, 4): ({(32, 256), (64, 256)},            {(32, 128), (32, 256)}),
+    (1,  12288,  4096, 4): ({(32, 256), (64, 256)},            {(32, 128), (32, 256)}),
+    (1,  12288,  2048, 4): ({(64, 128), (64, 256), (128, 128)},
+                            {(64, 128), (64, 256), (128, 128)}),
+    (1,  12288,  4096, 6): ({(32, 128), (64, 128)},            {(32, 128)}),
+    (1,   4096, 12288, 6): ({(32, 128), (64, 128)},            {(32, 128)}),
+    (1, 248320,  4096, 6): ({(32, 128), (64, 128)},            {(32, 128)}),
+    (1,   4096, 12288, 2): ({(32, 128), (32, 256)},            {(32, 128), (32, 256)}),
+    (1,   4112,  4096, 4): ({(16, 64)},                        {(16, 64)}),
+}
+
+
+@pytest.mark.parametrize("cu,col", [(48, 0), (16, 1)])
+def test_prune_n_bucket_pools(cu, col, monkeypatch):
+    """The M=1 fast-path prune must return non-empty, floor-safe pools.
+
+    _dev_caps is stubbed so this tests the pruning logic rather than whichever GPU
+    the suite happens to run on.
+    """
     from exllamav3.modules.quant.exl3_triton import (
         _exl3_gemm_configs, _exl3_gemm_early_prune,
     )
+    import exllamav3.modules.quant.exl3_triton as _T
+
+    # EXL3_GEMM_PIN=strict (perf/exl3-env.sh) collapses every m == 1 pool to one
+    # config, which is the pin's job and not the pruning logic under test here.
+    monkeypatch.delenv("EXL3_GEMM_PIN", raising = False)
+    monkeypatch.setattr(_T, "_dev_caps",
+                        lambda device = None: (cu, 32 if cu > 16 else 64, True))
     configs = _exl3_gemm_configs()
 
     def pool(m, n, k, bits):
-        return sorted(
+        return {
             (c.kwargs["BLOCK_N"], c.kwargs["BLOCK_K"])
             for c in _exl3_gemm_early_prune(configs, {"M": m, "N": n, "K_dim": k, "K_BITS": bits})
-        )
+        }
 
-    # Starved-N b4 non-split shape (K not divisible by 256)
-    p = pool(1, 4224, 4096, 4)
-    assert set(p) == {(32, 128), (32, 256), (64, 128)}
-    # Split-eligible starved-N b4 shape: widest windows only
-    p = pool(1, 4096, 12288, 4)
-    assert set(p) == {(32, 256), (64, 256)}
-    # Split-eligible large-N b4 shape (gate/up class, K deep enough)
-    p = pool(1, 12288, 4096, 4)
-    assert set(p) == {(32, 256), (64, 256)}
-    # Large-N b4 with shallow K stays on the classic large-N pool
-    p = pool(1, 12288, 2048, 4)
-    assert set(p) == {(128, 128), (64, 256), (64, 128)}
-    # bits=6 mid-N (MLP of a 6bpw model): split-eligible, BK128 pool
-    p = pool(1, 12288, 4096, 6)
-    assert set(p) == {(64, 128), (32, 128)}
-    # bits=6 small-N (down of a 6bpw model): same split pool
-    p = pool(1, 4096, 12288, 6)
-    assert set(p) == {(64, 128), (32, 128)}
-    # bits=6 huge-N (lm_head stream): BN64/BK128 (685 GB/s winner) + BN32
-    p = pool(1, 248320, 4096, 6)
-    assert set(p) == {(64, 128), (32, 128)}
-    # bits=2 pools follow the same narrow-tile rule
-    p = pool(1, 4096, 12288, 2)
-    assert set(p) == {(32, 128), (32, 256)}
-    # Non-divisible shapes fall back to the small-tile generic pool
-    p = pool(1, 4112, 4096, 4)
-    assert set(p) == {(16, 64)}
-    # M > 1 keeps the prefill configs untouched
+    for (m, n, k, bits), expected in _N_BUCKET_POOLS.items():
+        got = pool(m, n, k, bits)
+        assert got == expected[col], f"cu={cu} shape=({m},{n},{k},{bits})"
+        assert got, "the prune must never empty a pool"
+
+
+@pytest.mark.parametrize("cu", [48, 16])
+def test_prune_pool_floor_is_cu_independent(cu, monkeypatch):
+    """_prefer_warps must never empty a pool it cannot narrow.
+
+    It returns `want if want else configs`, so a pool whose every member is
+    num_warps != 2 survives INTACT on a low-CU part rather than vanishing. The
+    large-N shallow-K b4 pool is exactly that case, which is why it is the one
+    m == 1 entry above that does not move between the two columns.
+    """
+    import exllamav3.modules.quant.exl3_triton as _T
+    from exllamav3.modules.quant.exl3_triton import (
+        _exl3_gemm_configs, _exl3_gemm_early_prune, _prefer_warps,
+    )
+    monkeypatch.delenv("EXL3_GEMM_PIN", raising = False)
+    monkeypatch.setattr(_T, "_dev_caps",
+                        lambda device = None: (cu, 32 if cu > 16 else 64, True))
+    configs = _exl3_gemm_configs()
+    p = _exl3_gemm_early_prune(configs, {"M": 1, "N": 12288, "K_dim": 2048, "K_BITS": 4})
+    assert p, "pool emptied"
+    assert not any(c.num_warps == 2 for c in p), \
+        "this shape's pool is meant to have no nw==2 member; pick another shape"
+    assert _prefer_warps(list(p)) == list(p)
+
+
+def test_prune_keeps_all_prefill_configs_except_fuse_out_only():
+    """At M > 1 the pool is the full config list MINUS the output-Hadamard-only
+    tiles, which are illegal when FUSE_OUT_HAD is off (they exist solely to finish
+    128-column groups the CTA owns). Asserting len(configs) here instead is what
+    broke when _FUSE_OUT_ONLY_CFG was introduced."""
+    from exllamav3.modules.quant.exl3_triton import (
+        _exl3_gemm_configs, _exl3_gemm_early_prune, _FUSE_OUT_ONLY_CFG,
+    )
+    configs = _exl3_gemm_configs()
     p = _exl3_gemm_early_prune(configs, {"M": 128, "N": 4096, "K_dim": 4096, "K_BITS": 4})
-    assert len(p) == len(configs)
+    assert len(p) == len(configs) - len(_FUSE_OUT_ONLY_CFG)
+    assert not any((c.kwargs["BLOCK_N"], c.kwargs["BLOCK_K"], c.num_warps)
+                   in _FUSE_OUT_ONLY_CFG for c in p)
 
 
 @pytest.mark.parametrize("mcg,mul1", CB_VARIANTS)

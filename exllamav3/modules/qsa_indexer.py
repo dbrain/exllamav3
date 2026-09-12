@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from .module import Module
 from .linear import Linear
 from .rmsnorm import RMSNorm
+from ..constants import PAGE_SIZE
 from ..model.config import Config
 
 """
@@ -198,9 +199,12 @@ class QSAIndexer(Module):
 
     # ---- selection kernels -------------------------------------------------------------------
     # Selection = score -> top-k -> expand, three launches per (sequence, row slab), the same
-    # kernels the BC sparse-decode graph runs (row-tiled scorer for many queries). Every scalar
-    # comes from the host-side cache lengths: no per-layer H2D copy, no sync, and none of the
-    # arange/where/cat elementwise chains of the torch references kept below for the tests
+    # kernels the BC sparse-decode graph runs (row-tiled scorer for many queries). Prefill and
+    # multi-sequence calls take their scalars from the host-side cache lengths: no per-layer
+    # H2D copy, no sync, and none of the arange/where/cat elementwise chains of the torch
+    # references kept below for the tests. Single-row decode instead goes through
+    # _select_static, which reads the same scalars from the device so the launch can be
+    # captured; see graph_decode.py
 
     # Rows per launch (also the expand kernel's fixed SEQ constexpr) and pools per score tile.
     # Selection scores are computed tile by tile into a fixed SEL_SLAB x SEL_TILE fp16 slab
@@ -229,6 +233,17 @@ class QSAIndexer(Module):
         cr = self.compress_ratio
         return -(-(self.block_topk * cr + cr - 1) // 32) * 32
 
+    def _tile_pools(self, epp: int) -> int:
+        # Paged tiles must start on a pool page
+        return max(epp, self.SEL_TILE // epp * epp) if epp else self.SEL_TILE
+
+    def static_capture_limit(self) -> int:
+        """Cache capacity (in tokens) up to which decode selection runs entirely off device
+        state, i.e. is graph-capturable. A block table that can address more pools than one
+        score tile holds needs the tile loop below, whose trip count follows the position and
+        which therefore cannot be captured."""
+        return self._tile_pools(PAGE_SIZE // self.compress_ratio) * self.compress_ratio
+
     def _sel_weights(self, rows: int, device):
         w = getattr(self, "_sel_w", None)
         if w is None or w.device != device:
@@ -256,9 +271,7 @@ class QSAIndexer(Module):
         k_pad = out_rows.shape[1]
         k_sel = self.block_topk
         kp = -(-k_sel // 32) * 32
-        t_tile = self.SEL_TILE
-        if block_table is not None:
-            t_tile = max(epp, t_tile // epp * epp)   # tiles must start on a pool page
+        t_tile = self._tile_pools(epp if block_table is not None else 0)
         # Fixed score-row stride for every tile: it is a constexpr of the scoring kernel, so a
         # stride that followed the visible length recompiled it at every new 128-pool boundary
         s_stride = -(-t_tile // 128) * 128
@@ -555,22 +568,75 @@ class QSAIndexer(Module):
             pooled_flat[pflat.flatten()[vm]] = pooled.reshape(-1, dk)[vm]
         return q
 
+    def _select_static(self, layer, q_idx, block_table, cache_seqlens):
+        """
+        One-row (decode) selection with every bound read from device memory: score the whole
+        addressable pool range in one fixed-width tile, take the top block_topk with the scan
+        width as a device pointer, expand. Same three launches as _select_rows' single-tile
+        case, minus every host-side use of the cache position -- so the launch is identical at
+        every position the block table can reach and a captured graph replays it unchanged.
+
+        Selecting an unconditional block_topk needs no min() against the visible pool count:
+        this path only serves the sparse regime, where the position guarantees more complete
+        pools than that, and the top-k kernel emits everything finite when asked for more.
+        """
+        import triton
+        from .attention_fn.dsa_triton import dsa_indexer_scores, _dsa_pool_expand_kernel
+        from .attention_fn.qsa_triton import _qsa_sel_state_kernel
+        from ..ext import exllamav3_ext as ext
+        from ..util.tensor import g_tensor_cache
+        dev = q_idx.device
+        cr, H, dk = self.compress_ratio, self.n_heads, self.head_dim
+        epp = layer.pooled.shape[1]
+        npr = block_table.shape[-1]
+        t_cap = npr * epp
+        s_stride = -(-self._tile_pools(epp) // 128) * 128
+        kp = -(-self.block_topk // 32) * 32
+        k_pad = self.k_pad()
+
+        state = g_tensor_cache.get(dev, (2,), torch.int32, "qsa_sel_state")
+        scores = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile") \
+            [: s_stride].view(1, s_stride)
+        pool_idx = g_tensor_cache.get_bucketed(dev, kp, torch.int32, "qsa_sel_pool").view(1, kp)
+        out = torch.empty((1, k_pad), dtype = torch.int32, device = dev)
+        with torch.cuda.device(dev):
+            _qsa_sel_state_kernel[(1,)](cache_seqlens, state, 1, 1, P = cr)
+            sc = dsa_indexer_scores(
+                q_idx.reshape(1, H, dk), self._sel_weights(1, dev),
+                layer.pooled.view(-1, dk), 0, cr, 0, scores = scores,
+                block_table = block_table, epp = epp, scale = self.scale,
+                multirow = dict(q_pos0 = state[:1], t = state[1:], seq = 1,
+                                npr = npr, t_cap = t_cap),
+            )
+            ext.dsa_topk(sc, pool_idx, self.block_topk, state[1:], 0)
+            _dsa_pool_expand_kernel[(1, triton.cdiv(k_pad, 256))](
+                pool_idx, out, state[:1],
+                P = cr, SEL = self.block_topk, K_pad = k_pad, KP_pool = kp, TAIL = 1,
+                SEQ = 1, MULTIROW = 1, BLOCK = 256,
+            )
+        return out
+
     def select_indices_paged(
         self,
         layer,
         q_idx: torch.Tensor,
         block_table: torch.Tensor,
         cache_seqlens_cpu: torch.Tensor,
+        cache_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Cache-resident form of select_indices: pooled block keys are read from the paged plane
         through the block table and each row's positions are offset by its sequence's cache
         position. Emits per-SEQUENCE cache positions, (bsz * seq, K_pad) int32 -1-padded. The
-        paged attention kernel maps them through the block table.
+        paged attention kernel maps them through the block table. Single-row decode with the
+        device cache lengths in hand takes the capturable _select_static path.
         """
         bsz, seq = q_idx.shape[:2]
         cr = self.compress_ratio
         epp = layer.pooled.shape[1]
+        if cache_seqlens is not None and bsz == 1 and seq == 1 and \
+                block_table.shape[-1] * epp <= self._tile_pools(epp):
+            return self._select_static(layer, q_idx, block_table.int(), cache_seqlens)
         pool_flat = layer.pooled.view(-1, self.head_dim)
         bt = block_table.int()
         out = torch.empty((bsz * seq, self.k_pad()), dtype = torch.int32, device = q_idx.device)
@@ -638,6 +704,7 @@ class QSAIndexer(Module):
         q_idx: torch.Tensor,
         block_table: torch.Tensor,
         cache_seqlens_cpu: torch.Tensor,
+        cache_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Sparse paged attention through the gathered-GQA kernel: per-row selection over the
@@ -651,7 +718,7 @@ class QSAIndexer(Module):
         from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         from ..cache.quant import CacheLayer_quant
         bsz, seq = q.shape[:2]
-        indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
+        indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu, cache_seqlens)
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
         if isinstance(layer, CacheLayer_quant):

@@ -11,10 +11,17 @@ forwards issued back to back with their uploads still in flight. Uses the 4-laye
 quantized table (disk and RAM modes).
 """
 
-STUB = "/mnt/str/exl3temp/qwen38_stub4_q"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from util import resolve_device, skip_module
+
+STUB = os.environ.get("EXL3_TEST_STUB", "/mnt/str/exl3temp/qwen38_stub4_q")
 KEY = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
 EOS = 248044
-DEV = torch.device("cuda:0")
+
+if not os.path.isdir(STUB):
+    skip_module(f"4-layer quantized n-gram stub not available: {STUB}")
+
+DEV = torch.device(resolve_device())
 
 from exllamav3.loader.safetensors import SafetensorsCollection
 from exllamav3.modules import NGramEmbedding
