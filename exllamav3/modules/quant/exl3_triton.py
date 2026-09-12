@@ -600,6 +600,21 @@ _GEMM_PINNED = {
     ( 2560, 248320, 6, 8): ( 16,  32,  32, 1, 1, 2),  # lm_head
     ( 6144,   2560, 6, 8): ( 16,  32,  32, 1, 2, 3),  # gdn.out_proj
     (  640,   2560, 6, 8): ( 16,  32,  32, 1, 1, 2),  # moe / shared down_proj
+
+    # The speculative round's remaining dense GEMM, 19.9 ms of ~301 (6.6%), which ran
+    # AUTOTUNED because nobody had tabled it -- and TRITON_CACHE_AUTOTUNING freezes an
+    # autotune result on disk without ever re-measuring it, so a pass that happened to run
+    # while this 30 W box was busy could pin a loser permanently. These values were not swept:
+    # they are the picks the autotuner has already been making, read back out of
+    # ~/.triton/cache and cross-checked across every cached generation, so shipping them is a
+    # determinism fix and should be a null on speed.
+    #   consistency across cached generations / margin over the runner-up:
+    ( 2560,  98304, 6, 2): ( 16,  32,  32, 1, 1, 2),  # mtp sliced draft head   1/1,  1.39x
+    ( 2560,  98304, 6, 4): ( 16,  32,  32, 1, 1, 2),  #   17.134 ms/round, 5.69% 1/1,  1.41x
+    ( 2560,   2560, 5, 2): ( 16,  32,  32, 1, 1, 2),  # mtp.fc_hidden/_embedding 9/9, 1.09x
+    ( 2560,   2560, 5, 4): ( 16,  32,  32, 1, 1, 2),  #                        10/10, 1.12x
+    ( 2560,   2560, 5, 8): ( 16,  32,  32, 1, 1, 2),  #                         9/9,  1.07x
+    ( 2560,    640, 4, 8): ( 16,  32, 128, 1, 2, 3),  # attn.indexer_qk        12/13, ~1.00x
 }
 
 _GEMM_PIN_OFF = ("0", "off", "false", "no")

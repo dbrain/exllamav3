@@ -52,7 +52,6 @@ def gather(mod, uids, words, dtype):
     return out
 
 
-@torch.inference_mode()
 def main():
     import numpy as np
     rng = np.random.default_rng(0xE313)
@@ -129,4 +128,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Scoped to the run, NOT entered at module scope. This file is named test_* but defines no
+    # test functions, so pytest imports it during collection and never runs anything in it -- a
+    # module-scope inference_mode that is never exited therefore leaks into every test collected
+    # afterwards, and g_tensor_cache then hands out inference tensors for the rest of the
+    # session (see tests/test_tensor_cache_inference.py, which is what catches it).
+    with torch.inference_mode():
+        main()
