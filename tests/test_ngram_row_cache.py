@@ -18,7 +18,6 @@ KEY = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
 from exllamav3.loader.safetensors import SafetensorsCollection
 from exllamav3.modules import NGramEmbedding
 
-_IM = torch.inference_mode(); _IM.__enter__()
 
 
 def syscr():
@@ -129,4 +128,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Scoped to the run, NOT entered at module scope. This file is named test_* but defines no
+    # test functions, so pytest imports it during collection and never runs anything in it -- a
+    # module-scope inference_mode that is never exited therefore leaks into every test collected
+    # afterwards, and g_tensor_cache then hands out inference tensors for the rest of the
+    # session (see tests/test_tensor_cache_inference.py, which is what catches it).
+    with torch.inference_mode():
+        main()
