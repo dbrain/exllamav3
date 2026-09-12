@@ -18,7 +18,6 @@ KEY = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
 from exllamav3.loader.safetensors import SafetensorsCollection
 from exllamav3.modules import NGramEmbedding
 
-_IM = torch.inference_mode(); _IM.__enter__()
 
 
 def syscr():
@@ -53,6 +52,7 @@ def gather(mod, uids, words, dtype):
     return out
 
 
+@torch.inference_mode()
 def main():
     import numpy as np
     rng = np.random.default_rng(0xE313)

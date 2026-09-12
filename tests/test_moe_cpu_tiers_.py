@@ -18,6 +18,17 @@ random states miss. Skipped when the ladder is not present.
 import os, sys, subprocess, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+import torch as _torch
+
+# cpu/moe_mul1.cpp holds every ISA tier under test and is in ROCM_EXCLUDE_FILES, so this build
+# has no tier to compare: the probes come from ext_fallbacks.py and all report False (same
+# reason as tests/test_moe_cpu_pool_.py).
+pytestmark = pytest.mark.skipif(
+    _torch.version.hip is not None,
+    reason = "CPU MoE expert kernels not ported to ROCm"
+)
+
 INT8_TOL = 5e-4     # rel. L2 between int8 tiers (observed <= 1e-4 under -Ofast; 0 with strict FP)
 SCALAR_TOL = 0.05   # rel. L2 int8 tiers vs the fp32 scalar reference (observed <= 0.02)
 
