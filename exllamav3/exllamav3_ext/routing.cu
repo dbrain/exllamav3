@@ -6,6 +6,11 @@
 #include "util.cuh"
 #include "reduction.cuh"
 #include "hgemm.cuh"
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <mutex>
+#include <vector>
 
 #define MAX_NUM_EXPERTS 512
 #define MAX_K 16
@@ -182,6 +187,154 @@ void routing_gemv_kernel
         scores[row] = __float2half_rn(sum);
 }
 
+// Multi-row routing GEMV. routing_gemv below only took the hand-written kernel at bsz == 1,
+// so every M > 1 call -- which is EVERY call in a speculative verify forward -- fell through to
+// hgemm. The weight side is the whole cost: gate_t is (E, k) = 512 x 2560 fp16 = 2.62 MB per
+// layer and x is M x 2560 fp16 = 35 KB at M = 7, so the round reads 126 MB of gate weight and
+// 1.7 MB of activation. One warp per expert row reads that row ONCE and dots it against all M
+// activation rows, which leaves weight traffic identical to the bsz == 1 kernel and makes the
+// activation side an L2 hit (35 KB against a 2 MB L2). M is a template parameter so the
+// accumulators stay in registers and the inner loop fully unrolls; M_MAX caps that at the
+// point where register pressure would cost occupancy, which on this part beats byte count
+// (RUNBOOK section 1).
+#define ROUTING_GEMV_MAX_M 16
+
+template <int M>
+__global__ __launch_bounds__(RGEMV_WARPS * 32)
+void routing_gemv_m_kernel
+(
+    const half* __restrict__ x,         // (M, k)
+    const half* __restrict__ gate_t,    // (E, k)
+    half* __restrict__ scores,          // (M, E)
+    const int k,
+    const int E
+)
+{
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * RGEMV_WARPS + warp;
+    if (row >= E) return;
+
+    const int k2 = k / 2;
+    const half2* w2 = (const half2*) (gate_t + (size_t) row * k);
+    const half2* x2 = (const half2*) x;
+
+    float sum[M];
+    #pragma unroll
+    for (int m = 0; m < M; ++m) sum[m] = 0.0f;
+
+    for (int j = lane; j < k2; j += 32)
+    {
+        float2 wf = __half22float2(w2[j]);
+        #pragma unroll
+        for (int m = 0; m < M; ++m)
+        {
+            float2 xf = __half22float2(x2[(size_t) m * k2 + j]);
+            sum[m] = fmaf(xf.x, wf.x, sum[m]);
+            sum[m] = fmaf(xf.y, wf.y, sum[m]);
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < M; ++m)
+    {
+        float s = sum[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            s += __shfl_down_sync(0xffffffffu, s, offset);
+        if (lane == 0) scores[(size_t) m * E + row] = __float2half_rn(s);
+    }
+}
+
+// Same decomposition, 16-byte loads. The half2 version issues one 4-byte load per lane per
+// iteration (40 iterations at k = 2560); this issues one 16-byte load (10 iterations), which
+// is the usual way to close the gap between a coalesced-but-narrow read and the bus. Needs
+// k % 8 == 0. Register cost is M accumulators plus two float4 staging regs, which the ISA
+// dump must confirm still fits 16 waves/SIMD before any timing is believed.
+template <int M>
+__global__ __launch_bounds__(RGEMV_WARPS * 32)
+void routing_gemv_m4_kernel
+(
+    const half* __restrict__ x,         // (M, k)
+    const half* __restrict__ gate_t,    // (E, k)
+    half* __restrict__ scores,          // (M, E)
+    const int k,
+    const int E
+)
+{
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * RGEMV_WARPS + warp;
+    if (row >= E) return;
+
+    const int k8 = k / 8;
+    const float4* w4 = (const float4*) (gate_t + (size_t) row * k);
+    const float4* x4 = (const float4*) x;
+
+    float sum[M];
+    #pragma unroll
+    for (int m = 0; m < M; ++m) sum[m] = 0.0f;
+
+    for (int j = lane; j < k8; j += 32)
+    {
+        float4 wv = w4[j];
+        const half2* wh = (const half2*) &wv;
+        #pragma unroll
+        for (int m = 0; m < M; ++m)
+        {
+            float4 xv = x4[(size_t) m * k8 + j];
+            const half2* xh = (const half2*) &xv;
+            #pragma unroll
+            for (int t = 0; t < 4; ++t)
+            {
+                float2 wf = __half22float2(wh[t]);
+                float2 xf = __half22float2(xh[t]);
+                sum[m] = fmaf(xf.x, wf.x, sum[m]);
+                sum[m] = fmaf(xf.y, wf.y, sum[m]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < M; ++m)
+    {
+        float v = sum[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xffffffffu, v, offset);
+        if (lane == 0) scores[(size_t) m * E + row] = __float2half_rn(v);
+    }
+}
+
+// EXL3_ROUTING_GEMV: read per call so both arms interleave in one process. "multi" takes the
+// M-row kernel for 1 < M <= ROUTING_GEMV_MAX_M; anything else keeps the hgemm fallthrough.
+// bsz == 1 is unaffected either way -- it already had its own kernel.
+// 0 = off, 1 = half2 loads ("multi"), 2 = float4 loads ("multi4")
+static int routing_gemv_multi_env()
+{
+    const char* e = getenv("EXL3_ROUTING_GEMV");
+    if (!e) return 0;
+    if (!strcmp(e, "multi")) return 1;
+    if (!strcmp(e, "multi4")) return 2;
+    return 0;
+}
+
+// On a shared .so a sha names a BUILD, not a CHANGE (trap 39), and a silent fallback here
+// would turn an A/B arm into a measured null. So the first time each outcome is reached it
+// says so on stderr, with the reason it was rejected. One line per distinct reason, ever.
+static void routing_gemv_note(const char* what, int M)
+{
+    static std::mutex mtx;
+    static std::vector<const char*> seen;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const char* r : seen)
+            if (r == what) return;
+        seen.push_back(what);
+    }
+    fprintf(stderr, " !! EXL3_ROUTING_GEMV: %s (M=%d)\n", what, M);
+}
+
 void routing_gemv
 (
     const at::Tensor& hidden,
@@ -207,7 +360,49 @@ void routing_gemv
     }
     else
     {
-        hgemm(hidden, gate, scores);
+        int M = (int) (hidden.numel() / k);
+        if (routing_gemv_multi_env() && gate_t.has_value() && !(k & 1) &&
+            M > 1 && M <= ROUTING_GEMV_MAX_M &&
+            hidden.is_contiguous() && scores.is_contiguous() &&
+            (int) (scores.numel() / E) == M)
+        {
+            const half* xp = (const half*) hidden.data_ptr();
+            const half* wp = (const half*) gate_t.value().data_ptr();
+            half* sp = (half*) scores.data_ptr();
+            dim3 grid(CEIL_DIVIDE(E, RGEMV_WARPS));
+            dim3 block(RGEMV_WARPS * 32);
+            const bool v4 = (routing_gemv_multi_env() == 2) && (k % 8 == 0);
+            #define ROUTING_GEMV_CASE(N)                                                     \
+                case N:                                                                      \
+                    if (v4) routing_gemv_m4_kernel<N><<<grid, block, 0, stream>>>(xp, wp, sp, k, E); \
+                    else    routing_gemv_m_kernel<N> <<<grid, block, 0, stream>>>(xp, wp, sp, k, E); \
+                    break;
+            switch (M)
+            {
+                ROUTING_GEMV_CASE(2)  ROUTING_GEMV_CASE(3)  ROUTING_GEMV_CASE(4)
+                ROUTING_GEMV_CASE(5)  ROUTING_GEMV_CASE(6)  ROUTING_GEMV_CASE(7)
+                ROUTING_GEMV_CASE(8)  ROUTING_GEMV_CASE(9)  ROUTING_GEMV_CASE(10)
+                ROUTING_GEMV_CASE(11) ROUTING_GEMV_CASE(12) ROUTING_GEMV_CASE(13)
+                ROUTING_GEMV_CASE(14) ROUTING_GEMV_CASE(15) ROUTING_GEMV_CASE(16)
+                default: hgemm(hidden, gate, scores); break;
+            }
+            #undef ROUTING_GEMV_CASE
+            routing_gemv_note(v4 ? "multi-row kernel live (float4 loads)"
+                                 : "multi-row kernel live (half2 loads)", M);
+        }
+        else
+        {
+            if (routing_gemv_multi_env())
+                routing_gemv_note(
+                    !gate_t.has_value() ? "fallback: no gate_t supplied" :
+                    (k & 1)             ? "fallback: odd k" :
+                    M <= 1              ? "fallback: M == 1 with no gate_t" :
+                    M > ROUTING_GEMV_MAX_M ? "fallback: M above ROUTING_GEMV_MAX_M" :
+                    !hidden.is_contiguous() ? "fallback: hidden not contiguous" :
+                    !scores.is_contiguous() ? "fallback: scores not contiguous" :
+                                              "fallback: shape mismatch", M);
+            hgemm(hidden, gate, scores);
+        }
     }
 }
 

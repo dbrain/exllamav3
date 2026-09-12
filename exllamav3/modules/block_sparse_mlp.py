@@ -197,6 +197,13 @@ def routing_std(bsz, cfg, y, params):
             return selected_experts, routing_weights
         else:
             router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+            # gate_t was passed only on the bsz == 1 branch, so routing_gemv fell through to
+            # hgemm for every bsz > 1 call -- which is every call in a speculative verify
+            # forward. The transpose is the same lazily-built tensor the bsz == 1 branch and
+            # the other routers already materialise, so supplying it here adds no residency
+            # beyond what a bsz == 1 call would have created anyway.
+            if cfg.gate_tensor_t is None:
+                cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
             ext.routing_std(
                 y,
                 cfg.gate_tensor,
@@ -204,7 +211,7 @@ def routing_std(bsz, cfg, y, params):
                 selected_experts,
                 routing_weights,
                 cfg.per_expert_scale,
-                None,
+                cfg.gate_tensor_t,
                 None,
             )
         return selected_experts, routing_weights
@@ -315,6 +322,8 @@ def routing_dots(bsz, cfg, y, params):
             )
         else:
             router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+            if cfg.gate_tensor_t is None:
+                cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
             ext.routing_ds3_nogroup(
                 y,
                 cfg.gate_tensor,
@@ -323,7 +332,7 @@ def routing_dots(bsz, cfg, y, params):
                 selected_experts,
                 routing_weights,
                 cfg.routed_scaling_factor,
-                None,
+                cfg.gate_tensor_t,
                 ROUTING_ACT_SIGMOID,
             )
         return selected_experts, routing_weights
