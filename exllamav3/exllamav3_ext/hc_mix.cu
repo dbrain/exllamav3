@@ -717,6 +717,37 @@ static inline int gr_j_tile_env()
     return GR_J_TILE;
 }
 
+// EXL3_HC_THREADS: block width for the gr_dots r/j-tiled kernel. Read per call so one process
+// can A/B it.
+//
+// WHY THIS IS A KNOB AT ALL. The stream term of gr_mix_q is ~16 ms of a ~301 ms round and was
+// recorded as "L2-resident, so not DRAM -- 13.3 MB per row at ~700 GB/s is L2 rate". That
+// scored the kernel against a ceiling nobody had measured. perf/exl3/l2bw.py now measures it
+// with this kernel's own access pattern -- N blocks all reading one window, contiguous float4
+// -- and at the real 164 KB window gfx1150 does **1644 GB/s**, with the DRAM positive control
+// landing at 80.6-81.1 GB/s as it must. So the stream term runs at 43% of its ceiling, not at
+// it, and there is an upper bound of ~9 ms/round in the gap.
+//
+// The gap is unlikely to be ALU: one c iteration loads R_TILE*2 float4 of stream (128 B) and
+// does 32*J_TILE FMAs, i.e. **0.5 FMA/byte at J=2**, which is 707 GFLOP/s against ~4.1 TFLOP/s
+// of fp32 peak -- 17%. Low intensity plus far-from-peak bandwidth is the signature of a
+// LATENCY bound, and the cheapest test of that is more loads in flight, which is this.
+//
+// D4/2 = 320 at D = 2560, so the trade is not one-sided: 128 threads take 3 passes with the
+// last one quarter-idle, 256 take 2 with the second three-quarters idle, 512 take 1 with 192
+// of 512 lanes idle. Wider means more concurrency and more waste, so it is a measurement.
+#define GR_THREADS_A_DEFAULT GR_THREADS_A
+
+static inline int gr_threads_env()
+{
+    if (const char* e = getenv("EXL3_HC_THREADS"))
+    {
+        int v = atoi(e);
+        if (v == 64 || v == 128 || v == 256 || v == 512) return v;
+    }
+    return GR_THREADS_A_DEFAULT;
+}
+
 template <int H, int R_TILE>
 __global__ __launch_bounds__(GR_THREADS_A)
 void gr_dots_q8_rt_kernel
@@ -839,8 +870,8 @@ any timing -- three levers on this part have died at a wider tile (perf/exl3/kst
 
 */
 
-template <int H, int R_TILE, int J_TILE>
-__global__ __launch_bounds__(GR_THREADS_A)
+template <int H, int R_TILE, int J_TILE, int NT>
+__global__ __launch_bounds__(NT)
 void gr_dots_q8_rtj_kernel
 (
     const float* __restrict__ streams,   // (R, H, D)
@@ -865,7 +896,7 @@ void gr_dots_q8_rtj_kernel
     for (int t = 0; t < R_TILE; ++t)
         s4[t] = (const float4*) (streams + (size_t) min(r0 + t, R - 1) * H * D);
 
-    __shared__ float red[R_TILE][J_TILE][H][GR_THREADS_A / 32];
+    __shared__ float red[R_TILE][J_TILE][H][NT / 32];
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
 
@@ -880,7 +911,7 @@ void gr_dots_q8_rtj_kernel
 
         if (nj_fn > 0)
         {
-            for (int c = threadIdx.x; c < D4 / 2; c += GR_THREADS_A)
+            for (int c = threadIdx.x; c < D4 / 2; c += NT)
             {
                 float4 s0[R_TILE], s1[R_TILE];
                 #pragma unroll
@@ -918,7 +949,7 @@ void gr_dots_q8_rtj_kernel
         {
             // Row M: sum of squares of the raw streams. Own loop, own stride, unchanged.
             const int u = nj_fn;
-            for (int c = threadIdx.x; c < D4; c += GR_THREADS_A)
+            for (int c = threadIdx.x; c < D4; c += NT)
             {
                 #pragma unroll
                 for (int t = 0; t < R_TILE; ++t)
@@ -954,7 +985,7 @@ void gr_dots_q8_rtj_kernel
         const int j = j0 + u;
         float v = 0.0f;
         #pragma unroll
-        for (int w = 0; w < GR_THREADS_A / 32; ++w)
+        for (int w = 0; w < NT / 32; ++w)
             v += red[t][u][hh][w];
         if (j < M) v *= __half2float(fn_scale[(size_t) j * H + hh]);
         dots[((size_t) (r0 + t) * (M + 1) + j) * H + hh] = v;
@@ -1758,6 +1789,7 @@ void gr_mix_q
     const bool rtile_up = rtile && !up4;
 
     const int j_t = rtile_fn ? j_tile : 1;
+    const int n_t = gr_threads_env();
     dim3 grid_a((M + 1 + j_t - 1) / j_t, rtile_fn ? n_rtiles : R);
     if (fn4)
     {
@@ -1781,15 +1813,24 @@ void gr_mix_q
         #define ARGS_A \
             (const float*) streams.data_ptr(), (const int8_t*) fn.data_ptr(), \
             (const half*) fn_scale.data_ptr(), (float*) dots.data_ptr(), M, D
+        #define LAUNCH_DOTS_JN(RT, JT)                                                        \
+            switch (n_t)                                                                      \
+            {                                                                                 \
+                case  64: gr_dots_q8_rtj_kernel<4, RT, JT,  64>                               \
+                              <<<grid_a,  64, 0, stream>>>(ARGS_A, R); break;                 \
+                case 256: gr_dots_q8_rtj_kernel<4, RT, JT, 256>                               \
+                              <<<grid_a, 256, 0, stream>>>(ARGS_A, R); break;                 \
+                case 512: gr_dots_q8_rtj_kernel<4, RT, JT, 512>                               \
+                              <<<grid_a, 512, 0, stream>>>(ARGS_A, R); break;                 \
+                default:  gr_dots_q8_rtj_kernel<4, RT, JT, GR_THREADS_A>                      \
+                              <<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R); break;        \
+            }
         #define LAUNCH_DOTS_J(RT)                                                             \
             switch (j_t)                                                                      \
             {                                                                                 \
-                case 8: gr_dots_q8_rtj_kernel<4, RT, 8>                                       \
-                            <<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R); break;           \
-                case 4: gr_dots_q8_rtj_kernel<4, RT, 4>                                       \
-                            <<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R); break;           \
-                case 2: gr_dots_q8_rtj_kernel<4, RT, 2>                                       \
-                            <<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R); break;           \
+                case 8: LAUNCH_DOTS_JN(RT, 8); break;                                         \
+                case 4: LAUNCH_DOTS_JN(RT, 4); break;                                         \
+                case 2: LAUNCH_DOTS_JN(RT, 2); break;                                         \
                 default: gr_dots_q8_rt_kernel<4, RT>                                          \
                             <<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A, R); break;           \
             }
@@ -1800,6 +1841,7 @@ void gr_mix_q
         else
             gr_dots_q8_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>(ARGS_A);
         #undef LAUNCH_DOTS_J
+        #undef LAUNCH_DOTS_JN
         #undef ARGS_A
     }
     cuda_check(cudaPeekAtLastError());
