@@ -1221,7 +1221,10 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % PAGE_SIZE == 0
+            # A tail hit resumes past the last page boundary by design, so prefill of an EXTENDED
+            # prompt starts mid-page. Safe because the page-write loop clamps per page and the one
+            # alignment-dependent block below is skipped for recurrent models.
+            assert prefill_start % PAGE_SIZE == 0 or seq.tail_restored
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -1542,6 +1545,9 @@ class Job:
         seq = self.sequences[0]
 
         if seq.kv_position == 0:
+            return
+
+        if not seq.state_is_publishable(self.recurrent_state):
             return
 
         if self.is_checkpoint_boundary(interval) and \
