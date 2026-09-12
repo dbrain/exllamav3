@@ -39,15 +39,18 @@ enabled = os.environ.get("EXL3_DECODE_GRAPH", "0") != "0"
 _WARMUP_STEPS = int(os.environ.get("EXL3_DECODE_GRAPH_WARMUP", "2"))
 
 # Distinct shape signatures to keep captured at once. The generator rounds the
-# block-table width up to a multiple of 16 pages (generator.py, iterate_gen),
-# so the signature changes once every PAGE_SIZE*16 = 4096 tokens of context.
+# block-table width up to a multiple of 16 pages (generator.py, iterate_gen and
+# _draft_batch_tables), so the signature changes once every PAGE_SIZE*16 = 4096
+# tokens of context.
 _MAX_GRAPHS = int(os.environ.get("EXL3_DECODE_GRAPH_CACHE", "4"))
 
 # After capturing a span, replay it and compare bitwise against an eager run of
-# the same span from the same input. A mismatch means something in it was not
-# static, so the whole signature is discarded and never retried. Cheap and the
-# only thing standing between a subtly dynamic module and silently wrong
-# logits. Do not turn this off outside benchmarking.
+# the same span -- once from the input it was captured with, once from a
+# perturbed one (see _verify_span_varied; the same-input pass alone cannot see a
+# baked input). A mismatch means something in it was not static, so the whole
+# signature is discarded and never retried. Cheap and the only thing standing
+# between a subtly dynamic module and silently wrong logits. Do not turn this
+# off outside benchmarking.
 _VERIFY = os.environ.get("EXL3_DECODE_GRAPH_VERIFY", "1") != "0"
 
 _DEBUG = os.environ.get("EXL3_DECODE_GRAPH_DEBUG", "0") != "0"
@@ -130,7 +133,7 @@ _UNCAPTURABLE_TYPES = frozenset({
 # eventually produce a different token. Graph replay was measured
 # indistinguishable from that control -- same divergence step, same state delta
 # -- but it does mean bit-identical decode is unattainable on these models by
-# ANY route. See _Span.exempt for how verification handles it.
+# ANY route. See _Span.exempt and _verify_span for how verification handles it.
 _CAPTURABLE_RECURRENT_TYPES = frozenset({
     "GatedDeltaNet",
 })
@@ -169,6 +172,22 @@ _CAPTURABLE_RECURRENT_TYPES = frozenset({
 _QSA_TYPES = frozenset({"QSAIndexer"})
 
 
+# Per-step INPUT tensors that reach the step through params instead of through
+# input_ids. Like cache_seqlens and the block table their CONTENTS change every
+# step while their shape does not, so they are bound to persistent device buffers
+# that _refresh_step refills. Anything per-step left unbound is read from the
+# params dict that happened to be current at capture time, which a captured graph
+# bakes as an address and an eager span reads out of a frozen snapshot.
+#
+#   target_hidden   the target model's state for the token being drafted,
+#                   consumed by the MTP input layers (arch_specific/
+#                   qwen4_exp_mtp.py, qwen3_5_mtp.py). It advances on EVERY draft
+#                   step within a verification round, so a stale one collapses
+#                   draft acceptance to noise while every other signal -- the
+#                   capture, the verify, the logits' plausibility -- looks fine.
+_STEP_INPUT_KEYS = ("target_hidden",)
+
+
 def _module_capturable(module, qsa_dense: bool = False) -> bool:
     cap = module.caps.get("graph_capturable")
     if cap is not None:
@@ -181,6 +200,27 @@ def _module_capturable(module, qsa_dense: bool = False) -> bool:
     if module.caps.get("recurrent_cache"):
         return name in _CAPTURABLE_RECURRENT_TYPES
     return True
+
+
+def _perturb(t: torch.Tensor) -> torch.Tensor:
+    """A different value in every element, for the varied-input verification pass.
+
+    A roll along the last axis permutes the tensor's own values, so it cannot
+    manufacture an inf/nan/out-of-range mismatch the real workload would never
+    produce. A degenerate (constant or single-element) input rolls to itself and
+    the varied pass simply adds no coverage for that span.
+    """
+    return t.roll(1, -1) if t.numel() > 1 else t
+
+
+def _step_inputs(params) -> list:
+    """The _STEP_INPUT_KEYS tensors this step actually carries, in a fixed order."""
+    out = []
+    for k in _STEP_INPUT_KEYS:
+        t = params.get(k)
+        if isinstance(t, torch.Tensor):
+            out.append((k, t))
+    return out
 
 
 def _recurrent_state_tensors(params) -> list:
@@ -224,9 +264,9 @@ class _Span:
         self.end = end
         # exempt: this span contains a kernel that is not deterministic run to
         # run AND advances state, so an eager reference re-run is neither
-        # reproducible nor idempotent. Verification is skipped for it. This is
-        # per SPAN, not per model: a dense span in a hybrid model is still
-        # checked bitwise.
+        # reproducible nor idempotent. It is gated against its own measured
+        # noise floor instead of bitwise (_verify_span). This is per SPAN, not
+        # per model: a dense span in a hybrid model is still checked bitwise.
         self.exempt = exempt
         self.graph = None
         self.static_in = None
@@ -238,9 +278,11 @@ class _Span:
 
 
 class _CapturedStep:
-    def __init__(self, spans, dev_seqlens, host_seqlens, dev_block_table, cache, params):
+    def __init__(self, spans, dev_seqlens, host_seqlens, dev_block_table, step_inputs, cache, params):
         self.spans = spans
         self.dev_seqlens = dev_seqlens
+        # key -> persistent device buffer for a _STEP_INPUT_KEYS tensor
+        self.step_inputs = step_inputs
         # Pinned host mirror of the cache lengths. Attention's QSA branch reads
         # get_for_device(params, "cache_seqlens", "cpu"); binding only a device
         # tensor would turn that into a D2H copy, which is a sync and cannot be
@@ -410,6 +452,8 @@ class DecodeGraphs:
             tuple(input_ids.shape),
             tuple(bt.shape), bt.dtype,
             tuple(cs.shape), cs.dtype,
+            # Bound per-step inputs: contents vary freely, shape and dtype may not
+            tuple((k, tuple(t.shape), t.dtype) for k, t in _step_inputs(params)),
             id(params.get("cache")),
             params.get("causal", True),
             params.get("last_tokens_only"),
@@ -485,6 +529,11 @@ class DecodeGraphs:
         p["block_table"] = cap.dev_block_table
         p["positions"] = cap.dev_seqlens
         p.pop("position", None)
+        # Per-step params inputs (target_hidden): point at the persistent buffers
+        # _refresh_step refills, so a captured span bakes an address that stays
+        # valid and an eager span in a replayed step reads this step's values
+        for k, buf in cap.step_inputs.items():
+            p[k] = buf
         # Seed the host mirror so Attention's QSA branch, which asks for
         # get_for_device(params, "cache_seqlens", "cpu"), gets a pinned CPU
         # tensor instead of a D2H copy off the bound device buffer (that copy
@@ -509,8 +558,11 @@ class DecodeGraphs:
         cap.host_seqlens.copy_(src_cs)
         src_bt = params["block_table"]
         cap.dev_block_table.copy_(src_bt, non_blocking = src_bt.is_pinned())
+        for k, buf in cap.step_inputs.items():
+            src = params[k]
+            buf.copy_(src, non_blocking = src.device.type == "cpu" and src.is_pinned())
 
-    def _walk(self, cap, input_ids):
+    def _walk(self, cap, input_ids, params):
         """One decode step: replay captured spans, run eager ones in between."""
         x = input_ids
         for span in cap.spans:
@@ -521,14 +573,107 @@ class DecodeGraphs:
                 span.graph.replay()
                 x = span.out
             else:
-                x = self._run_range(x, span.start, span.end, cap.params)
+                x = self._run_range(x, span.start, span.end, params)
         return x
 
     def _replay(self, cap, input_ids, params):
         self._refresh_step(cap, params)
-        x = self._walk(cap, input_ids)
+        # Rebind against THIS step's params. A captured span reads only the
+        # persistent buffers refreshed above, but the eager spans between them
+        # run ordinary module code, and binding once at capture time would hand
+        # them the capture-time params dict forever
+        x = self._walk(cap, input_ids, self._bind(params, cap))
         self.n_replays += 1
         return x
+
+    # ------------------------------------------------------------ verification
+
+    def _span_eager(self, span, x_in, p, restore):
+        """One eager run of a span from x_in and a restored state."""
+        restore()
+        span.static_in.copy_(x_in)
+        out = self._run_range(span.static_in, span.start, span.end, p)
+        torch.cuda.synchronize()
+        return out.clone()
+
+    def _span_replay(self, span, x_in, p, restore):
+        restore()
+        span.static_in.copy_(x_in)
+        span.graph.replay()
+        torch.cuda.synchronize()
+        return span.out
+
+    def _verify_span(self, span, x_in, p, restore, ref = None):
+        """Compare a replay of `span` from x_in against an eager run of the same
+        span from the same input and state. Returns None, or why they differ.
+
+        `ref` is a precomputed eager output for x_in; exempt spans ignore it and
+        recompute, since they need several samples to size their noise floor.
+        """
+        if span.exempt:
+            # This span holds kernels that are not deterministic run to run, so
+            # neither "graph == eager" nor "graph == graph" holds even when the
+            # capture is perfectly correct. Measured on qwen35-35b-a3b with
+            # capture OFF: repeating one decode step from byte-identical state
+            # gave bitwise-identical logits only 2 times in 7, and 8 full greedy
+            # decodes produced 3 distinct token sequences.
+            #
+            # So calibrate instead of assuming: run the span eagerly
+            # _NOISE_SAMPLES times from the same restored state to measure this
+            # span's own noise floor, then accept the graph only if it lands
+            # inside it. Self-calibrating, and it neither rubber-stamps (the old
+            # skip) nor refuses every hybrid (a bitwise gate would).
+            refs = [self._span_eager(span, x_in, p, restore).float()
+                    for _ in range(_NOISE_SAMPLES)]
+            noise = max(
+                (refs[a] - refs[b]).abs().max().item()
+                for a in range(len(refs)) for b in range(a + 1, len(refs))
+            )
+            got = self._span_replay(span, x_in, p, restore)
+            delta = (got.float() - refs[0]).abs().max().item()
+            # Allow a few multiples of the observed spread, plus a small absolute
+            # floor so a span that happens to measure zero noise is not held to
+            # exact equality.
+            budget = max(noise * _NOISE_TOLERANCE, 1e-3)
+            if delta > budget:
+                return (f"graph differs from eager by {delta:.3e}, outside this "
+                        f"span's measured noise floor {noise:.3e} "
+                        f"(budget {budget:.3e})")
+            _log(f"span {span} verified against its own noise floor: delta "
+                 f"{delta:.3e} <= budget {budget:.3e} "
+                 f"(eager-vs-eager spread {noise:.3e})")
+            return None
+
+        if ref is None:
+            ref = self._span_eager(span, x_in, p, restore)
+        got = self._span_replay(span, x_in, p, restore)
+        if not torch.equal(got, ref):
+            return f"max abs diff {(got.float() - ref.float()).abs().max().item():.3e}"
+        return None
+
+    def _verify_span_varied(self, cap, span, x_in, p, restore):
+        """Second verification pass, from a DIFFERENT input.
+
+        Replaying the input a graph was captured from can only prove the graph
+        reproduces the step it recorded. What makes a graph wrong is an input it
+        BAKED instead of re-reading, and that stays invisible for exactly as long
+        as the input does not change -- which is why an MTP draft whose every
+        step carries a fresh target_hidden decoded to noise while this check
+        passed. So vary both channels a step's inputs arrive on: the span input,
+        and every per-step params buffer. The params buffers are rewritten IN
+        PLACE, since a bound buffer is precisely the address a correct capture
+        reads through; anything that grabbed a different tensor stays stale and
+        shows up as a mismatch here.
+        """
+        saved = {k: b.clone() for k, b in cap.step_inputs.items()}
+        try:
+            for k, b in cap.step_inputs.items():
+                b.copy_(_perturb(saved[k]))
+            why = self._verify_span(span, _perturb(x_in), p, restore)
+        finally:
+            for k, b in cap.step_inputs.items():
+                b.copy_(saved[k])
+        return None if why is None else f"varied input: {why}"
 
     def _capture(self, sig, input_ids, params):
         dev = self.device
@@ -546,8 +691,11 @@ class DecodeGraphs:
         self.layout = layout
         spans = [_Span(c, s, e, x) for c, s, e, x in layout]
         host_seqlens = params["cache_seqlens"].detach().to("cpu").clone().pin_memory()
+        step_inputs = {
+            k: t.to(dev).contiguous().clone() for k, t in _step_inputs(params)
+        }
         cap = _CapturedStep(spans, dev_seqlens, host_seqlens, dev_block_table,
-                            params.get("cache"), None)
+                            step_inputs, params.get("cache"), None)
         cap.params = self._bind(params, cap)
         p = cap.params
         self._refresh_step(cap, params)
@@ -606,69 +754,21 @@ class DecodeGraphs:
                 return None
             span.graph = graph
 
-        # 3) Verify each span against its eager output, from the same input
+        # 3) Verify each span twice: from the input it was captured with, and
+        #    from a DIFFERENT one
         if _VERIFY:
             for k, span in enumerate(spans):
                 if not span.captured:
                     continue
-                if span.exempt:
-                    # This span holds kernels that are not deterministic run to
-                    # run, so neither "graph == eager" nor "graph == graph"
-                    # holds even when the capture is perfectly correct. Measured
-                    # on qwen35-35b-a3b with capture OFF: repeating one decode
-                    # step from byte-identical state gave bitwise-identical
-                    # logits only 2 times in 7, and 8 full greedy decodes
-                    # produced 3 distinct token sequences.
-                    #
-                    # So calibrate instead of assuming: run the span eagerly
-                    # _NOISE_SAMPLES times from the same restored state to
-                    # measure this span's own noise floor, then accept the graph
-                    # only if it lands inside it. Self-calibrating, and it
-                    # neither rubber-stamps (the old skip) nor refuses every
-                    # hybrid (a bitwise gate would). Three samples, not two: the
-                    # noise is intermittent (a pair can measure exactly 0 while
-                    # other pairs on the same span measure 2e-2), so one pair
-                    # under-estimates the floor and false-rejects a sound graph.
-                    refs = []
-                    for _ in range(_NOISE_SAMPLES):
-                        restore(); span.static_in.copy_(ins[k])
-                        r = self._run_range(span.static_in, span.start, span.end, p)
-                        torch.cuda.synchronize()
-                        refs.append(r.float().clone())
-                    noise = max(
-                        (refs[a] - refs[b]).abs().max().item()
-                        for a in range(len(refs)) for b in range(a + 1, len(refs))
-                    )
-                    r1 = refs[0]
-
-                    restore(); span.static_in.copy_(ins[k])
-                    span.graph.replay(); torch.cuda.synchronize()
-                    delta = (span.out.float() - r1).abs().max().item()
-
-                    # Allow a few multiples of the observed spread, plus a small
-                    # absolute floor so a span that happens to measure zero
-                    # noise on one pair is not held to exact equality.
-                    budget = max(noise * _NOISE_TOLERANCE, 1e-3)
-                    if delta > budget:
-                        _log(f"VERIFY FAILED for {sig} span {span}: graph differs "
-                             f"from eager by {delta:.3e}, outside this span's "
-                             f"measured noise floor {noise:.3e} (budget "
-                             f"{budget:.3e}); falling back to eager")
-                        self.rejected.add(sig)
-                        restore()
-                        return None
-                    _log(f"span {span} verified against its own noise floor: "
-                         f"delta {delta:.3e} <= budget {budget:.3e} "
-                         f"(eager-vs-eager spread {noise:.3e})")
-                    continue
-                restore()
-                span.static_in.copy_(ins[k])
-                span.graph.replay()
-                torch.cuda.synchronize()
-                if not torch.equal(span.out, outs[k]):
-                    d = (span.out.float() - outs[k].float()).abs().max().item()
-                    _log(f"VERIFY FAILED for {sig} span {span}: max abs diff "
-                         f"{d:.3e}; falling back to eager")
+                why = self._verify_span(
+                    span, ins[k], p, restore,
+                    ref = None if span.exempt else outs[k],
+                )
+                if why is None:
+                    why = self._verify_span_varied(cap, span, ins[k], p, restore)
+                if why is not None:
+                    _log(f"VERIFY FAILED for {sig} span {span}: {why}; "
+                         f"falling back to eager")
                     self.rejected.add(sig)
                     restore()
                     return None
@@ -677,7 +777,7 @@ class DecodeGraphs:
         #    passes above were all rolled back, so the state advances exactly
         #    once, as it would have on the eager path
         restore()
-        out = self._walk(cap, input_ids)
+        out = self._walk(cap, input_ids, p)
 
         if len(self.graphs) >= _MAX_GRAPHS:
             self.graphs.pop(next(iter(self.graphs)))
