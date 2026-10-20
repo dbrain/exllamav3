@@ -1044,7 +1044,29 @@ class Generator:
 
     def recurrent_checkpoint(self):
         for job in self.active_jobs:
-            job.maybe_stash_recurrent(self.recurrent_cache)
+            # 🔴 FOURTH FAILURE SITE. iterate() calls this UNGUARDED on every iteration, and
+            # maybe_stash_recurrent() holds two bare asserts (`seq.kv_position % PAGE_SIZE == 0`,
+            # `page.kv_position == PAGE_SIZE`) plus a cache.put(). A raise here escapes iterate() into
+            # AsyncGenerator._run_iteration, latches self.error and kills the generator for EVERY job --
+            # the same failure class as patches 00/04/05.
+            #
+            # We SKIP rather than reap. The stash is a pure write into the shared recurrent cache keyed by
+            # page hash; the running job generates from its own self.recurrent_state and never reads back
+            # from the cache mid-stream. So a failed stash cannot corrupt this job's output -- it only means
+            # a future job resuming this prefix has to recompute from an earlier checkpoint. Reaping a
+            # healthy generation over a failed cache write would be strictly more destructive than the
+            # degradation we are containing.
+            if getattr(job, "_exl3_stash_broken", False):
+                continue
+            try:
+                job.maybe_stash_recurrent(self.recurrent_cache)
+            except Exception as e:
+                # Latch per job: this is called every iteration, so an unlatched warning would spam the
+                # log at decode rate for the life of the generation.
+                job._exl3_stash_broken = True
+                print(f" ## Warning: recurrent checkpoint failed for job "
+                      f"{getattr(job, 'serial_number', '?')} ({repr(e)}); checkpointing "
+                      f"disabled for this job, generation continues")
 
 
     def update_visualizer(self):
@@ -2241,7 +2263,18 @@ class Generator:
         num_jobs = self.num_remaining_jobs()
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
-                job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
+                # 🔴 FIFTH FAILURE SITE, one line before the requeue guard added by
+                # 05-contain-requeue-failure.patch and reachable on the same code path: a job that yields
+                # at max_rq_tokens stashes its last checkpoint here so the replacement job can resume from
+                # it. Same asserts, same blast radius (escapes iterate() -> latches self.error -> generator
+                # dead for all). Skipping only costs the replacement job a re-prefill from an earlier
+                # checkpoint, so containment here is free.
+                try:
+                    job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
+                except Exception as e:
+                    print(f" ## Warning: recurrent stash before requeue failed for job "
+                          f"{getattr(job, 'serial_number', '?')} ({repr(e)}); the requeued "
+                          f"job will re-prefill from an earlier checkpoint")
             if _REPLY_FIRST and job not in requeuing_jobs:
                 self.deferred_jobs.append(job)   # released by flush_deferred() after the results are out
             else:
