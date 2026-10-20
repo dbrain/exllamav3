@@ -8,9 +8,16 @@ import os, sys
 from array import array
 import numpy as np
 import torch
+from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 
 class StopDraft(Exception):
     pass
+
+def text_prefix(cont):
+    # an image/video span in the context holds embedding ids: the target never emits one and a verify row cannot embed it
+    for i, t in enumerate(cont):
+        if t >= FIRST_MM_EMBEDDING_INDEX: return cont[:i]
+    return cont
 
 def ngram_match(ctx, nmin, K):
     n = len(ctx); suf = ctx[n - nmin:]
@@ -20,7 +27,7 @@ def ngram_match(ctx, nmin, K):
         if ctx[j - nmin:j] == suf:
             L = nmin
             while L < 32 and j - L - 1 >= 0 and ctx[j - L - 1] == ctx[n - L - 1]: L += 1
-            if L > best[0]: best = (L, ctx[j:j + K])
+            if L > best[0]: best = (L, text_prefix(ctx[j:j + K]))
             if L >= 16: break
     return best
 
@@ -163,7 +170,7 @@ class NgramIndex:
             self.fallbacks += 1
             return ngram_match(toks.tolist(), nmin, K)
         self._hit = (j, m)
-        return (L, toks[j:j + K].tolist())
+        return (L, text_prefix(toks[j:j + K].tolist()))
 
     def witness_len(self, cont):
         """After match(): how many leading tokens of its continuation the PREVIOUS occurrence of the matched gram also
@@ -336,7 +343,9 @@ def env_defaults(ndt):
     """(thf, thv, maxd) for install(): today's 0.6 / 0.3 / ndt unless QWSPEC_THF / QWSPEC_THV / QWSPEC_MAXD are set."""
     return _envf("QWSPEC_THF", 0.6), _envf("QWSPEC_THV", 0.3), _envf("QWSPEC_MAXD", int(ndt))
 
-def ngram_from_env(default=(2, 7, 16, 3)):
+NGRAM_DEFAULT = (2, 7, 16, 3)
+
+def ngram_from_env(default=NGRAM_DEFAULT):
     """n-gram lookup setting for install(): (gram, K, match[, cmin]) from QWSPEC_NGRAM = "gram,K,match[,cmin]"; "off" = no
     lookup (None). cmin: see install(); 0 or absent = no second-occurrence check.
     Default (2, 7, 16, 3): the lookup replaces the drafter only on a match of 16 tokens or more and then drafts 7 tokens.
@@ -649,3 +658,16 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         lm.forward = orig_lmf; dm.forward = orig_fwd; dm.sample_from_state = orig_sfs
         g.__dict__.pop("iterate_draftmodel_mtp_gen", None); g.__dict__.pop("enqueue", None)
     return uninstall
+
+def install_draft_policy(generator, rule=None, ngram=NGRAM_DEFAULT, stats=None):
+    """The draft policy of tools/qwen/serve.py on an MTP Generator (built with dynamic_draft_tokens off): depth from the
+    drafter's own top-1 probabilities under `rule` (default TierRule with maxd = generator.num_draft_tokens) and the
+    n-gram lookup `ngram` (see install(); None = no lookup). stats: optional dict of round counters. Returns an
+    uninstall function."""
+    if not getattr(generator, "mtp_draft", False):
+        raise ValueError("the draft policy needs a Generator with an MTP drafter")
+    if generator.dynamic_draft:
+        raise ValueError("the draft policy sets the draft length itself: build the Generator with dynamic_draft_tokens=False")
+    if rule is None:
+        rule = TierRule(maxd=generator.num_draft_tokens)
+    return install(generator, generator.draft_model, generator.model, ngram=ngram, stats=stats, rule=rule)
