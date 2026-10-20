@@ -64,7 +64,27 @@ def _ttrace_end(what, t):
     torch.cuda.synchronize()
     print(f"trace:   {what}: {(time.perf_counter() - t) * 1000:.1f} ms", flush=True)
 
+class ScoreGroup:
+    """
+    Score-only jobs that share a prompt prefix and are scored back to back, e.g. the questions of one
+    decision request, which all start with the same state. split_at is the length of the shared token
+    prefix. The first member to run past it leaves a private recurrent stash there and keeps its pages
+    referenced, so the later members resume at split_at, mid-page, instead of re-prefilling from the
+    last page boundary. Released by the generator when the last member finishes, fails or is cancelled.
+    """
+
+    def __init__(self, split_at: int):
+        self.split_at = split_at
+        self.pending = 0            # members enqueued and not yet retired; counted by Generator.enqueue
+        self.stash = None
+        self.anchor = None          # member whose pages hold the shared partial page
+        self.anchor_page = None     # its index in the anchor's allocated_pages
+
+
 class Job:
+
+    # Feature flag for callers that must also run against an exllamav3 without the score-only path
+    score_only_supported = True
 
     def __init__(
         self,
@@ -87,6 +107,10 @@ class Job:
         max_rq_tokens: int | None = None,
         stop_on_loop: tuple[int, int] = None,
         rq_state: dict | None = None,
+        score_only: bool = False,
+        score_token_ids: list[int] | None = None,
+        score_split_at: int | None = None,
+        score_group: ScoreGroup | None = None,
         **kwargs
     ):
         """
@@ -162,8 +186,42 @@ class Job:
         :param rq_state:
             Internal, passed when job requeues itself
 
+        :param score_only:
+            Return the logits of the position after the prompt and nothing else: no sampling, no draft, no
+            generated token. The generator runs these ahead of its pending queue, outside max_batch_size, at
+            the head of the next iterate(), and emits one result with stage "score".
+
+        :param score_token_ids:
+            With score_only, return the logits of these token ids only (float32, CPU) instead of the full row
+
+        :param score_split_at:
+            With score_only, a prompt position the job should leave a resume point at: the last page boundary
+            at or below it gets a recurrent checkpoint in the shared cache, so a later prompt sharing that
+            prefix (the same state, a different question) resumes there. Default: the last page boundary of
+            the prompt, as prefill does
+
+        :param score_group:
+            With score_only, the ScoreGroup this job belongs to
+
         :param kwargs:
         """
+
+        self.score_only = score_only
+        self.score_token_ids = list(score_token_ids) if score_token_ids is not None else None
+        self.score_split_at = score_split_at
+        self.score_group = score_group
+        self.score_started = False
+        self.score_done = False
+        self.score_plan = None
+        self.score_cached = 0
+        self.score_keep_pages = False
+        if score_only:
+            if token_healing or filters or embeddings or banned_strings or stop_on_loop:
+                raise ValueError("A score-only job takes no token healing, filters, embeddings, banned strings or loop detection")
+            if rq_state is not None:
+                raise ValueError("A score-only job never requeues")
+            max_new_tokens = 1
+            max_rq_tokens = None
 
         assert all(ids.device.type == "cpu" for ids in input_ids), \
             "input_ids must reside in system memory"
@@ -1321,7 +1379,12 @@ class Job:
                                       - 1 - self.generator.max_draft_tokens)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
-        if self.max_rq_tokens is not None:
+        if self.score_only:
+            # Pages for the prompt only: nothing is generated and nothing drafted
+            self.max_rq_tokens = 1
+            self.rq_margin = 0
+            self.rq_headroom = 0
+        elif self.max_rq_tokens is not None:
             if len(self.sequences) == 1:
                 boundary = self.generator.recurrent_checkpoint_interval \
                     if self.generator.recurrent_cache is not None else PAGE_SIZE
@@ -1343,13 +1406,19 @@ class Job:
 
         # Compatibility checks
         self._check_banned_strings(self.banned_strings)
+        if self.score_token_ids is not None:
+            # An out-of-range index would be a device-side assert, which poisons the CUDA context for good
+            vocab = self.generator.model.config.vocab_size
+            if not self.score_token_ids or not all(isinstance(t, int) and 0 <= t < vocab for t in self.score_token_ids):
+                raise ValueError(f"score_token_ids must be a non-empty list of token ids below {vocab}")
 
         # Hash full pages of input IDs
         all_unique_hashes = set()
         all_unique_pages = 0
         for seq in self.sequences:
             unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens + self.rq_headroom)
-            if self.generator.mtp_draft:
+            # A score-only job never drafts, so it needs no real target token at the end of its prefill
+            if self.generator.mtp_draft and not self.score_only:
                 seq.max_cached_pages = max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
                 cached_hashes = seq.page_hashes[:seq.max_cached_pages]
                 omitted_pages = len(seq.page_hashes) - len(cached_hashes)

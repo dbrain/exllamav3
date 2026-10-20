@@ -2,11 +2,21 @@ from __future__ import annotations
 from .generator import Generator
 from .job import Job
 import asyncio
+import os
 import torch
 
 # Sentinel pushed to an AsyncJob's queue on cancellation so a consumer parked in queue.get() wakes up and
 # exits, rather than waiting forever for results that will no longer be produced
 _CANCELLED_SENTINEL = object()
+
+def _yield_turns() -> int:
+    # A malformed value falls back rather than failing the import, i.e. the model load
+    try:
+        return max(1, int(os.environ.get("EXL3_ASYNC_YIELD_TURNS", "8")))
+    except ValueError:
+        return 8
+
+_YIELD_TURNS = _yield_turns()
 
 class AsyncGenerator:
     """
@@ -49,7 +59,13 @@ class AsyncGenerator:
 
                 # Yield back to the event loop so result consumers and cancellation requests can run between
                 # generator iterations, even if the synchronous generator immediately has more work available.
-                await asyncio.sleep(0)
+                # Several turns, not one: an incoming request needs a few (socket read, ASGI task start,
+                # middleware, handler) before it reaches enqueue(), and each turn it misses costs it a whole
+                # iterate(), which is seconds during a long prefill. Measured with one turn: a score request
+                # arriving during a 52k-token prefill waited ~22 s before its handler even started. An idle turn
+                # costs microseconds against a decode round's tens of milliseconds
+                for _ in range(_YIELD_TURNS):
+                    await asyncio.sleep(0)
 
         except asyncio.CancelledError:
             # Silently return on cancel

@@ -20,7 +20,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
-from .job import Job, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
+from .job import Job, ScoreGroup, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
 # EXL3_REPLY_FIRST=1 (default off): a job that finishes inside iterate() is released (deallocate_pages: reply-end tail
 # stash, draft flush, page / slot release) by flush_deferred() AFTER its last results are returned, not before. The server calls it
 # once the results are handed out; every iterate / cancel / clear_queue runs it first, so later work sees the same cache state in
@@ -337,6 +337,10 @@ class Generator:
         self.job_serial = 0
         self.pending_jobs = []
         self.active_jobs = []
+        # Score-only jobs (Job(score_only = True)): FIFO, run at the head of iterate(), outside max_batch_size
+        self.score_jobs = []
+        self.score_trace = os.environ.get("EXL3_SCORE_TRACE", "0") != "0"
+        self.score_yielded = False
         self.deferred_jobs = []   # EXL3_REPLY_FIRST: finished jobs not yet released
 
         # Filter threads
@@ -474,7 +478,7 @@ class Generator:
 
 
     def num_remaining_jobs(self):
-        return len(self.pending_jobs) + len(self.active_jobs)
+        return len(self.pending_jobs) + len(self.active_jobs) + len(self.score_jobs)
 
     def num_active_jobs(self):
         return len(self.active_jobs)
@@ -625,8 +629,11 @@ class Generator:
         num_jobs = self.num_remaining_jobs()
         for job in self.active_jobs + self.pending_jobs:
             job.deallocate_pages()
+        for job in list(self.score_jobs):
+            self.score_retire(job)
         self.active_jobs.clear()
         self.pending_jobs.clear()
+        self.score_jobs.clear()
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
 
@@ -657,7 +664,12 @@ class Generator:
 
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
-        self.pending_jobs.append(job)
+        if job.score_only:
+            if job.score_group is not None:
+                job.score_group.pending += 1
+            self.score_jobs.append(job)
+        else:
+            self.pending_jobs.append(job)
         if self.disk_page_cache is not None:
             # Start reading the prompt's pages that only the disk tier holds, so the allocation finds them in
             # the CPU tier (or in flight) rather than waiting on the disk itself
@@ -683,7 +695,10 @@ class Generator:
         self.flush_deferred()
         num_jobs = self.num_remaining_jobs()
 
-        if job in self.pending_jobs:
+        if job in self.score_jobs:
+            self.score_jobs.remove(job)
+            self.score_retire(job)
+        elif job in self.pending_jobs:
             self.pending_jobs.remove(job)
         elif job in self.active_jobs:
             job.deallocate_pages()
@@ -787,6 +802,7 @@ class Generator:
             # reused these pages and state slots) and refuse to run
             self.pending_jobs.clear()
             self.active_jobs.clear()
+            self.score_jobs.clear()
             raise RuntimeError(
                 "This Generator no longer owns its Cache: a newer Generator was created over the same "
                 "Cache. Close or discard the old Generator before creating a new one."
@@ -795,6 +811,19 @@ class Generator:
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
         results = []
+
+        # Score-only jobs first: they wait behind at most the round already in flight, never behind the
+        # prefill chunks this round is about to run. Results only reach their consumers when iterate()
+        # returns, so a round that produced scores returns right away instead of running a prefill chunk
+        # (seconds, at chunk_size 4096) on top. Never twice in a row, so a steady stream of score requests
+        # still leaves every other round to the regular jobs
+        if self.score_jobs:
+            self.iterate_score(results)
+            if results and not self.score_yielded and (self.active_jobs or self.pending_jobs):
+                self.score_yielded = True
+                return results
+        self.score_yielded = False
+
         _t0 = _ttrace_begin()
         self.iterate_start_jobs(results)
         _ttrace_end("start_jobs (alloc pages/restore ckpt)", _t0)
@@ -2404,6 +2433,358 @@ class Generator:
             self.on_queue_drained()
 
 
+    # ── Score-only jobs ─────────────────────────────────────────────────────────────────────────────────
+    #
+    # A score job wants the logits of the one position after its prompt. The regular path gets there with
+    # a prefill of all but the last prompt token, a full generation round for the last one (with MTP: three
+    # draft forwards and a four-wide verify whose drafts are discarded) and sampling. This path runs the
+    # uncached prompt tail as ordinary forwards and reads the last position's logits from the final one.
+    #
+    # Scheduling: score jobs never enter pending_jobs or active_jobs. iterate() advances them first, FIFO,
+    # within one prefill chunk's worth of tokens per round, so a score request waits only for the round in
+    # flight when it arrives. They do not count against max_batch_size; they do need a free recurrent state
+    # slot, and wait for one if every slot is taken.
+    #
+    # Containment: everything below runs inside iterate_score()'s try. A failure reaps that one job, as a
+    # failed prefill would, and a failed checkpoint stash is skipped with a warning, as in patch 06.
+
+    def iterate_score(self, results: list):
+        num_jobs = self.num_remaining_jobs()
+        budget = self.max_chunk_size
+        while self.score_jobs and budget > 0:
+            job = self.score_jobs[0]
+            try:
+                if not job.score_started:
+                    if not self.score_can_start(job):
+                        break
+                    self.score_start(job)
+                budget -= self.score_advance(job, budget, results)
+            except Exception as e:
+                if job in self.score_jobs:
+                    self.score_jobs.remove(job)
+                job.score_keep_pages = False
+                self.score_retire(job)
+                self.reap_failed_job(job, e, results)
+                continue
+            if not job.score_done:
+                break
+            self.score_jobs.remove(job)
+            # Hand a finished request back now rather than after every request queued behind it: results only
+            # reach their consumers when iterate() returns. A group is one request, so it finishes as a unit
+            if self.score_jobs and (job.score_group is None or self.score_jobs[0].score_group is not job.score_group):
+                break
+        if num_jobs and not self.num_remaining_jobs():
+            self.on_queue_drained()
+
+
+    def score_can_start(self, job) -> bool:
+        if self.recurrent_cache is not None and not self.cache.free_list:
+            return False
+        return job.current_new_pages_required() <= self.pagetable.num_unreferenced_pages()
+
+
+    def _score_t(self):
+        if self.score_trace:
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+
+    def score_start(self, job):
+        """
+        Claim pages and a recurrent state, and plan the forwards. Pages come from the same prefix lookup as a
+        regular job (host and durable tiers included); the resume point is the longest cached prefix with a
+        checkpoint, or the job's group's shared stash when that reaches further.
+        """
+        t0 = self._score_t()
+        job.score_started = True
+        job.score_t0 = time.time()
+        job.activate()
+        seq = job.sequences[0]
+        rc = self.recurrent_cache
+
+        protected = set(job.all_unique_hashes)
+        allocated, cached_pages, non_sequential, stashed = \
+            seq.allocate_pages(self.pagetable, rc, protected)
+        job.cached_pages += cached_pages
+        job.total_pages += allocated
+        job.non_sequential_pages += non_sequential
+
+        if rc is not None:
+            group = job.score_group
+            if group is not None and group.stash is not None and self.score_group_resume(job, seq, group):
+                stashed = group.stash
+            job.free_recurrent_state()
+            job.recurrent_state = self.score_recurrent_state(stashed, seq.kv_position)
+            job.last_recurrent_checkpoint_pos = job.recurrent_state.position
+
+        L = len(seq.sequence_ids)
+        start = seq.kv_position
+        if start >= L:
+            raise RuntimeError(f"score job resumed at {start}, past its {L}-token prompt")
+        job.score_cached = start
+
+        plan = []
+        if rc is not None:
+            split = job.score_split_at
+            if split is None or not 0 < split < L:
+                split = (L - 1) // PAGE_SIZE * PAGE_SIZE
+            boundary = split // PAGE_SIZE * PAGE_SIZE
+            if start < boundary:
+                plan.append((boundary, "checkpoint"))
+            group = job.score_group
+            if (group is not None and group.stash is None and group.pending > 1 and
+                    boundary < group.split_at < L and start < group.split_at):
+                plan.append((group.split_at, "group"))
+        plan.append((L, "logits"))
+        job.score_plan = plan
+        job.score_steps = [("start", start, L, self._score_t() - t0)]
+
+
+    def score_recurrent_state(self, stashed: dict | None, position: int) -> PairedState:
+        """
+        A score job's recurrent state: the target side only, fresh or from a stash. Score forwards never run the
+        draft model, so a draft side (a recurrent drafter, e.g. DFlash2's sliding-window ring) would stay at its
+        start while the target advanced, and the next stash or restore of the pair asserts on the mismatch
+        """
+        if not self.target_recurrent:
+            return self.new_recurrent_state() if stashed is None else \
+                self.recurrent_state_from_stashed(stashed, position = position)
+        if stashed is None:
+            return PairedState(self.cache.get_new_state(), None)
+        return PairedState(self.cache.new_from_stashed(stashed["target"], position), None)
+
+
+    def score_group_resume(self, job, seq, group) -> bool:
+        """
+        Resume a group member at the group's split point: copy the shared partial page from the anchor and take
+        the group's stash. Only when this job's own resume point is exactly the page boundary below the split,
+        i.e. the shared prefix up to that boundary is cached and checkpointed, and the anchor still holds the
+        same tokens on the same chain.
+        """
+        split = group.split_at
+        boundary = split // PAGE_SIZE * PAGE_SIZE
+        n = split - boundary
+        if n <= 0 or seq.kv_position != boundary or split >= len(seq.sequence_ids):
+            return False
+        anchor = group.anchor
+        if anchor is None or anchor is job:
+            return False
+        aseq = anchor.sequences[0]
+        pi = group.anchor_page
+        if not aseq.allocated_pages or pi >= len(aseq.allocated_pages) or pi >= len(seq.allocated_pages):
+            return False
+        src = aseq.allocated_pages[pi]
+        dst = seq.allocated_pages[pi]
+        prev_hash = seq.allocated_pages[pi - 1].phash if pi > 0 else None
+        if dst.ref_count != 1:
+            return False
+        tail = seq.sequence_ids.torch_slice(boundary, split)
+        if dst.kv_position == 0:
+            if src.kv_position < n or src.prev_hash != prev_hash or not torch.equal(src.sequence[:, :n], tail):
+                return False
+            self.cache.copy_page(self.cache, src.page_index, dst.page_index, n)
+            dst.prev_hash = prev_hash
+            dst.sequence[:, :n].copy_(tail)
+            dst.kv_position = n
+        elif not (dst.kv_position >= n and dst.prev_hash == prev_hash and torch.equal(dst.sequence[:, :n], tail)):
+            # A page this job found cached by hash (the same prompt scored before) already holds the shared
+            # tokens on the same chain and needs no copy; anything else is not safe to resume into
+            return False
+        dst.can_revert = False
+        seq.kv_position = split
+        return True
+
+
+    def score_advance(self, job, budget: int, results: list) -> int:
+        """
+        Run the job's planned forwards, at most one chunk at a time and within budget tokens (the first piece
+        always runs). Returns the number of tokens processed.
+        """
+        seq = job.sequences[0]
+        done = 0
+        while job.score_plan:
+            end, action = job.score_plan[0]
+            a = seq.kv_position
+            logits = None
+            if a < end:
+                b = end
+                limit = (a + self.max_chunk_size) // PAGE_SIZE * PAGE_SIZE
+                if limit > a:
+                    b = min(b, limit)
+                if done and done + (b - a) > budget:
+                    break
+                t0 = self._score_t()
+                logits = self.score_forward(job, seq, a, b, action == "logits" and b == end)
+                done += b - a
+                job.score_steps.append(("forward", a, b, self._score_t() - t0))
+                if b < end:
+                    continue
+            elif action == "logits":
+                raise RuntimeError("score job has no prompt token left to evaluate")
+            job.score_plan.pop(0)
+            t0 = self._score_t()
+            if action == "checkpoint":
+                self.score_checkpoint(job, seq)
+            elif action == "group":
+                self.score_group_stash(job, seq)
+            else:
+                self.score_finish(job, seq, logits, results)
+            job.score_steps.append((action, seq.kv_position, None, self._score_t() - t0))
+        return done
+
+
+    def score_forward(self, job, seq, a: int, b: int, want_logits: bool):
+        """
+        Forward prompt positions [a, b) into the job's pages and recurrent state, then update the page
+        bookkeeping exactly as Job.prefill does. Returns the last position's logits if asked.
+        """
+        ids = seq.sequence_ids.torch_slice(a, b)
+        params = {
+            "attn_mode": "flash_attn",
+            "block_table": seq.prefill_block_table(),
+            "cache": self.cache,
+            "cache_seqlens": torch.tensor([a], dtype = torch.int32),
+            "recurrent_states": [job.recurrent_state.target] if job.recurrent_state is not None and
+                                job.recurrent_state.target is not None else None,
+            "indexed_embeddings": [],
+            "inv_freq": None,
+            "mm_span_prefix": 0,
+        }
+        if want_logits:
+            params["last_tokens_only"] = 1
+            logits = self.model.forward(input_ids = ids, params = params)
+        else:
+            self.model.prefill(input_ids = ids, params = params)
+            logits = None
+
+        seq.kv_position = b
+        pages = seq.allocated_pages
+        p0 = a // PAGE_SIZE
+        p2 = min(b // PAGE_SIZE + 1, len(pages))
+        for li in range(p0, p2):
+            page = pages[li]
+            page.kv_position = min(max(b - li * PAGE_SIZE, 0), PAGE_SIZE)
+            page.prev_hash = None if li == 0 else pages[li - 1].phash
+            pf_a = max(li * PAGE_SIZE, a)
+            pf_b = min(li * PAGE_SIZE + PAGE_SIZE, b)
+            if pf_b > pf_a:
+                page.sequence[:, pf_a - li * PAGE_SIZE:pf_b - li * PAGE_SIZE].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
+            page.can_revert = False
+        for li in range(p0, p2):
+            page = pages[li]
+            if page.kv_position == PAGE_SIZE and li < len(seq.page_hashes) and page.phash != seq.page_hashes[li]:
+                job.hash_completed_page(seq, li)
+        return logits
+
+
+    @staticmethod
+    def score_state_ok(seq, state) -> bool:
+        """A state that describes exactly this sequence's prefix: at its position, with no unsettled pass."""
+        position = getattr(state, "position", None)
+        return (position is None or position == seq.kv_position) and getattr(state, "last_history", 0) == 0
+
+
+    def score_checkpoint(self, job, seq):
+        """Stash the state at a page boundary in the shared recurrent cache, as prefill's last-page stash does."""
+        try:
+            pos = seq.kv_position
+            state = job.recurrent_state
+            if state is None or pos == 0 or pos % PAGE_SIZE or not self.score_state_ok(seq, state):
+                return
+            if self.draft_recurrent:
+                # Score states carry no draft side (score_recurrent_state), and a chat resuming here needs one
+                return
+            page = seq.allocated_pages[pos // PAGE_SIZE - 1]
+            if page.kv_position != PAGE_SIZE or not is_content_hash(page.phash):
+                return
+            self.recurrent_cache.put(page.phash, state)
+            job.last_recurrent_checkpoint_pos = pos
+        except Exception as e:
+            print(f" ## Warning: score job {job.serial_number}: recurrent checkpoint failed ({e!r}); "
+                  f"skipped, the score is unaffected")
+
+
+    def score_group_stash(self, job, seq):
+        """Leave the group's private stash at its split point; this job becomes the anchor and keeps its pages."""
+        group = job.score_group
+        try:
+            state = job.recurrent_state
+            if (group is None or group.stash is not None or group.pending <= 1 or state is None or
+                    seq.kv_position != group.split_at or not self.score_state_ok(seq, state)):
+                return
+            group.stash = state.stash()
+            group.anchor = job
+            group.anchor_page = group.split_at // PAGE_SIZE
+            job.score_keep_pages = True
+        except Exception as e:
+            print(f" ## Warning: score job {job.serial_number}: group stash failed ({e!r}); "
+                  f"the other questions re-prefill from the last checkpoint")
+
+
+    def score_finish(self, job, seq, logits, results: list):
+        row = logits[0, -1, :self.model.config.vocab_size]
+        if job.score_token_ids is not None:
+            idx = torch.tensor(job.score_token_ids, dtype = torch.long, device = row.device)
+            out = row.index_select(0, idx).float().cpu()
+        else:
+            out = row.float().cpu()
+        job.score_done = True
+        now = time.time()
+        self.score_retire(job)
+        r = {
+            "job": job,
+            "stage": "score",
+            "eos": True,
+            "serial": job.serial_number,
+            "logits": out,
+            "prompt_tokens": len(seq.sequence_ids),
+            "cached_tokens": job.score_cached,
+            "time_enqueued": job.score_t0 - job.time_enqueue,
+            "time_score": now - job.score_t0,
+        }
+        if job.identifier is not None:
+            r["identifier"] = job.identifier
+        results.append(r)
+        if self.score_trace:
+            steps = " ".join(f"{k}[{a}:{b}]={dt * 1000:.1f}ms" if b is not None else f"{k}@{a}={dt * 1000:.1f}ms"
+                             for k, a, b, dt in job.score_steps)
+            print(f" -- score #{job.serial_number}: {steps} total={(now - job.score_t0) * 1000:.1f}ms")
+
+
+    def score_retire(self, job):
+        """
+        Release what a score job holds, once: its pages (unless it anchors a group still running, which keeps
+        them until the group is done) and its state slot, and its share of the group.
+        """
+        if getattr(job, "score_retired", False):
+            return
+        job.score_retired = True
+        if job.score_keep_pages:
+            job.free_recurrent_state()
+        else:
+            job.deallocate_pages()
+        group = job.score_group
+        if group is not None:
+            group.pending -= 1
+            if group.pending <= 0:
+                self.score_group_release(group)
+
+
+    def score_group_release(self, group):
+        stashed, group.stash = group.stash, None
+        anchor, group.anchor = group.anchor, None
+        if stashed is not None:
+            try:
+                # A pair stash: host tensors and/or one TP handle per side
+                host_pool.give(stashed)
+                self.recurrent_cache._release_tp(stashed)
+            except Exception as e:
+                print(f" ## Warning: releasing a score group's stash failed ({e!r})")
+        if anchor is not None:
+            anchor.score_keep_pages = False
+            anchor.deallocate_pages()
+
+
     def reap_failed_job(self, job, error, results: list):
         """
         Contain a per-job failure so the generator stays usable for other jobs: release the
@@ -2458,8 +2839,11 @@ class Generator:
             skipped_jobs = []
             for job in self.pending_jobs.copy():
 
+                # A score job running across rounds holds a recurrent state slot outside max_batch_size,
+                # so a full batch is no longer the only way to run out of slots
                 if (len(job.sequences) + current_max_batch > self.max_batch_size or
-                        job.current_new_pages_required() > self.pagetable.num_unreferenced_pages()):
+                        job.current_new_pages_required() > self.pagetable.num_unreferenced_pages() or
+                        (self.recurrent_cache is not None and len(self.cache.free_list) < len(job.sequences))):
                     skipped_jobs.append(job)
                     continue
 
