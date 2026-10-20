@@ -13,11 +13,32 @@
 #include "exl3_devctx.cuh"
 #include "exl3_moe_coop.cuh"
 #include "comp_units/exl3_moe_coop_instances.cuh"
+#include "bits_k.cuh"
 #define EXL3_MOE_COOP_DEFINE_ROT
 #include "exl3_moe_coop_kernel.cuh"
 
-static MoeCoopKernel moe_coop_kernel_a(int K, int cb, int Hi, bool wide)
+// Output rows of a launch without routed slots (top-k 0): the empty sum, plus the shared-expert term
+// when there is one. One warp per (row, 128-column chunk)
+__global__ __launch_bounds__(32)
+void exl3_moe_coop_empty_kernel(const MoeCoopParams p)
 {
+    exl3_moe_coop_ns::write_empty_row_chunk(p, blockIdx.x, blockIdx.y, threadIdx.x);
+}
+
+static MoeCoopKernel moe_coop_kernel_a(float K_, int cb, int Hi, bool wide)
+{
+    const BitsK bk = bits_from_K(K_);
+    const int K = bk.bits;
+    if (bk.half)
+    {
+        TORCH_CHECK(cb == 2, "exl3_moe_coop: half-integer bitrates require the mul1 codebook");
+        switch (K)
+        {
+            case 1: return exl3_moe_coop_kernel_a_h1(Hi, wide);
+            case 2: return exl3_moe_coop_kernel_a_h2(Hi, wide);
+            default: return exl3_moe_coop_kernel_a_h3(Hi, wide);
+        }
+    }
     switch (K)
     {
         case 1: return exl3_moe_coop_kernel_a_k1(cb, Hi, wide);
@@ -31,8 +52,20 @@ static MoeCoopKernel moe_coop_kernel_a(int K, int cb, int Hi, bool wide)
     }
 }
 
-static MoeCoopKernel moe_coop_kernel_b(int K, int cb, bool wide)
+static MoeCoopKernel moe_coop_kernel_b(float K_, int cb, bool wide)
 {
+    const BitsK bk = bits_from_K(K_);
+    const int K = bk.bits;
+    if (bk.half)
+    {
+        TORCH_CHECK(cb == 2, "exl3_moe_coop: half-integer bitrates require the mul1 codebook");
+        switch (K)
+        {
+            case 1: return exl3_moe_coop_kernel_b_h1(wide);
+            case 2: return exl3_moe_coop_kernel_b_h2(wide);
+            default: return exl3_moe_coop_kernel_b_h3(wide);
+        }
+    }
     switch (K)
     {
         case 1: return exl3_moe_coop_kernel_b_k1(cb, wide);
@@ -48,7 +81,12 @@ static MoeCoopKernel moe_coop_kernel_b(int K, int cb, bool wide)
 
 // Split-k factor: blocks per column chunk, partial outputs summed by the last-arriving block.
 // Measured ineffective.
-static int moe_coop_pick_ksplit(int max_split)
+// Split-k factor for one stage. The grid is slots x column tiles, which fills the device for a
+// routed launch (bsz x top-k slots) but not for a single-slot launch such as the shared expert
+// (one expert's tiles on a 100+ SM device): split k until there is a block per SM, keeping at
+// least 64 k-slices (1024 columns) per split so the partials and their reduction stay cheap.
+// EXL3_MOE_COOP_KSPLIT forces one factor for every stage (testing)
+static int moe_coop_pick_ksplit(int base, int kslices, int max_split, int device)
 {
     static int forced = -2;
     if (forced == -2)
@@ -56,7 +94,10 @@ static int moe_coop_pick_ksplit(int max_split)
         const char* env = std::getenv("EXL3_MOE_COOP_KSPLIT");
         forced = env ? atoi(env) : 0;
     }
-    return forced > 0 ? std::min(forced, max_split) : 1;
+    if (forced > 0) return std::min(forced, max_split);
+    const int want = CEIL_DIVIDE(DevCtx::instance().get_num_sms(device), std::max(base, 1));
+    const int kcap = std::max(kslices / 64, 1);
+    return std::max(1, std::min(std::min(want, kcap), max_split));
 }
 
 // Tile geometry per stage: the wide (128-column, 4-way k-split) tile for long k, the narrow one
@@ -91,11 +132,20 @@ static void moe_coop_smem_optin(void* kernel, int smem)
     done[kernel] = smem;
 }
 
-void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, int device, cudaStream_t stream)
+void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
 {
     MoeCoopParams p = p_in;
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
     const int slots = p.bsz * p.topk;
+    if (!slots)
+    {
+        if (p.bsz && p.H_out)
+        {
+            exl3_moe_coop_empty_kernel<<<dim3(p.bsz, CEIL_DIVIDE(p.H_out, 128)), 32, 0, stream>>>(p);
+            cuda_check(cudaPeekAtLastError());
+        }
+        return;
+    }
     const int nproj = p.gated ? 2 : 1;
     p.a_global = p.bsz > 1;
 
@@ -109,8 +159,8 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     const int base_a = slots * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
     const int base_b = slots * (p.Ho / (wide_b ? 128 : MOE_COOP_COLS));
     const int max_split = std::max(1, p.slots_max / slots);
-    p.ksplit_a = moe_coop_pick_ksplit(max_split);
-    p.ksplit_b = moe_coop_pick_ksplit(max_split);
+    p.ksplit_a = moe_coop_pick_ksplit(base_a, p.Hi / 16, max_split, device);
+    p.ksplit_b = moe_coop_pick_ksplit(base_b, p.I / 16, max_split, device);
     const int grid_a = base_a * p.ksplit_a;
     const int grid_b = base_b * p.ksplit_b;
 
@@ -135,7 +185,7 @@ MoeCoopParams exl3_moe_coop_prepare
     const c10::optional<at::Tensor>& g_bias,
     const c10::optional<at::Tensor>& u_bias,
     const c10::optional<at::Tensor>& d_bias,
-    int Kg, int Ku, int Kd,
+    float Kg, float Ku, float Kd,
     bool mcg, bool mul1,
     int act,
     float act_limit,
@@ -149,7 +199,7 @@ MoeCoopParams exl3_moe_coop_prepare
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_gate_w,
-    int& K_gu, int& K_d, int& cb
+    float& K_gu, float& K_d, int& cb
 )
 {
     TORCH_CHECK_DTYPE(ctr, kInt);
@@ -167,6 +217,7 @@ MoeCoopParams exl3_moe_coop_prepare
     p.Ho = (int) d_out.size(-1);
     p.H_out = (int) out.size(-1);
     TORCH_CHECK(p.Hi % 128 == 0 && p.I % 128 == 0 && p.Ho % 128 == 0 && p.H_out <= p.Ho, "exl3_moe_coop: Hi/I/Ho shape");
+    TORCH_CHECK(p.Hi > 0 && p.I > 0 && p.Ho > 0, "exl3_moe_coop: empty Hi/I/Ho dimension");
 
     TORCH_CHECK_DTYPE(had_g, kHalf);
     TORCH_CHECK_DTYPE(had_u, kHalf);
@@ -246,7 +297,7 @@ MoeCoopParams exl3_moe_coop_prepare
 
 void exl3_moe_coop_run
 (
-    MoeCoopParams p, int K_gu, int K_d, int cb,
+    MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
     const c10::optional<at::Tensor>& sh_out
 )
@@ -293,7 +344,7 @@ void exl3_moe_coop
     const c10::optional<at::Tensor>& g_bias,
     const c10::optional<at::Tensor>& u_bias,
     const c10::optional<at::Tensor>& d_bias,
-    int Kg, int Ku, int Kd,
+    float Kg, float Ku, float Kd,
     bool mcg, bool mul1,
     int act,
     float act_limit,
@@ -321,7 +372,7 @@ void exl3_moe_coop
         TORCH_CHECK(sh_out->is_contiguous() && sh_out->size(-1) == x.size(1) && sh_out->numel() >= x.size(0) * x.size(1),
                     "exl3_moe_coop: shared expert output shape");
     }
-    int K_gu, K_d, cb;
+    float K_gu, K_d; int cb;
     MoeCoopParams p = exl3_moe_coop_prepare(Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh,
                                             g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, gated,
                                             had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_gate_w, K_gu, K_d, cb);

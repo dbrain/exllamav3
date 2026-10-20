@@ -7,8 +7,10 @@ from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
+from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+from ..util.pinned_arena import PinnedArena
 import os
 import time as _time
 
@@ -166,9 +168,15 @@ class Linear(Module):
         ss = scale_inv.shape
         if len(ss) > 0:
             assert len(ws) == len(ss) == 2
-            assert all(w == s * 128 for w, s in zip(ws, ss))
-            weight = weight.view(ss[0], 128, ss[1], 128)
-            scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+            assert all(s == (w + 127) // 128 for w, s in zip(ws, ss)), \
+                f"fp8 scale grid {tuple(ss)} does not cover a {tuple(ws)} weight in 128x128 blocks"
+            if all(w == s * 128 for w, s in zip(ws, ss)):
+                weight = weight.view(ss[0], 128, ss[1], 128)
+                scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+            else:
+                # A dimension that is not a multiple of 128 ends in a partial block (Ling's MTP
+                # head gate: 64 rows); expand the grid over whole blocks and crop
+                scale_inv = scale_inv.repeat_interleave(128, 0)[:ws[0]].repeat_interleave(128, 1)[:, :ws[1]]
         weight = weight.float() * scale_inv
         return weight.view(ws).half()
 
@@ -206,7 +214,12 @@ class Linear(Module):
             self.used_alt_key = key == self.alt_key
             if self.used_alt_key and isinstance(key, list):
                 dev = self.device
-                weight = [self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True) for k in key]
+                weight = []
+                for k in key:
+                    # fp8 parts (Ling 3.x q/k/v) carry their own block scales: dequantize each before the concat
+                    w = self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True)
+                    scale_inv = self.config.stc.get_tensor(k + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                    weight.append(self.apply_fp8_scales_inv_(w, scale_inv) if scale_inv is not None else w)
                 bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key]
                 weight = torch.cat(weight, dim = -1)
                 bias = torch.cat(bias, dim = -1) if bias[0] is not None else None
@@ -226,7 +239,7 @@ class Linear(Module):
                 if scale_q is not None and scale_q.dim() == 2:
                     # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
                     # orientation (out, in); dequant first, then orient/pad like a plain load
-                    w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True)
+                    w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
                     weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
                     if self.transposed_load:
                         weight = weight.T
@@ -237,9 +250,12 @@ class Linear(Module):
                     scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     assert scale is None or scale_inv is None
-                    no_defer = self.no_defer_load or scale is not None or scale_inv is not None or self.weight_scale != 1.0
-                    weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
-                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)
+                    # Scaled loads are rewritten into a new tensor below: keep the raw load out of
+                    # the loader's slab blocks, where the dead copy would otherwise stay resident
+                    rescaled = self.no_defer_load or scale is not None or scale_inv is not None or self.weight_scale != 1.0
+                    no_defer = rescaled
+                    weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer, arena = not rescaled)
+                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer, arena = not rescaled)
                 if scale is not None:
                     weight = self.apply_fp8_scales_(weight, scale)
                 elif scale_inv is not None:
@@ -442,8 +458,8 @@ class Linear(Module):
         sv = opt(".sv", self.device, no_defer = True)
         svh = opt(".svh", self.device)
         trellis = stc.get_tensor(key + ".trellis", self.device)
-        mcg = opt(".mcg", "cpu")
-        mul1 = opt(".mul1", "cpu")
+        mcg = stc.get_codebook_marker(key + ".mcg", codebook_mcg_mult)
+        mul1 = stc.get_codebook_marker(key + ".mul1", codebook_mul1_mult)
         bias = opt(".bias", self.device)
         self.inner = LinearEXL3(
             self.config,
@@ -497,9 +513,13 @@ class Linear(Module):
             return
 
         def pin_alias(t):
+            # An arena of the tensor's own size rather than a tensor from torch's pinned allocator, which
+            # rounds each request up to a power of two and keeps the block after the tower is unloaded
             if not t.is_contiguous():
                 t = t.contiguous()
-            p = torch.empty(t.shape, dtype = t.dtype, device = "cpu", pin_memory = True)
+            nbytes = t.numel() * t.element_size()
+            inner._pinned_arena = PinnedArena(nbytes, f"Pinned weights of {self.key}", mapped = True, required = True)
+            p = inner._pinned_arena.tensor[:nbytes].view(t.dtype).view(t.shape)
             p.copy_(t)
             return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
 

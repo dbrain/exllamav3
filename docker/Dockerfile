@@ -46,7 +46,7 @@ ENV EXL3_ROCM_SDK=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel
     EXL3_HIPCC=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipcc \
     EXL3_HSA_LIB=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/libhsa-runtime64.so.1
 # --- Layer B: native extension. Only native sources and build scripts invalidate it. ---
-# setup.py loads exllamav3/exllamav3_ext/build_config.py and exllamav3/util/arch_list.py by file path
+# setup.py loads exllamav3/util/cuda_flags.py and exllamav3/util/arch_list.py by file path
 # (no top-level exllamav3 import) and reads the version from exllamav3/version.py; build.sh runs
 # tools/strix_halo/rebuild.sh, which sources tools/strix_halo/env.sh. Nothing else is read at build time.
 COPY setup.py build.sh pyproject.toml ./
@@ -54,6 +54,7 @@ COPY exllamav3/exllamav3_ext/ ./exllamav3/exllamav3_ext/
 COPY exllamav3/version.py ./exllamav3/version.py
 COPY exllamav3/__init__.py ./exllamav3/__init__.py
 COPY exllamav3/util/arch_list.py ./exllamav3/util/arch_list.py
+COPY exllamav3/util/cuda_flags.py ./exllamav3/util/cuda_flags.py
 COPY exllamav3/util/__init__.py ./exllamav3/util/__init__.py
 COPY tools/strix_halo/env.sh tools/strix_halo/rebuild.sh ./tools/strix_halo/
 RUN --mount=type=cache,target=/root/.cache/pip \

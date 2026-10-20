@@ -6,8 +6,10 @@ from .module import Module
 from .rmsnorm import RMSNorm
 from ..model.config import Config
 from ..ext import exllamav3_ext as ext
+from ..util.backend import HC_FOLD
 from ..util.tensor import g_tensor_cache
 import os
+import math
 from .quant.exl3 import PAD_MIN_ROWS as _PAD_MIN_ROWS, PAD_ELEMS as _PAD_ELEMS
 
 def _pad_pitch_for(k: int) -> int:
@@ -141,6 +143,35 @@ def _hc_mix_supported(device: torch.device) -> bool:
         _hc_mix_support_cache[key] = bool(support_fn(index))
     return _hc_mix_support_cache[key]
 
+# Prefill-sized GatedResidual mixes run the tiled deterministic kernel (rank-consistent under
+# TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
+_gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
+
+# Decode row counts: launch-count folds for the mHC sites (hc_mix_fused, hc_fuse.cuh). apply_ defers its
+# residual update into the next site's mix, and the RMSNorm a block runs after a mix executes inside its
+# finalize. Bit-identical to the unfused launches; EXL3_HC_FOLD selects (per-backend default in util/backend.py)
+# Kyojin's mHC decode paths take precedence when selected explicitly: EXL3_FUSE_HC_NORM (one-pass hc_mix_norm,
+# _mix_norm) or EXL3_BLOCK_GRAPH (a captured block must not leave its last apply_ deferred outside the graph)
+_ky_hc_dec = os.environ.get("EXL3_FUSE_HC_NORM", "0") != "0" or os.environ.get("EXL3_BLOCK_GRAPH", "0") == "1"
+_hc_fold = HC_FOLD and not _ky_hc_dec
+_HC_FOLD_MAX_R = 32
+
+
+def _apply_pending(pending):
+    """Run a deferred residual apply (x, y, post, comb) in place on its own x; comb None is the GatedResidual form"""
+    x, y, post, comb = pending
+    b, s, H, D = x.shape
+    R = b * s
+    ext.hc_apply(x.view(R, H, D), y.reshape(R, D), post.reshape(R, H),
+                 comb.view(R, H, H) if comb is not None else None, None, None)
+
+
+def hc_flush(params: dict):
+    """Run a deferred apply_ (held in params["hc_pending"]: the HC_FOLD decode deferral or a prefill deferral
+    of EXL3_PF_HC_FUSE / EXL3_PF_GR_FUSE) before anything other than the next site's mix reads its streams"""
+    p = params.pop("hc_pending", None)
+    if p is not None:
+        _apply_pending(p)
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -219,9 +250,9 @@ class HyperConnection(Module):
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
         stc = self.config.stc
-        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True).float().contiguous()
-        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True).float().contiguous()
-        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True).float().contiguous()
+        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True, arena = False).float().contiguous()
+        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True, arena = False).float().contiguous()
+        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True, arena = False).float().contiguous()
 
     @override
     def unload(self):
@@ -253,66 +284,77 @@ class HyperConnection(Module):
         """streams (b, s, H, D) fp32 -> (post (b,s,H), comb (b,s,H,H), collapsed (b,s,D)).
         Fused ext path (2 kernel launches, see benchmarks/hc_mix/) returns collapsed as HALF
         (both block consumers cast it immediately); the torch fallback keeps fp32."""
-        hc = self.hc_mult
-        b, s, H, D = streams.shape
-        if hasattr(ext, "hc_mix_num_chunks") and hasattr(ext, "hc_mix") \
-                and _hc_mix_supported(streams.device) \
-                and hc == 4 and streams.dtype == torch.float and D % 4 == 0 \
-                and streams.is_contiguous():
-            R = b * s
-            st = streams.view(R, H, D)
-            chunks = ext.hc_mix_num_chunks(R, H * D)
-            M1 = 2 * H + H * H + 1
-            dev = streams.device
-            # Decode-class row counts take the static workspaces (allocation latency matters and
-            # the graphed callers rely on them); prefill chunks allocate per call so the static
-            # cache holds only small buffers
-            def ws(numel, dtype, tag):
-                if R <= 32:
-                    return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
-                return torch.empty((numel,), dtype = dtype, device = dev)
-            partials = ws(R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
-            post = ws(R * H, torch.float, "hc_post").view(R, H)
-            comb = ws(R * H * H, torch.float, "hc_comb").view(R, H, H)
-            collapsed = ws(R * D, torch.half, "hc_coll").view(R, D)
-            # Small R (decode): fn in fp16 -- the (M, H * D) matrix is the partials kernel's
-            # dominant traffic and the kernel dots it in fp32 either way
-            if R <= 32 or os.environ.get("EXL3_HC_FN_HALF_PF", "0") != "0":
-                if self.fn_h is None:
-                    self.fn_h = self.fn.half()
-                fn = self.fn_h
-            else:
-                fn = self.fn
-            ext.hc_mix(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
-                       self.sinkhorn_iters, partials, post, comb, collapsed)
-            return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
-        flat = self.norm.forward(streams.flatten(2), params)
-        mix = F.linear(flat, self.fn)
-        pre_w, post_w, comb_w = mix.split([hc, hc, hc * hc], dim = -1)
-        pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
-        pre_s, post_s, comb_s = self.scale.unbind(0)
+        post, comb, y, _ = self.mix_norm(streams, params, None)
+        return post, comb, y
 
-        pre = torch.sigmoid(pre_w * pre_s + pre_b) + self.hc_eps
-        post = 2.0 * torch.sigmoid(post_w * post_s + post_b)
-        comb = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_s + comb_b.view(hc, hc)
-        comb = torch.softmax(comb, dim = -1) + self.hc_eps
-        comb = comb / (comb.sum(dim = -2, keepdim = True) + self.hc_eps)
-        for _ in range(self.sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim = -1, keepdim = True) + self.hc_eps)
-            comb = comb / (comb.sum(dim = -2, keepdim = True) + self.hc_eps)
-        collapsed = (pre.unsqueeze(-1) * streams).sum(dim = 2)
-        return post, comb, collapsed
+    def _fold_norm_ok(self, norm, D: int) -> bool:
+        from .rmsnorm import RMSNorm
+        return isinstance(norm, RMSNorm) and not norm.span_heads and norm.groups == 1 and D // 4 <= 1024 \
+            and (norm.weight is None or (norm.weight.dtype in (torch.half, torch.bfloat16) and norm.weight.numel() == D))
 
     def mix_norm(self, streams: torch.Tensor, params: dict, norm, pending = None):
-        """mix_norm with an optional deferred residual apply of the previous site (pf_can_defer).
-        With pending, streams are updated in place either way: fused when the site pair
-        qualifies, else flushed with the plain apply followed by the normal path."""
+        """mix() followed by norm (the block's RMSNorm on the collapsed output, half out), returning (post,
+        comb, y, normed): y is the normed output when the norm could be folded into the mix (normed True),
+        otherwise the collapsed output for the caller to normalize. A deferred apply_ on these streams, from
+        params["hc_pending"] or handed over as `pending` (EXL3_PF_HC_FUSE), is consumed here; any other
+        pending apply is flushed first.
+        Decode rows (R <= 32) fold through hc_mix_fused when EXL3_HC_FOLD applies (_hc_fold); otherwise
+        Kyojin's paths: the prefill apply+mix_norm fusion for a handed-over pending apply, then the one-pass
+        hc_mix_norm (EXL3_FUSE_HC_NORM), then the unfused mix"""
+        hc = self.hc_mult
+        b, s, H, D = streams.shape
+        if pending is None:
+            pending = params.pop("hc_pending", None)
+        else:
+            hc_flush(params)
+        if pending is not None and pending[0] is not streams:
+            _apply_pending(pending)
+            pending = None
+        R = b * s
+        if _hc_fold and hc == 4 and R <= _HC_FOLD_MAX_R and streams.dtype == torch.float and D % 4 == 0 \
+                and streams.is_contiguous() and hasattr(ext, "hc_mix_fused") and _hc_mix_supported(streams.device) \
+                and (pending is None or pending[3] is not None):
+            fold_norm = norm is not None and self._fold_norm_ok(norm, D)
+            if pending is not None or fold_norm:
+                chunks = ext.hc_mix_num_chunks(R, H * D)
+                M1 = 2 * H + H * H + 1
+                dev = streams.device
+                partials = g_tensor_cache.get_bucketed(dev, R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
+                post = g_tensor_cache.get_bucketed(dev, R * H, torch.float, "hc_post").view(R, H)
+                comb = g_tensor_cache.get_bucketed(dev, R * H * H, torch.float, "hc_comb").view(R, H, H)
+                collapsed = g_tensor_cache.get_bucketed(dev, R * D, torch.half, "hc_coll").view(R, D)
+                normed = g_tensor_cache.get_bucketed(dev, R * D, torch.half, "hc_normed").view(R, D) if fold_norm else None
+                if self.fn_h is None:
+                    self.fn_h = self.fn.half()
+                pend = pending
+                py, ppost, pcomb = (pend[1].view(R, D), pend[2].view(R, H), pend[3].view(R, H, H)) if pend else (None, None, None)
+                ext.hc_mix_fused(
+                    streams.view(R, H, D), py, ppost, pcomb, self.fn_h, self.base, self.scale,
+                    self.rms_eps, self.hc_eps, self.sinkhorn_iters, partials, post, comb, collapsed,
+                    norm.weight if fold_norm else None, normed,
+                    norm.rms_norm_eps if fold_norm else 0.0,
+                    norm.constant_bias if fold_norm else 0.0,
+                    norm.constant_scale if fold_norm else 1.0,
+                )
+                if fold_norm:
+                    if norm.key in params.get("export_state_norm_keys", ()):
+                        states = params.get("export_states")
+                        if states is None:
+                            states = params["export_states"] = []
+                        states.append(normed.half())
+                    return post.view(b, s, H), comb.view(b, s, H, H), normed.view(b, s, D), True
+                return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D), False
         if pending is not None:
-            fused = self._pf_apply_mix_norm(streams, params, norm, pending)
+            fused = self._pf_apply_mix_norm(streams, params, norm, pending) if norm is not None else None
             if fused is not None:
-                return fused
-            HyperConnection.flush_pending(streams, pending)
-        return self._mix_norm(streams, params, norm)
+                return *fused, True
+            _apply_pending(pending)
+        if norm is not None:
+            fused = self._mix_norm(streams, params, norm)
+            if fused is not None:
+                return *fused, True
+        post, comb, y = self._mix_unfused(streams, params)
+        return post, comb, y, False
 
     @staticmethod
     def pf_can_defer(x: torch.Tensor, y: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
@@ -338,12 +380,9 @@ class HyperConnection(Module):
     @staticmethod
     def flush_pending(x: torch.Tensor, pending) -> torch.Tensor:
         """Run a deferred residual apply (see pf_can_defer) in place on x."""
-        px, y, post, comb = pending
-        if px is not x:
+        if pending[0] is not x:
             raise RuntimeError("EXL3_PF_HC_FUSE: deferred hc apply reached a different stream tensor")
-        b, s, H, D = x.shape
-        R = b * s
-        ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H) if comb is not None else None)
+        _apply_pending(pending)
         return x
 
     def _pf_apply_mix_norm(self, streams: torch.Tensor, params: dict, norm, pending):
@@ -428,6 +467,55 @@ class HyperConnection(Module):
                         norm.rms_norm_eps, norm.constant_bias, norm.constant_scale)
         return post.view(b, s, H), comb.view(b, s, H, H), y
 
+    def _mix_unfused(self, streams: torch.Tensor, params: dict):
+        hc = self.hc_mult
+        b, s, H, D = streams.shape
+        if hasattr(ext, "hc_mix_num_chunks") and hasattr(ext, "hc_mix") \
+                and _hc_mix_supported(streams.device) \
+                and hc == 4 and streams.dtype == torch.float and D % 4 == 0 \
+                and streams.is_contiguous():
+            R = b * s
+            st = streams.view(R, H, D)
+            chunks = ext.hc_mix_num_chunks(R, H * D)
+            M1 = 2 * H + H * H + 1
+            dev = streams.device
+            # Decode-class row counts take the static workspaces (allocation latency matters and
+            # the graphed callers rely on them); prefill chunks allocate per call so the static
+            # cache holds only small buffers
+            def ws(numel, dtype, tag):
+                return g_tensor_cache.get_scratch(dev, numel, dtype, tag, R)
+            partials = ws(R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
+            post = ws(R * H, torch.float, "hc_post").view(R, H)
+            comb = ws(R * H * H, torch.float, "hc_comb").view(R, H, H)
+            collapsed = ws(R * D, torch.half, "hc_coll").view(R, D)
+            # Small R (decode): fn in fp16 -- the (M, H * D) matrix is the partials kernel's
+            # dominant traffic and the kernel dots it in fp32 either way
+            if R <= 32 or os.environ.get("EXL3_HC_FN_HALF_PF", "0") != "0":
+                if self.fn_h is None:
+                    self.fn_h = self.fn.half()
+                fn = self.fn_h
+            else:
+                fn = self.fn
+            ext.hc_mix(st, fn, self.base, self.scale, self.rms_eps, self.hc_eps,
+                       self.sinkhorn_iters, partials, post, comb, collapsed)
+            return post.view(b, s, H), comb.view(b, s, H, H), collapsed.view(b, s, D)
+        flat = self.norm.forward(streams.flatten(2), params)
+        mix = F.linear(flat, self.fn)
+        pre_w, post_w, comb_w = mix.split([hc, hc, hc * hc], dim = -1)
+        pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
+        pre_s, post_s, comb_s = self.scale.unbind(0)
+
+        pre = torch.sigmoid(pre_w * pre_s + pre_b) + self.hc_eps
+        post = 2.0 * torch.sigmoid(post_w * post_s + post_b)
+        comb = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_s + comb_b.view(hc, hc)
+        comb = torch.softmax(comb, dim = -1) + self.hc_eps
+        comb = comb / (comb.sum(dim = -2, keepdim = True) + self.hc_eps)
+        for _ in range(self.sinkhorn_iters - 1):
+            comb = comb / (comb.sum(dim = -1, keepdim = True) + self.hc_eps)
+            comb = comb / (comb.sum(dim = -2, keepdim = True) + self.hc_eps)
+        collapsed = (pre.unsqueeze(-1) * streams).sum(dim = 2)
+        return post, comb, collapsed
+
     def apply_(
         self,
         x: torch.Tensor,
@@ -442,12 +530,18 @@ class HyperConnection(Module):
         path: the capture and advance passes forward the SAME stored input states twice."""
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
+        hc_flush(params)
         if hasattr(ext, "hc_apply") and not converting and _hc_mix_supported(x.device) \
                 and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
-            ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H))
+            # ROCm, decode rows: hand the update to the next site's mix (mix_norm), which runs it inside its
+            # partials kernel. Not while states are exported or under TP, where other readers see the streams
+            if _hc_fold and R <= _HC_FOLD_MAX_R and not params.get("export_state_layers") and "backend" not in params:
+                params["hc_pending"] = (x, y, post, comb)
+                return x
+            ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H), None, None)
             return x
         return post.unsqueeze(-1) * y.float().unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x)
 
@@ -510,20 +604,36 @@ class GatedResidual(Module):
     with comb = None. Final-mixer form (use_combine = False, HF hyper_connection_mixer): a
     standalone module whose forward() collapses the stack.
 
-    Two compute paths sharing the hc_mix.cu machinery: small R (decode) runs the fused
-    ext.gr_mix pair (per-stream partial dots on the raw streams + a finalize that derives the
-    low-rank gate inline), large R (prefill) runs half GEMMs + a few elementwise ops where
-    launch count amortizes and tensor cores carry the FLOPs. apply_() is ext.hc_apply without
-    a comb (x[h] += post[h] * y), shared with mHC. _mix_ref() keeps the fp32 torch reference
-    the parity tests compare against.
+    Three compute paths: small R (decode) runs the fused ext.gr_mix pair (per-stream partial
+    dots on the unnormalized streams + a finalize that derives the low-rank gate inline); large
+    R (prefill) runs the tiled ext.gr_mix_tiled kernels (hc_mix_tiled.cu: int8 tensor-core
+    tiles over the row stack with exact integer accumulation and a fixed fp32 combination, so
+    replicated TP ranks of any sm_80+ architecture produce identical streams and any
+    replicated decision downstream agrees — the tiled int8 kernels need cp.async and
+    mma.m16n8k32 s8, both sm_80+, so pre-Ampere devices take the cuBLAS path below
+    (device-dependent, but uniform within a single-arch fleet),
+    or, where the shape does not fit that kernel or EXL3_GR_MIX_TILED=0, half cuBLAS GEMMs +
+    a few elementwise ops. apply_() is ext.hc_apply without a comb (x[h] += post[h] * y),
+    shared with mHC. _mix_ref() keeps the fp32 torch reference the parity tests compare
+    against.
+
+    One resident table set serves both kernel paths: the fp16 projection (proj_h, unfolded) and
+    the repacked up table. The tiled path derives its int8 hi/lo tables from them per call (a
+    deterministic per-row split, so the tables are the same bytes every call), and the decode
+    kernel takes the norm weight on the stream side instead of folded into the table: apply_()
+    of the preceding site writes the next site's weighted stream copy while the updated streams
+    are in its registers (link_sites wires the successors), handed over through params; a mix
+    that finds no copy for itself (first site after the stream expansion, a PLE layer or device
+    boundary in between, MTP drafts) lets the kernel apply the weight in its inner loop.
 
     Tensors: {key}.hc_norm.weight, {key}.input_mix_weight_down.weight,
     {key}.input_mix_weight_up.weight and, for the site form, {key}.block_inject_weight.weight.
     """
 
-    # Rows at or below this take the fused small-R mixer (int8 weights on ROCm); 0 forces the precise GEMM path for every
-    # row count. EXL3_HC_FUSED_MAX_R overrides at import.
-    FUSED_MAX_R = int(os.environ.get("EXL3_HC_FUSED_MAX_R", "32"))
+    # Rows at or below this take the fused small-R mixer; 0 forces the prefill path for every row count.
+    # EXL3_HC_FUSED_MAX_R overrides at import. Default 8 (beyond this the tiled int8 path is cheaper, flat ~37 us
+    # on a PRO 6000 vs 53 us fused at 16 rows), 32 with Kyojin's int8 fused mixer (ROCm, EXL3_HIP_GR_MIX_Q8)
+    FUSED_MAX_R = int(os.environ.get("EXL3_HC_FUSED_MAX_R", "32" if _GR_MIX_Q8 else "8"))
     # hc_mix kernels launch dim3(n_chunks, R): grid.y = R is limited to 65535 by HIP/CUDA, so one forward of 65536+ rows fails at its first mix launch
     MAX_FORWARD_ROWS = 65535
     # small-R fused mixer weight format. None = the load-time default (int8 when use_q8, else fp16); "fp16" runs the
@@ -555,53 +665,72 @@ class GatedResidual(Module):
         self.up_h = None            # (hc_mult * hidden, rank) half, checkpoint orientation
         self.upx_h = None           # (hc_mult, hidden / 4, rank, 4) half (fused-kernel layout)
         self.inject_h = None        # (hc_mult, hc_mult * hidden) half (site form)
-        self.proj_h = None          # cat(down, inject) half, unfolded (GEMM path)
-        self.fn_h = None            # cat(down, inject) * w half, folded (fused path)
+        self.proj_h = None          # cat(down, inject) half, zero-padded to a multiple of 64
+                                    # rows for the tiled path (other paths use [:proj_m])
+        self.proj_m = 0             # rows of proj_h in use: rank (+ hc_mult in the site form)
+        self.rank = 0
+        self.tiled = False          # prefill mixes take the tiled deterministic kernel
+        self.next_site = None       # GatedResidual whose mix follows this site's apply_ (link_sites)
         self.use_q8 = False         # int8 fused-path weights (ROCm), see _prepare
         self.fn_q8 = self.fn_scale = self.upx_q8 = self.up_scale = None
         self.fn_g8 = self.fn_gs = self.upx_g8 = self.up_gs = None     # group-scaled int8 set (EXL3_GR_GS=2)
-        self.rank = 0
 
     @override
-    def load(self, device: torch.device, **kwargs):
+    def load(self, device: torch.device, keep_source_weights: bool = False, **kwargs):
+        """keep_source_weights: keep the fp16 projection tables after the kernel-layout copies
+        are built. Conversion needs them (get_tensors exports the original weights); inference
+        does not, and they are a third copy of 1.3 GB on Qwen3.8-class models."""
         super().load(device, **kwargs)
         stc = self.config.stc
         self.norm_w_raw = stc.get_tensor(f"{self.key}.hc_norm.weight", device, no_defer = True)
-        down = stc.get_tensor(f"{self.key}.input_mix_weight_down.weight", device, no_defer = True)
-        up = stc.get_tensor(f"{self.key}.input_mix_weight_up.weight", device, no_defer = True)
+        # Sources only: _prepare copies them into the kernel layouts, so keep them out of the
+        # loader's slab blocks or the dead copies stay resident
+        down = stc.get_tensor(f"{self.key}.input_mix_weight_down.weight", device, no_defer = True, arena = False)
+        up = stc.get_tensor(f"{self.key}.input_mix_weight_up.weight", device, no_defer = True, arena = False)
         inject = stc.get_tensor(f"{self.key}.block_inject_weight.weight", device,
-                                no_defer = True) if self.use_combine else None
-        self._prepare(down, up, inject)
+                                no_defer = True, arena = False) if self.use_combine else None
+        self._prepare(down, up, inject, keep_source_weights)
 
-    def _prepare(self, down, up, inject):
-        # Derived buffers are deduplicated (down/inject live as views of proj_h; up is kept in
-        # its checkpoint orientation and the GEMM path transposes by view), and the fp32 folding
-        # intermediates go through a REUSED scratch: load interleaves these preparations with
-        # the persistent weight allocations, and per-site transient churn splinters the
-        # allocator's segments (measured ~15 GB reserved-not-allocated on the full model)
-        from ..util.tensor import g_tensor_cache
+    def _prepare(self, down, up, inject, keep_source_weights: bool = False):
+        # Derived buffers are deduplicated: down/inject live as views of proj_h, up is kept in
+        # its checkpoint orientation (the GEMM path transposes by view) only while the sources
+        # are wanted, and the fused decode kernel reads the repacked copy
         dev = down.device
         H, Dh = self.hc_mult, self.hidden_size
         self.norm_w = (self.norm_w_raw.float() + 1.0).view(H, Dh).contiguous()
         self.w_h = self.norm_w.flatten().half().contiguous()
         self.rank = down.shape[0]
+        M = self.rank + (0 if inject is None else inject.shape[0])
+        Mpad = -(-M // 64) * 64
+        self.proj_m = M
+        self.proj_h = torch.zeros((Mpad, H * Dh), dtype = torch.half, device = dev)
+        self.proj_h[: self.rank].copy_(down)
         if inject is None:
-            self.proj_h = down.half().contiguous()
             self.inject_h = None
         else:
-            self.proj_h = torch.cat((down.half(), inject.half())).contiguous()
-            self.inject_h = self.proj_h[self.rank :]
+            self.proj_h[self.rank : M].copy_(inject)
+            self.inject_h = self.proj_h[self.rank : M]
         self.down_h = self.proj_h[: self.rank]
-        M = self.proj_h.shape[0]
-        tmp = g_tensor_cache.get_bucketed(dev, M * H * Dh, torch.float, "gr_prep_tmp") \
-            .view(M, H * Dh)
-        tmp.copy_(self.proj_h)
-        tmp *= self.w_h.float()
+        # Tiled kernel constraints (hc_mix_tiled.cu): H = 4, D a multiple of 128, rank of 64,
+        # at most 512 padded proj rows. Its int8 tensor-core path takes the projection tables
+        # pre-quantized per row (14-bit fixed point split into two int8 slices, det_quant_weight)
+        # (the TP loader stages modules on the CPU in the parent process; workers rebuild them
+        # on their devices, so the int8 tables are only prepared for CUDA-resident copies)
+        # The tiled int8 kernels use cp.async and mma.m16n8k32 s8 — sm_80+
+        # instructions — so on CUDA the path is Ampere+ only (ROCm runs it on RDNA's int8
+        # WMMA, rocm/det_gemm_rocm.cuh); elsewhere the cuBLAS fallback serves the projection.
+        self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
+            and Mpad <= 512 and ext.HAS_GR_MIX_TILED and dev.type == "cuda" \
+            and torch.cuda.get_device_capability(dev)[0] >= 8
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
         self.use_q8 = _GR_MIX_Q8 and hasattr(ext, "gr_mix_q8") and dev.type == "cuda"
         if self.use_q8:
-            # Symmetric per-row int8: fn row j (the dot product's output) and up output column
-            # h*D+d both get one scale, applied once per result inside the kernel
+            # Symmetric per-row int8 over the norm-folded table: fn row j (the dot product's output) and up
+            # output column h*D+d both get one scale, applied once per result inside the kernel. The fold
+            # intermediate goes through a reused scratch (per-site transient churn splinters the allocator)
+            tmp = g_tensor_cache.get_bucketed(dev, M * H * Dh, torch.float, "gr_prep_tmp").view(M, H * Dh)
+            tmp.copy_(self.proj_h[:M])
+            tmp *= self.w_h.float()
             sc = tmp.abs().amax(dim = 1).clamp_min_(1e-12) / 127.0
             self.fn_q8 = torch.round(tmp / sc[:, None]).clamp_(-127, 127).to(torch.int8).contiguous()
             self.fn_scale = sc.contiguous()
@@ -620,24 +749,26 @@ class GatedResidual(Module):
                     self.fn_g8, self.fn_gs, self.upx_g8, self.up_gs = gq
                 else:
                     self.fn_q8, self.fn_scale, self.upx_q8, self.up_scale = gq
-            if _GR_KEEP_ALL:
-                self.fn_h = tmp.half().contiguous()
-                self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank).permute(0, 1, 3, 2).contiguous()
-            else:
-                self.fn_h = None
-                self.upx_h = None
+            # The fp16 fused kernel's repacked up is only resident on request; the tiled path reads up_h
+            self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank).permute(0, 1, 3, 2).contiguous() \
+                if _GR_KEEP_ALL else None
             del up32, upq
         else:
-            self.fn_h = tmp.half().contiguous()
             # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
             self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
                 .permute(0, 1, 3, 2).contiguous()
+        # Kyojin's prefill paths (int8 mixer, EXL3_GR_HIP, EXL3_PF_GR_FUSE) read the checkpoint-layout up
+        ky_pf = self.use_q8 or os.environ.get("EXL3_GR_HIP", "0") == "1" or os.environ.get("EXL3_PF_GR_FUSE", "0") == "1"
+        if self.tiled and not keep_source_weights and not ky_pf and _hc_mix_supported(dev):
+            # Every inference consumer reads proj_h directly or the repacked up (the tiled path
+            # derives its int8 tables per call, _tiled_tables): release the checkpoint-layout up
+            self.up_h = None
 
     @override
     def unload(self):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
-        self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = self.fn_h = None
+        self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = None
         self.fn_q8 = self.fn_scale = self.upx_q8 = self.up_scale = None
         self.fn_g8 = self.fn_gs = self.upx_g8 = self.up_gs = None
 
@@ -647,8 +778,13 @@ class GatedResidual(Module):
             return self.fn_g8, self.fn_gs, self.upx_g8, self.up_gs
         return self.fn_q8, self.fn_scale, self.upx_q8, self.up_scale
 
+    def _fused_q8(self) -> bool:
+        mode = self.MIX_MODE
+        return self.use_q8 if mode is None else (mode == "q8")
+
     @override
     def get_tensors(self):
+        self._require_source_weights("get_tensors")
         t = {
             f"{self.key}.hc_norm.weight": self.norm_w_raw.contiguous(),
             f"{self.key}.input_mix_weight_down.weight": self.down_h.contiguous(),
@@ -667,9 +803,15 @@ class GatedResidual(Module):
     def optimizer_targets(self):
         return []
 
+    def _require_source_weights(self, what):
+        assert self.up_h is not None, \
+            f"GatedResidual {self.key}: {what} needs the fp16 source weights, released after load " \
+            f"(load with keep_source_weights = True, as conversion does)"
+
     def _mix_ref(self, streams: torch.Tensor):
         """fp32 torch reference of the mix (the parity tests' ground truth): returns
         (post (b, s, H) or None, mixed (b, s, D)), both fp32."""
+        self._require_source_weights("the reference path")
         x = streams.float()
         normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim = True) + self.rms_eps) * self.norm_w
         flat = normed.flatten(-2)
@@ -680,10 +822,73 @@ class GatedResidual(Module):
             if self.use_combine else None
         return post, mixed
 
-    def _mix(self, streams: torch.Tensor, cached: bool = True, pad_ok: bool = False, pending = None):
+    @staticmethod
+    def link_sites(modules: list):
+        """Wire each site's successor for the weighted-copy handoff (apply_ -> next mix), from
+        the model's module list in forward order: the two sites of a block, the mlp site to the
+        next block's attn site, the last to the final mixer. Any other module between two sites
+        (PLE layers add into the streams in place) breaks the chain, so that site's successor
+        falls back to the in-kernel weighting."""
+        prev = None
+        for m in modules:
+            attn_hc, mlp_hc = getattr(m, "attn_hc", None), getattr(m, "mlp_hc", None)
+            if isinstance(m, GatedResidual):
+                sites = [m]
+            elif isinstance(attn_hc, GatedResidual) or isinstance(mlp_hc, GatedResidual):
+                sites = [hc for hc in (attn_hc, mlp_hc) if isinstance(hc, GatedResidual)]
+            else:
+                if prev is not None:
+                    prev.next_site = None
+                prev = None
+                continue
+            for site in sites:
+                if prev is not None:
+                    prev.next_site = site
+                prev = site
+        if prev is not None:
+            prev.next_site = None
+
+    def _weighted_copy(self, s3: torch.Tensor, params: dict | None):
+        """The weighted stream copy the previous site's apply_ left for this mix, or None. The
+        entry is consumed either way (a mix without its copy would otherwise leave a stale one
+        behind) and only honored for the same stream tensor on the same device."""
+        if params is None:
+            return None
+        ent = params.pop("gr_weighted", None)
+        if ent is None or ent[0] is not self or ent[1] != s3.data_ptr():
+            return None
+        xw = ent[2]
+        if xw.device != s3.device or xw.shape != s3.shape:
+            return None
+        return xw
+
+    def _tiled_tables(self, ws):
+        """Per-call int8 hi/lo tables (+ per-row fp32 scales) for the tiled kernel, derived from
+        the resident fp16 tables: det_quant_weight is a deterministic per-row split, so the
+        bytes match a stored copy. up goes back to its checkpoint orientation first."""
+        H, Dh = self.hc_mult, self.hidden_size
+        Mpad = self.proj_h.shape[0]
+        proj_i8 = ws((2, Mpad, H * Dh), torch.int8)
+        proj_sb = ws((Mpad,), torch.float)
+        ext.det_quant_weight(self.proj_h, proj_i8, proj_sb)
+        if self.up_h is not None:
+            up = self.up_h
+        else:
+            up = ws((H * Dh, self.rank), torch.half).view(H, Dh // 4, 4, self.rank)
+            up.copy_(self.upx_h.permute(0, 1, 3, 2))
+            up = up.view(H * Dh, self.rank)
+        up_i8 = ws((2, H * Dh, self.rank), torch.int8)
+        up_sb = ws((H * Dh,), torch.float)
+        ext.det_quant_weight(up, up_i8, up_sb)
+        return proj_i8, proj_sb, up_i8, up_sb
+
+    def _mix(self, streams: torch.Tensor, cached: bool = True, params: dict | None = None,
+             pad_ok: bool = False, pending = None):
         """streams (b, s, H, D) fp32 -> (post (R, H) fp32 or None, mixed (R, D) half).
         cached: small-R outputs may come from the per-device static workspaces (see below);
-        callers that hold the result across another mix on the device pass False."""
+        callers that hold the result across another mix on the device pass False.
+        pending: the previous site's deferred apply (EXL3_PF_GR_FUSE, see gr_can_defer), run inside
+        the prefill norm pass. pad_ok: the consumer accepts a row-padded mixed (EXL3_GR_HIP path)."""
         H, Dh = self.hc_mult, self.hidden_size
         R = streams.shape[0] * streams.shape[1]
         if R > self.MAX_FORWARD_ROWS:
@@ -694,42 +899,64 @@ class GatedResidual(Module):
         if not s3.is_contiguous():
             s3 = s3.contiguous()
         dev = s3.device
+        xw = self._weighted_copy(s3, params)
         has_gr_mix = hasattr(ext, "gr_mix")
         native_mix = has_gr_mix and _hc_mix_supported(dev)
         if not has_gr_mix or (R <= self.FUSED_MAX_R and not native_mix):
+            assert pending is None
             post, mixed = self._mix_ref(s3.view(1, R, H, Dh))
             return (post.view(R, H) if post is not None else None), mixed.view(R, Dh).half()
+
+        fuse = _GR_PF_FUSE and dev.type == "cuda" and torch.version.hip is not None
+        gr_hip_ok = (R > 32 and os.environ.get("EXL3_GR_HIP", "0") == "1" and fuse and self.use_combine and H == 4
+                     and self.proj_m == 324 and self.proj_h.shape[1] == 10240
+                     and self.up_h is not None and tuple(self.up_h.shape) == (10240, 320)
+                     and self.proj_h.dtype == torch.half and self.up_h.dtype == torch.half
+                     and self.proj_h.is_contiguous() and self.up_h.is_contiguous())
 
         if R <= self.FUSED_MAX_R:
             # Decode/MTP-class row counts (the fused path's whole domain) take bucketed
             # workspaces from the per-device static cache, shared by every GatedResidual site
             # on the device: a site's outputs are consumed (block input, apply_) before the
             # next site mixes on the same stream, so one set per device suffices and no
-            # per-site statics are needed. Sized by numel, so a rebuilt fn_h with another rank
+            # per-site statics are needed. Sized by numel, so a rebuilt proj_h with another rank
             # simply lands in a different bucket; nearby R share a backing via slices.
             def ws(numel, dtype, tag):
                 if cached:
                     return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
                 return torch.empty((numel,), dtype = dtype, device = dev)
-            M = self.proj_h.shape[0] + 1
+            M = self.proj_m + 1
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            mode = self.MIX_MODE
-            q8 = self.use_q8 if mode is None else (mode == "q8")
-            if q8:
+            if self._fused_q8():
                 fq, fsc, uq, usc = self.q8_set()
                 ext.gr_mix_q8(s3, fq, fsc, uq, usc, self.w_h, self.rms_eps, dots, post, mixed)
             else:
-                ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+                ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+        elif self.tiled and pending is None and not gr_hip_ok:
+            # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
+            # reuses segments across chunk sizes), never statics
+            def ws(shape, dtype):
+                numel = math.prod(shape)
+                buf = torch.empty((1 << (numel - 1).bit_length(),), dtype = dtype, device = dev)
+                return buf[: numel].view(shape)
+            Mpad = self.proj_h.shape[0]
+            proj_i8, proj_sb, up_i8, up_sb = self._tiled_tables(ws)
+            S = ext.gr_mix_tiled_slices(R, Dh, Mpad)
+            Rpad = -(-R // 64) * 64
+            post = ws((R, H), torch.float) if self.use_combine else None
+            mixed = ws((R, Dh), torch.half)
+            ext.gr_mix_tiled(
+                s3, self.w_h, proj_i8, proj_sb, up_i8, up_sb, self.rms_eps, self.proj_m,
+                ws((S, Rpad, Mpad), torch.float), ws((S, Rpad), torch.float), ws((R, H), torch.float),
+                ws((2, R, self.rank), torch.int8), ws((R, self.rank // 64), torch.float), post, mixed
+            )
         else:
+            self._require_source_weights("the cuBLAS path")
+            proj = self.proj_h[: self.proj_m]
             post = torch.empty((R, H), dtype = torch.float, device = dev) \
                 if self.use_combine else None
-            fuse = _GR_PF_FUSE and dev.type == "cuda" and torch.version.hip is not None
-            gr_hip_ok = (R > 32 and os.environ.get("EXL3_GR_HIP", "0") == "1" and fuse and self.use_combine and H == 4
-                         and tuple(self.proj_h.shape) == (324, 10240) and tuple(self.up_h.shape) == (10240, 320)
-                         and self.proj_h.dtype == torch.half and self.up_h.dtype == torch.half
-                         and self.proj_h.is_contiguous() and self.up_h.is_contiguous())
             # gr_g1 reads normed rows of H * Dh fp16 = 20480 B, a pitch the GEMM-style tile loads read at a fraction of
             # the rate; with the hand kernels (gr_g1, gr_g2s) and gr_norm all taking a token pitch, normed is a (R, H*Dh + 64) buffer.
             # Same values, bit-exact. EXL3_OPROJ_PAD=0 turns it off.
@@ -766,7 +993,7 @@ class GatedResidual(Module):
                 gr_hip = _gr_hip()
                 if gr_hip is not None:
                     t = torch.empty((R, self.rank), dtype = torch.half, device = dev)
-                    gr_hip.gr_g1(normed.view(R, H * Dh), self.proj_h, t, post)
+                    gr_hip.gr_g1(normed.view(R, H * Dh), proj, t, post)
                     # the block input feeds qkv / z / q|gate; at a 5120 B row pitch their GEMMs read it ~7 % slower
                     # than at a padded pitch. gr_g2s writes mixed at row pitch Dh + 64 when the consumer accepts a padded view
                     # (pad_ok, set by the transformer for the attention site only). EXL3_OPROJ_PAD=0 turns it off.
@@ -778,7 +1005,7 @@ class GatedResidual(Module):
                     gr_hip.gr_g2s(t, self.up_h, normed, mixed)
                     return post, mixed
             assert xp == H * Dh
-            dm = torch.matmul(normed.view(R, H * Dh), self.proj_h.t())     # (R, rank [+ H])
+            dm = torch.matmul(normed.view(R, H * Dh), proj.t())            # (R, rank [+ H])
             t = F.silu(dm[:, : self.rank] / H)
             if self.use_combine:
                 post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
@@ -800,7 +1027,8 @@ class GatedResidual(Module):
             return False
         if "quant_preserve" in params or "capture" in params or not self.use_combine or post is None:
             return False
-        if not hasattr(ext, "gr_mix") or not _hc_mix_supported(x.device) or torch.version.hip is None:
+        if not hasattr(ext, "gr_mix") or not _hc_mix_supported(x.device) or torch.version.hip is None \
+                or self.up_h is None:
             return False
         if x.dim() != 4 or x.shape[2] != self.hc_mult or x.shape[3] != self.hidden_size:
             return False
@@ -816,9 +1044,15 @@ class GatedResidual(Module):
                                         and pending[0] is streams):
             HyperConnection.flush_pending(streams, pending)
             pending = None
-        post, mixed = self._mix(streams, pending = pending, pad_ok = bool(params.get("hc_pad_ok")) and "capture" not in params
+        post, mixed = self._mix(streams, params = params, pending = pending,
+                                pad_ok = bool(params.get("hc_pad_ok")) and "capture" not in params
                                 and "quant_preserve" not in params and "ovr" not in params and "reconstruct" not in params)
         return post.view(b, s, self.hc_mult), None, mixed.view(b, s, self.hidden_size)
+
+    def mix_norm(self, streams: torch.Tensor, params: dict, norm, pending = None):
+        """HyperConnection.mix_norm interface: the norm is never folded here (normed False)"""
+        post, comb, y = self.mix(streams, params, pending)
+        return post, comb, y, False
 
     def apply_(
         self,
@@ -838,22 +1072,34 @@ class GatedResidual(Module):
                 or y.dtype not in (torch.half, torch.float) or not y.is_contiguous() \
                 or post.dtype != torch.float or not post.is_contiguous():
             return x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
-        y2 = y.reshape(b * s, self.hidden_size)
+        R = b * s
+        y2 = y.reshape(R, self.hidden_size)
+        x3 = x.view(R, self.hc_mult, self.hidden_size)
+        # Decode-class rows: also emit the successor's weighted stream copy for its fused mix
+        # (the prefill path applies the weight itself). Same static bucket for every site on
+        # the device: the copy is consumed by the very next mix on the stream.
+        nxt = self.next_site
+        xw = None
+        if nxt is not None and R <= nxt.FUSED_MAX_R and not nxt._fused_q8() and nxt.w_h is not None \
+                and nxt.w_h.device == x.device:
+            xw = g_tensor_cache.get_bucketed(x.device, x3.numel(), torch.float, "gr_apply_xw").view(x3.shape)
         ext.hc_apply(
-            x.view(b * s, self.hc_mult, self.hidden_size),
+            x3,
             y2.contiguous(),
-            post.reshape(b * s, self.hc_mult).contiguous(),
+            post.reshape(R, self.hc_mult).contiguous(),
             None,
+            nxt.w_h if xw is not None else None,
+            xw,
         )
+        if xw is not None:
+            params["gr_weighted"] = (nxt, x3.data_ptr(), xw)
         return x
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         """Final-mixer form only: collapse the stream stack."""
         assert not self.use_combine, "site-form GatedResidual is consumed via mix()/apply_()"
-        pending = params.pop("hc_pending", None)
-        if pending is not None:
-            HyperConnection.flush_pending(x, pending)
+        hc_flush(params)
         # MTP trunk tap: models without a final norm export the PRE-collapse stream stack here
         # (flattened), the analog of the RMSNorm export hook
         if self.key in params.get("export_state_norm_keys", ()):
@@ -863,13 +1109,15 @@ class GatedResidual(Module):
             states.append(x.flatten(-2).half())
         b, s = x.shape[:2]
         # Conversion passes hold this output while other modules run; give them fresh tensors
-        _, mixed = self._mix(x, cached = "capture" not in params and "quant_preserve" not in params)
+        _, mixed = self._mix(x, cached = "capture" not in params and "quant_preserve" not in params, params = params)
         mixed = mixed.view(b, s, self.hidden_size)
         dt = out_dtype or self.out_dtype
         return mixed if dt is None else mixed.to(dt)
 
     def tp_export(self, plan, producer):
         # Streams are replicated across TP workers (like the residual), so plain replication
+        # The parent loads on the CPU (no kernel tables built there), so the sources are present
+        self._require_source_weights("tp_export")
         return {
             "cls": GatedResidual,
             "kwargs": {
@@ -928,9 +1176,9 @@ class HyperHead(Module):
         if self.mean:
             return
         stc = self.config.stc
-        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True).float().contiguous()
-        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True).float().contiguous()
-        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True).float().contiguous()
+        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True, arena = False).float().contiguous()
+        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True, arena = False).float().contiguous()
+        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True, arena = False).float().contiguous()
 
     @override
     def unload(self):
@@ -975,6 +1223,8 @@ class HyperHead(Module):
                 "hc_mult": self.hc_mult,
                 "rms_norm_eps": self.rms_eps,
                 "hc_eps": self.hc_eps,
+                # GLM5.3: parameterless mean over the streams (fn/base/scale are None)
+                "mean": self.mean,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),
@@ -993,10 +1243,13 @@ class HyperHead(Module):
         return module
 
     @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        hc_flush(params)
+        return super().prepare_for_device(x, params)
+
+    @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
-        pending = params.pop("hc_pending", None)
-        if pending is not None:
-            HyperConnection.flush_pending(x, pending)
+        hc_flush(params)
         if self.mean:
             # MTP tap (EXL3_MTP_PRENORM_H, default OFF): the reference feeds the MTP head the
             # mean-collapsed streams BEFORE model.norm, not the post-norm state. Keyed on the
@@ -1013,10 +1266,12 @@ class HyperHead(Module):
                 and H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)
-            partials = g_tensor_cache.get_bucketed(
-                x.device, R * chunks * (H + 1), torch.float, "hc_head_partials").view(R, chunks, H + 1)
-            collapsed = g_tensor_cache.get_bucketed(
-                x.device, R * D, torch.float, "hc_head_coll").view(R, D)
+            # Decode-class row counts take the static workspaces (same rule as _mix); prefill
+            # chunks allocate per call, or the collapsed rows alone would pin 64 MiB per device
+            def ws(numel, tag):
+                return g_tensor_cache.get_scratch(x.device, numel, torch.float, tag, R)
+            partials = ws(R * chunks * (H + 1), "hc_head_partials").view(R, chunks, H + 1)
+            collapsed = ws(R * D, "hc_head_coll").view(R, D)
             if R <= 32:
                 if self.fn_h is None:
                     self.fn_h = self.fn.half()

@@ -599,9 +599,6 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # thread settles them before any reader): the 72 per-layer .cpu() syncs of an 8K prompt drained the queue twice (idle 55-64 ms
              # of a 5.2 s prefill); bitwise (first-token + tail-resume logits equal, base vs on). 0 = the synchronous stash.
              ("EXL3_NC2_ASYNC_STASH", "1"),
-             # a speculative rewind records the accepted recurrent-state history index in a per-slot base instead of copying
-             # it back to index 0: bit-exact (ids equal off vs on, Qwen GDN ndt 7). 0 = copy.
-             ("EXL3_STATE_REBASE", "1"),
              # a turn that resumes mid-page (tail checkpoint) and adds 1024..4095 tokens in one chunk no longer pays a separate
              # last-page forward: follow-up after a 12K conversation 1.47 -> 1.26 s (+1536 tokens), 2.37 -> 2.11 s (+3072), first-token
              # KLD vs a cold prefill 2.1e-3 / 1.9e-3 (shipped 4.8e-3 / 3.8e-3), top-1 equal; 768 and 6144 appends unchanged (bitwise).

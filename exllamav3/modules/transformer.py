@@ -5,7 +5,7 @@ import torch
 from ..util.tensor import to2
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
-from .hyperconnections import HyperConnection
+from .hyperconnections import HyperConnection, hc_flush
 from . import ablit_runtime
 from ..util import profile_opt
 from . import moe_fused
@@ -152,23 +152,14 @@ class TransformerBlock(Module):
                 if fused_x is not None:
                     return fused_x
             if self.mlp_hc:
-                gr_pend = hc_pending is not None and hc_pending[3] is None and not self.mlp_norm
-                if hc_pending is not None and not self.mlp_norm and not gr_pend:
-                    HyperConnection.flush_pending(x, hc_pending)
-                    hc_pending = None
                 params["hc_pad_ok"] = "mlp"         # MLP site: GEMMs and the MoE gather take a row-padded input
                 try:
-                    fused = self.mlp_hc.mix_norm(x, params, self.mlp_norm, hc_pending) if self.mlp_norm else None
+                    hc_post, hc_comb, y, normed = self.mlp_hc.mix_norm(x, params, self.mlp_norm, hc_pending)
                 finally:
                     params.pop("hc_pad_ok", None)
-                if fused is not None:
-                    hc_post, hc_comb, y = fused
-                else:
-                    hc_post, hc_comb, y = self.mlp_hc.mix(x, params, pending = hc_pending) if gr_pend \
-                        else self.mlp_hc.mix(x, params)
-                    y = y.half()
-                    if self.mlp_norm:
-                        y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
+                y = y.half()
+                if self.mlp_norm and not normed:
+                    y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
             else:
                 params["residual"] = x
                 if y_resid is not None:
@@ -227,6 +218,12 @@ class TransformerBlock(Module):
                 x += y
         return x
 
+    @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        # A deferred mHC apply_ (hyperconnections.hc_flush) lands before its streams move to another device
+        if "hc_pending" in params and x.device != self.device:
+            hc_flush(params)
+        return super().prepare_for_device(x, params)
 
     @override
     def forward(
@@ -248,9 +245,7 @@ class TransformerBlock(Module):
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
-        gr_pend = hc_pending is not None and hc_pending[3] is None and bool(self.attn and self.attn_hc) \
-            and not self.attn_norm
-        if hc_pending is not None and not gr_pend and not (self.attn and self.attn_hc and self.attn_norm):
+        if hc_pending is not None and not (self.attn and self.attn_hc):
             HyperConnection.flush_pending(x, hc_pending)
             hc_pending = None
         hc_defer = not export_state and self.layer_scalar_f is None
@@ -262,21 +257,12 @@ class TransformerBlock(Module):
             if self.attn_hc:
                 params["hc_pad_ok"] = True          # the attention site accepts a row-padded block input
                 try:
-                    fused = self.attn_hc.mix_norm(x, params, self.attn_norm, hc_pending) if self.attn_norm else None
+                    hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm, hc_pending)
                 finally:
                     params.pop("hc_pad_ok", None)
-                if fused is not None:
-                    hc_post, hc_comb, y = fused
-                else:
-                    params["hc_pad_ok"] = True      # the attention site accepts a row-padded block input
-                    try:
-                        hc_post, hc_comb, y = self.attn_hc.mix(x, params, pending = hc_pending) if gr_pend \
-                            else self.attn_hc.mix(x, params)
-                    finally:
-                        params.pop("hc_pad_ok", None)
-                    y = y.half()
-                    if self.attn_norm:
-                        y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+                y = y.half()
+                if self.attn_norm and not normed:
+                    y = self.attn_norm.forward(y, params, out_dtype = torch.half)
             elif self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
@@ -471,7 +457,7 @@ class ParallelDecoderBlock(Module):
             y1 += y2
 
             if self.tp_reduce:
-                params["backend"].all_reduce(y1)
+                self.tp_collect(params["backend"], y1)
 
             x += y1
 
@@ -528,4 +514,6 @@ class ParallelDecoderBlock(Module):
 
         # Use single reduction for sum of mlp and attn
         module.tp_reduce = True
+        module.tp_owner = module.tp_single_owner(
+            local_context, exported["attn"]["kwargs"]["key"], exported["mlp"]["kwargs"]["key"])
         return module

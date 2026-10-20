@@ -4,37 +4,18 @@
 // comp_units/exl3_gemv_int8_inst_*.cu; the host code in exl3_gemv_int8.cu includes this header only
 // for the launch-geometry constants and __host__ __device__ helpers
 
-#if defined(USE_ROCM)
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
-#include <hip/hip_bf16.h>
-#include <hip/hip_cooperative_groups.h>
-#else
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
-#include <cooperative_groups.h>
-#endif
 #include <cstdio>
+#include <cooperative_groups.h>
 #include "../util.h"
-#include "../util.cuh"   // ROCm: pulls in compat.cuh -> compat_rocm.cuh (shfl_*_sync, FSHF_IMM, BFE16_IMM)
-#if !defined(USE_ROCM)
-#include "../ptx.cuh"    // CUDA-only PTX helpers (cp.async, bfe/shf asm)
-#endif
+#include "../util.cuh"
+#include "../ptx.cuh"
 #include "exl3_dq.cuh"
 #include "hadamard_inner.cuh"
 
 namespace cg_gemv = cooperative_groups;
-
-#if defined(USE_ROCM)
-// HIP only provides __ldcg for half/half2. The sq epilogue reads per-slice partials written by
-// OTHER workgroups after a counter handshake; a relaxed agent-scope atomic load is the HIP
-// equivalent of the L1-bypassing (.cg) load (RDNA's per-CU L0/L1 is not coherent across CUs).
-__device__ __forceinline__ int __ldcg(const int* p)
-{
-    return __hip_atomic_load(const_cast<int*>(p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-}
-#endif
 
 // Fused int8-activation GEMV for mul1 (cb 2) tensors, single cooperative launch.
 //
@@ -79,10 +60,7 @@ __device__ __forceinline__ int __ldcg(const int* p)
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 {
 #if defined(USE_ROCM)
-    // v_dot4_i32_iu8: mixed-sign 4x int8 dot with int32 accumulate. Builtin signature is
-    // (a_signed, a, b_signed, b, c, clamp); dp4a.u32.s32 is (unsigned a) . (signed b). Verified on
-    // gfx1151: sudot4(false, 0xFF010203, true, 0xFE0102FF, 0) == -508
-    return __builtin_amdgcn_sudot4(false, a, true, b, c, false);
+    return exl3_dp4a_us(a, b, c);
 #else
     int d;
     asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
@@ -92,11 +70,38 @@ __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 
 // i0/i2 land in [0, 2*words); a compare+subtract replaces the modulo (words is not a power of two for
 // odd bit widths)
-template <int bits>
+template <int bits, bool HALF = false>
 __device__ __forceinline__ int wrap_idx(int i)
 {
-    constexpr int words = bits * 256 / 32;
+    constexpr int words = HALF ? 4 * (2 * bits + 1) : bits * 256 / 32;
     return i >= words ? i - words : i;
+}
+
+// Half-integer rate bits + 0.5: same two-group extraction as dq8_half (exl3_dq.cuh), 18 + 3 * bits bits per group
+template <int KA>
+__device__ __forceinline__ void ext8w_half
+(
+    const uint32_t* ptr, int t0,
+    uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3,
+    uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
+)
+{
+    constexpr int bits2 = 2 * KA + 1;
+    constexpr int gspan = 18 + 3 * KA;
+    const int e7 = ((t0 >> 1) + 4) * bits2 + 128 * bits2;
+    const int e3 = e7 - 2 * bits2;
+    {
+        int hi = (e7 - 1) / 32, lo = (e7 - gspan) / 32, s = (hi + 1) * 32 - e7;
+        uint32_t a = ptr[wrap_idx<KA, true>(lo)], b = ptr[wrap_idx<KA, true>(hi)];
+        w7 = fshift(b, a, s); w6 = w7 >> (KA + 1); w5 = w6 >> KA; w4 = w5 >> (KA + 1);
+    }
+    {
+        int hi = (e3 - 1) / 32, lo = (e3 - gspan) / 32, s = (hi + 1) * 32 - e3;
+        uint32_t a = ptr[wrap_idx<KA, true>(lo)], b = ptr[wrap_idx<KA, true>(hi)];
+        w3 = fshift(b, a, s); w2 = w3 >> (KA + 1); w1 = w2 >> KA; w0 = w1 >> (KA + 1);
+    }
+    w7 &= 0xffff; w6 &= 0xffff; w5 &= 0xffff; w4 &= 0xffff;
+    w3 &= 0xffff; w2 &= 0xffff; w1 &= 0xffff; w0 &= 0xffff;
 }
 
 template <int bits>
@@ -129,7 +134,7 @@ __device__ __forceinline__ void ext2w(const uint32_t* ptr, int t0, uint32_t& w0,
     w0 = fshift(b, a, s2 + bits) & 0xffff;
 }
 
-template <int bits>
+template <int bits, bool HALF = false>
 __device__ __forceinline__ void ext8w
 (
     const uint32_t* ptr, int t0,
@@ -137,7 +142,11 @@ __device__ __forceinline__ void ext8w
     uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
 )
 {
-    if constexpr (bits == 1)
+    if constexpr (HALF)
+    {
+        ext8w_half<bits>(ptr, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    }
+    else if constexpr (bits == 1)
     {
         uint32_t i1 = t0 >> 5;
         uint32_t i0 = (i1 + 7) & 7;
@@ -487,7 +496,7 @@ __device__ __forceinline__ void gemv_int8_unit_wide
 
 // One k-row of an adjacent block pair, generic K: extract + dp4a for both blocks from block pointers
 // (global or shared memory), M rows sharing the extraction
-template <int bits, int M, bool residual>
+template <int bits, int M, bool residual, bool HALF = false>
 __device__ __forceinline__ void gemv_int8_pair_row
 (
     const uint32_t* blockA, const uint32_t* blockB,
@@ -498,7 +507,7 @@ __device__ __forceinline__ void gemv_int8_pair_row
 )
 {
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
-    ext8w<bits>(blockA, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    ext8w<bits, HALF>(blockA, t0, w0, w1, w2, w3, w4, w5, w6, w7);
     w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
     w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
     #pragma unroll
@@ -531,7 +540,7 @@ __device__ __forceinline__ void gemv_int8_pair_row
         }
     }
 
-    ext8w<bits>(blockB, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    ext8w<bits, HALF>(blockB, t0, w0, w1, w2, w3, w4, w5, w6, w7);
     w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
     w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
     #pragma unroll
@@ -636,7 +645,11 @@ __device__ __forceinline__ void gemv_int8_pair_tail
 
 // Narrow generic unit (any K): one (256-column x k-slice) unit, warp per adjacent block pair
 // processed sequentially with pointer-based extraction straight from global memory
-template <int bits, int M, bool residual, bool atomic = true>
+// Words per 16x16 tile: 8 * bits, or 4 * (2 * bits + 1) at the half-integer rate bits + 0.5
+template <int bits, bool HALF>
+__host__ __device__ constexpr int gemv_int8_twords() { return HALF ? 4 * (2 * bits + 1) : 8 * bits; }
+
+template <int bits, int M, bool residual, bool atomic = true, bool HALF = false>
 __device__ __forceinline__ void gemv_int8_unit_narrow
 (
     const uint16_t* __restrict__ B,
@@ -652,9 +665,10 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
 {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
+    constexpr int TWORDS = gemv_int8_twords<bits, HALF>();
     int nbp = nb256 * 8 + warp;
-    const int row_stride = size_n * bits / 2;
-    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (bits * 16);
+    const int row_stride = size_n / 16 * TWORDS;
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (2 * TWORDS);
     int c2 = 2 * (lane & 3);
     int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
     int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
@@ -662,7 +676,7 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     for (int kb = 0; kb < nrows; ++kb)
     {
         const uint32_t* blockA = bp + (size_t) kb * row_stride;
-        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+        gemv_int8_pair_row<bits, M, residual, HALF>(blockA, blockA + TWORDS,
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
@@ -673,7 +687,7 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
 // slice with cp.async (coalesced 16 B chunks, one commit group per row, GEMV_STAGE_D rows deep) and
 // extracts from shared memory. Used for the K where scattered pointer extraction leaves the most
 // load latency exposed (3, 5, 7); warp-private slices need no block-level synchronization.
-template <int bits, int M, bool residual, bool atomic = true>
+template <int bits, int M, bool residual, bool atomic = true, bool HALF = false>
 __device__ __forceinline__ void gemv_int8_unit_smem
 (
     const uint16_t* __restrict__ B,
@@ -689,12 +703,13 @@ __device__ __forceinline__ void gemv_int8_unit_smem
 )
 {
     constexpr int D = GEMV_STAGE_D;
-    constexpr int pairwords = 16 * bits;
+    constexpr int TWORDS = gemv_int8_twords<bits, HALF>();
+    constexpr int pairwords = 2 * TWORDS;
     constexpr int chunks = pairwords / 4;      // 16 B cp.async chunks per pair row
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int nbp = nb256 * 8 + warp;
-    const int row_stride = size_n * bits / 2;
+    const int row_stride = size_n / 16 * TWORDS;
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
     uint32_t* sb = sh_b + warp * (D * pairwords);
 
@@ -720,7 +735,7 @@ __device__ __forceinline__ void gemv_int8_unit_smem
         stage_row(kb + D - 1);
 
         const uint32_t* blockA = sb + (kb % D) * pairwords;
-        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+        gemv_int8_pair_row<bits, M, residual, HALF>(blockA, blockA + TWORDS,
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
@@ -758,9 +773,15 @@ __device__ __forceinline__ void gemv_int8_unit_smem
 
 // K values routed to the smem-staged unit (measured on 3090: K=3 -13%; narrow wins for 2/6/8 which
 // are at the ALU floor / DRAM-bound, wide covers 4)
-__host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
+__host__ __device__ constexpr bool gemv_int8_stage_smem(int bits, bool half = false)
 {
-    return bits == 3 || bits == 5 || bits == 7;
+    return half || bits == 3 || bits == 5 || bits == 7;   // half-integer rates: staged (unmeasured, the generic choice)
+}
+
+// Stage bytes per block for the staged unit: 8 warps x GEMV_STAGE_D pair rows
+__host__ __device__ constexpr int gemv_int8_stage_bytes(int bits, bool half = false)
+{
+    return gemv_int8_stage_smem(bits, half) ? 8 * GEMV_STAGE_D * (half ? 8 * (2 * bits + 1) : 16 * bits) * 4 : 0;
 }
 
 // Epilogue for one row: affine correction + output Hadamard + svh scale + accumulator reset,
@@ -1018,7 +1039,7 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
 
-template <int bits, int M, bool c_fp32, bool residual>
+template <int bits, int M, bool c_fp32, bool residual, bool HALF = false>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_sq_kernel
 (
@@ -1061,7 +1082,7 @@ void exl3_gemv_int8_sq_kernel
     half* sh_ah = (half*) shmem;
     uint32_t* sh_as = shmem + rows_per * 8;
     uint32_t* sh_b = sh_as + slice_stride * M * (residual ? 2 : 1);
-    float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * 16 * bits : 0));
+    float* sh_tmp = (float*) (sh_b + gemv_int8_stage_bytes(bits, HALF) / 4);
     __shared__ float sh_red[33];
     __shared__ int sh_last;
 
@@ -1080,12 +1101,12 @@ void exl3_gemv_int8_sq_kernel
             prev_slice = slice;
         }
         int* pacc = partials + (size_t) slice * M * pstride;
-        if constexpr (bits == 4)
+        if constexpr (bits == 4 && !HALF)
             gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
-        else if constexpr (gemv_int8_stage_smem(bits))
-            gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
+        else if constexpr (gemv_int8_stage_smem(bits, HALF))
+            gemv_int8_unit_smem<bits, M, residual, false, HALF>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
         else
-            gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_narrow<bits, M, residual, false, HALF>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
 
         // Completion counter: the ksplit-th contributor runs the epilogue for this 256-column group.
         // (sh_last reuse across iterations is ordered by the next iteration's __syncthreads.)
@@ -1109,7 +1130,7 @@ void exl3_gemv_int8_sq_kernel
 // ---------------------------------------------------------------------------------------------------------
 // Cooperative kernel: same argument list as exl3_gemm_kernel
 
-template <int bits, bool c_fp32, bool residual>
+template <int bits, bool c_fp32, bool residual, bool HALF = false>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_coop_kernel
 (
@@ -1271,12 +1292,12 @@ void exl3_gemv_int8_coop_kernel
                 gemv_int8_stage_splats<residual>(Ar, q_row, sh_as, sh_as2, kb0, nrows);
                 prev_slice = slice;
             }
-            if constexpr (bits == 4)
+            if constexpr (bits == 4 && !HALF)
                 gemv_int8_unit_wide<1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n);
-            else if constexpr (gemv_int8_stage_smem(bits))
-                gemv_int8_unit_smem<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, sh_b, nb256, kb0, nrows, size_n);
+            else if constexpr (gemv_int8_stage_smem(bits, HALF))
+                gemv_int8_unit_smem<bits, 1, residual, true, HALF>(B, accs, 0, sh_as, rows_per * 16, sh_b, nb256, kb0, nrows, size_n);
             else
-                gemv_int8_unit_narrow<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n);
+                gemv_int8_unit_narrow<bits, 1, residual, true, HALF>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n);
         }
         grid.sync();
 

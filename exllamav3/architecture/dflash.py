@@ -6,9 +6,10 @@ from ..cache import Cache
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle
-from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP
+from ..modules import RMSNorm, TransformerBlock, Attention, SlidingAttention, SWAState, GatedMLP
 from ..modules.arch_specific.dflash import DFlashInputLayer
 from ..modules.attn import prepare_for_attn
+from ..cache.recurrent_util import prepare_for_recurrence
 from ..util.device_copy import to_device
 import weakref
 
@@ -57,6 +58,9 @@ class DFlashConfig(Config):
         # self.num_target_layers = self.read_cfg(int, "num_target_layers", no_default)
         self.layer_types = self.read_cfg(list, "layer_types", ["full_attention"] * self.num_hidden_layers)
         self.sliding_window = self.read_cfg(int, "sliding_window", 2048)
+        # Block attention direction, as the reference draft reads it: "is_causal" in the checkpoint
+        # config overrides the default of causal on sliding-window layers, bidirectional elsewhere
+        self.is_causal = self.read_cfg(bool, ["is_causal", "dflash_config->is_causal"], None)
 
         # DFlash. Config keys live under dflash_config-> in the original release, at the top
         # level in later ones (MuseGlimmerAssistant)
@@ -68,17 +72,14 @@ class DFlashConfig(Config):
         # "tap_shift" under dflash_config or at the top level
         self.tap_shift = self.read_cfg(int, ["dflash_config->tap_shift", "tap_shift"], self.tap_shift)
         self.target_layer_ids = [i + self.tap_shift for i in self.target_layer_ids]
+        assert len(set(self.target_layer_ids)) == len(self.target_layer_ids), \
+            "DFlash target_layer_ids must be unique"
         self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
 
-        # --- variant switches -------------------------------------------------------------
-        # These cover checkpoints whose drafter is not the plain z-lab one. MiMo-V2.6-Flash-RL's
-        # `dflash/` is the first: 5 sliding-window layers with gpt-oss style learned sinks, a
-        # value scale, a learned mask embedding that is NOT in the target's embedding table, and
-        # `is_causal: false`. See notes/dflash.md in the MiMo port for the full difference list.
+        # Variant switches for drafters other than the original z-lab ones (e.g. MiMo-V2.6's).
+        # Each defaults to the previous behaviour.
 
-        # Learned per-q-head attention sinks (extra logit column dropped after the softmax),
-        # stored as layers.N.self_attn.attention_sink_bias. Declared by the config or simply
-        # detected in the checkpoint
+        # Learned per-head attention sinks
         self.attention_sink_bias = self.read_cfg(
             bool,
             ["dflash_config->attention_sink_bias", "attention_sink_bias", "add_swa_attention_sink_bias"],
@@ -87,24 +88,13 @@ class DFlashConfig(Config):
         if self.attention_sink_bias is None:
             self.attention_sink_bias = self.stc.has_tensor("layers.0.self_attn.attention_sink_bias")
 
-        # V is scaled before the attention output; attention is linear in V (the sink column
-        # carries no value), so this folds exactly into o_proj
+        # Scale on V, folded into o_proj
         self.attention_value_scale = self.read_cfg(
             float, ["dflash_config->attention_value_scale", "attention_value_scale"], None
         ) or 1.0
 
-        # `is_causal: false` with a sliding window. causal = False alone is not enough: the
-        # kernels read a bare int window as (left, 0), which re-imposes causality inside the
-        # drafted block. The bidirectional block is a window of (sliding_window, block_size - 1)
-        self.bidirectional_block = self.read_cfg(
-            bool, ["dflash_config->bidirectional_block", "bidirectional_block"], None
-        )
-        if self.bidirectional_block is None:
-            self.bidirectional_block = not self.read_cfg(bool, "is_causal", True)
-
-        # Learned mask embedding. The original DFlash release reuses the target's embedding row
-        # for mask_token_id; checkpoints that ship their own vector (MiMo) carry it as a
-        # "mask_embedding" tensor (see notes/prepare_dflash_draft.py)
+        # Learned mask embedding shipped with the drafter, used instead of the target's
+        # embedding row for mask_token_id
         self.key_mask_embedding = "mask_embedding" if self.stc.has_tensor("mask_embedding") else None
 
         # RoPE
@@ -112,6 +102,109 @@ class DFlashConfig(Config):
 
         # Vision placeholders
         self.vision = None
+
+
+    def block_window(self, idx: int) -> tuple[int, int]:
+        """
+        (sliding_window, window_right) for draft layer idx. The reference masks q - k < sw,
+        i.e. self plus sw - 1 past keys; a layer that is not causal within the draft block sees
+        the same span ahead of the query
+        """
+        if self.layer_types[idx] != "sliding_attention":
+            return -1, 0
+        causal = True if self.is_causal is None else self.is_causal
+        return self.sliding_window - 1, 0 if causal else self.sliding_window - 1
+
+
+def dflash_update_kv_from_target(
+    model: Model,
+    target_hidden: list,
+    cache: Cache,
+    params: dict,
+    lengths: list[int] = None,
+):
+    """
+    Update a DFlash-style draft's K/V cache with hidden states extracted from the target model.
+    Shared by every drafter built on the DFlash encoder (fc + hidden_norm over concatenated taps)
+    with plain GQA attention layers: model.input_layer, model.attn_modules and
+    model.config.target_layer_ids are what it reads.
+
+    params:
+        "block_table": torch.Tensor
+        "cache_seqlens": torch.Tensor
+    """
+
+    # Target states arrive in layer execution order. Reorder them only when the checkpoint's
+    # projection expects a different target_layer_ids order.
+    target_layer_ids = model.config.target_layer_ids
+    if target_layer_ids != sorted(target_layer_ids):
+        source_idx = {layer_id: idx for idx, layer_id in enumerate(sorted(target_layer_ids))}
+        target_hidden = [target_hidden[source_idx[layer_id]] for layer_id in target_layer_ids]
+
+    # May update a few redundant tokens when batching, but we'd never draft longer than the cache length
+    if lengths is not None:
+        max_length = max(lengths)
+        target_hidden = [t[:, :max_length] for t in target_hidden]
+
+    # Ensure all state snapshots are on the same device
+    device = model.input_layer.device
+    for i in range(len(target_hidden)):
+        target_hidden[i] = to_device(target_hidden[i], device)
+
+    # Projection concatenated states to hidden size, once
+    target_hidden = torch.cat(target_hidden, dim = -1)
+    target_hidden = model.input_layer.proj.forward(target_hidden, {}, out_dtype = torch.half)
+    target_hidden = model.input_layer.norm.forward(target_hidden, {}, out_dtype = torch.half)
+
+    bsz, target_seqlen, dim = target_hidden.shape
+    params["target_hidden_cc"] = target_hidden
+
+    # Sliding-window layers kept as recurrent states (SlidingAttention, swa_full off) take their
+    # rows into the window rings at the batch rows' positions; the rest go to the paged cache
+    rsg = params.get("recurrent_states")
+    ring_plan = None
+    if rsg is not None:
+        swa_layer = next((l for l in model.attn_modules if isinstance(l, SlidingAttention)), None)
+        if swa_layer is not None:
+            ring_plan = swa_layer.plan_state_rows(rsg, params["cache_seqlens"].tolist(), lengths, target_seqlen)
+
+    # Update KV layers
+    for layer in model.attn_modules:
+        block_table = get_for_device(params, "block_table", layer.device)
+        cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
+        target_hidden = get_for_device(params, "target_hidden_cc", layer.device)
+
+        # k/v project
+        k = layer.k_proj.forward(target_hidden, params)
+        v = layer.v_proj.forward(target_hidden, params)
+        k = k.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
+        v = v.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
+
+        # Apply rope and norm to k
+        k, _ = layer.rope.apply(
+            k, None,
+            0,
+            cache_seqlens,
+            None,
+            True,
+            layer.k_norm_tensor,
+            None,
+            layer.norm_eps,
+            layer.norm_constant_bias,
+            None,
+        )
+
+        if isinstance(layer, SlidingAttention):
+            assert ring_plan is not None, "DFlash draft with sliding-window states needs the draft's recurrent states"
+            layer.write_state_rows(rsg, ring_plan, k, v)
+            continue
+
+        # Write k, v rows to the paged cache; quantized caches quantize them in place rather
+        # than dequantizing/requantizing full layers
+        cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
+
+    if ring_plan is not None:
+        SlidingAttention.commit_state_rows(rsg, ring_plan)
 
 
 class DFlashModel(Model):
@@ -124,9 +217,11 @@ class DFlashModel(Model):
     def __init__(
         self,
         config: DFlashConfig,
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.swa_full = swa_full
 
         self.input_layer = DFlashInputLayer(
             config = config,
@@ -146,9 +241,13 @@ class DFlashModel(Model):
         self.attn_modules = []
 
         for idx in range(config.num_hidden_layers):
-            is_swa = config.layer_types[idx] == "sliding_attention"
+            window_left, window_right = config.block_window(idx)
 
-            attn = Attention(
+            # Sliding-window layers keep a window ring per sequence (a recurrent state, stashed with
+            # the target's checkpoints) instead of a context-sized paged cache; -swa_full keeps the
+            # paged cache
+            swa = config.layer_types[idx] == "sliding_attention" and not swa_full
+            attn = (SlidingAttention if swa else Attention)(
                 config = config,
                 key = f"layers.{idx}.self_attn",
                 layer_idx = idx,
@@ -162,11 +261,8 @@ class DFlashModel(Model):
                 key_v = "v_proj",
                 key_o = "o_proj",
                 qmap = "block.attn",
-                sliding_window = config.sliding_window if is_swa else -1,
-                # `is_causal: false`: the drafted block attends to itself in both directions.
-                # With no window that follows from causal = False; with one it has to be an
-                # explicit right bound, or the window's implied (left, 0) re-imposes causality
-                window_right = (config.block_size - 1) if (is_swa and config.bidirectional_block) else 0,
+                sliding_window = window_left,
+                window_right = window_right,
                 key_sinks = "attention_sink_bias" if config.attention_sink_bias else None,
                 q_norm = RMSNorm(
                     config = config,
@@ -180,7 +276,6 @@ class DFlashModel(Model):
                 ),
                 out_dtype = torch.float,
             )
-            # attention_value_scale multiplies V before the attention output; fold into o_proj
             attn.o_proj.weight_scale = config.attention_value_scale
             self.attn_modules.append(attn)
 
@@ -235,6 +330,13 @@ class DFlashModel(Model):
             "default_draft_size": config.block_size - 1,
             "autosplit_load_fwd": False,
         })
+        self.recurrent_state_cls = None
+        if any(isinstance(m, SlidingAttention) for m in self.attn_modules):
+            self.caps.update({
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 2048,
+            })
+            self.recurrent_state_cls = SWAState
 
         self.attached_model = None
 
@@ -255,61 +357,7 @@ class DFlashModel(Model):
         params: dict,
         lengths: list[int] = None,
     ):
-        """
-        Update K/V cache with hidden states extracted from target model
-
-        params:
-            "block_table": torch.Tensor
-            "cache_seqlens": torch.Tensor
-        """
-
-        # May update a few redundant tokens when batching, but we'd never draft longer than the cache length
-        if lengths is not None:
-            max_length = max(lengths)
-            target_hidden = [t[:, :max_length] for t in target_hidden]
-
-        # Ensure all state snapshots are on the same device
-        device = self.input_layer.device
-        for i in range(len(target_hidden)):
-            target_hidden[i] = to_device(target_hidden[i], device)
-
-        # Projection concatenated states to hidden size, once
-        target_hidden = torch.cat(target_hidden, dim = -1)
-        target_hidden = self.input_layer.proj.forward(target_hidden, {}, out_dtype = torch.half)
-        target_hidden = self.input_layer.norm.forward(target_hidden, {}, out_dtype = torch.half)
-
-        bsz, target_seqlen, dim = target_hidden.shape
-        params["target_hidden_cc"] = target_hidden
-
-        # Update KV layers
-        for layer in self.attn_modules:
-            block_table = get_for_device(params, "block_table", layer.device)
-            cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
-            target_hidden = get_for_device(params, "target_hidden_cc", layer.device)
-
-            # k/v project
-            k = layer.k_proj.forward(target_hidden, params)
-            v = layer.v_proj.forward(target_hidden, params)
-            k = k.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
-            v = v.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
-
-            # Apply rope and norm to k
-            k, _ = layer.rope.apply(
-                k, None,
-                0,
-                cache_seqlens,
-                None,
-                True,
-                layer.k_norm_tensor,
-                None,
-                layer.norm_eps,
-                layer.norm_constant_bias,
-                None,
-            )
-
-            # Write k, v rows to the paged cache; quantized caches quantize them in place rather
-            # than dequantizing/requantizing full layers
-            cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
+        dflash_update_kv_from_target(self, target_hidden, cache, params, lengths)
 
 
     def sample_from_state(
@@ -317,24 +365,8 @@ class DFlashModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        if not self.attached_model().loaded_tp:
-            ll = self.attached_model().logit_layer_idx
-            lm = self.attached_model().modules[ll]
-            logits = lm.prepare_for_device(state, params)
-            logits = lm.forward(logits, params)
-            logits = logits[..., :self.attached_model().config.vocab_size]
-            if params.get("export_draft_conf"):
-                # Per-position confidence for the generator's draft truncation: the argmax logit
-                # value separates converged from degenerate block positions far better than any
-                # distribution-shape statistic (the softcapped head is near-flat either way)
-                conf, ids = torch.max(logits, dim = -1)
-                params["draft_conf"] = conf
-                return ids
-            return torch.argmax(logits, dim = -1)
-        else:
-            state = self.attached_model().tp_producer.send(state)
-            argmax = self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
-            return argmax
+        # The target's head, TP-aware; exports draft confidence when the generator asks
+        return self.attached_model().lm_head_argmax(state, params)
 
 
     def default_load_shape_dtype(self, chunk_size):
@@ -347,10 +379,12 @@ class DFlashModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        # The draft block attends to itself bidirectionally; causality on the sliding-window
-        # layers is expressed through their window (left sw, right 0) instead
-        params["causal"] = False
+        # Block attention direction per the checkpoint (DFlashConfig.block_window): the kernel
+        # flag is only needed when every layer is causal; windowed layers carry their own bounds
+        params["causal"] = self.config.is_causal is True
         input_ids = prepare_for_attn(input_ids, params)
+        if self.recurrent_state_cls is not None:
+            prepare_for_recurrence(input_ids, params, self)
         return input_ids
 
 

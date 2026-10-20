@@ -32,16 +32,17 @@ for m in model.modules:
 assert site is not None
 site.load(torch.device("cuda:0"))
 H, D, LR = site.hc_mult, site.hidden_size, site.rank
-M = site.proj_h.shape[0] + 1
+M = site.proj_m + 1
 if getattr(site, "use_q8", False):
     fn_bytes = site.fn_q8.numel(); upt_bytes = site.upx_q8.numel()
     def call(s3, dots, post, mixed):
         ext.gr_mix_q8(s3, site.fn_q8, site.fn_scale, site.upx_q8, site.up_scale, site.w_h, site.rms_eps, dots, post, mixed)
     print("path: gr_mix_q8 (int8)")
 else:
-    fn_bytes = site.fn_h.numel() * 2; upt_bytes = site.upx_h.numel() * 2
+    fn = site.proj_h[: site.proj_m]
+    fn_bytes = fn.numel() * 2; upt_bytes = site.upx_h.numel() * 2
     def call(s3, dots, post, mixed):
-        ext.gr_mix(s3, site.fn_h, site.upx_h, site.w_h, site.rms_eps, dots, post, mixed)
+        ext.gr_mix(s3, None, fn, site.upx_h, site.w_h, site.rms_eps, dots, post, mixed)
     print("path: gr_mix (fp16)")
 print(f"site={site.key} H={H} D={D} rank={LR} M={M-1}  fn={fn_bytes/2**20:.1f} MiB upt={upt_bytes/2**20:.1f} MiB")
 BW = 236e9

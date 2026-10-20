@@ -15,6 +15,7 @@ from exllamav3.modules import dsv4
 from exllamav3.modules import hyperconnections as hc
 from exllamav3.modules import ngram_embedding as ne
 from exllamav3.modules import ple
+from exllamav3.modules.row_table import RowTable
 from exllamav3.modules.attention_fn import bighead_scalar
 from exllamav3.modules.attention_fn import torch as torch_attn
 from exllamav3.modules.attention_fn.common import AttnArgs
@@ -40,29 +41,21 @@ def _ngram_module(*, trellis: bool):
     module.head_offsets = torch.tensor([0], dtype = torch.long)
     module.head_vocab_sizes = torch.tensor([7], dtype = torch.long)
     module.layer_multipliers = torch.tensor([3, 5], dtype = torch.long)
-    module.rows_per_shard = 7
-    module.num_rows = 7
     module.device = torch.device(DEVICE)
-    module.handles = None
     module.out_dtype = torch.half
-    module._pin = None
+    table = RowTable("ngram", ["ngram"])
     if trellis:
-        module.mode = "trellis_ram"
-        module.K = 1
         states = torch.arange(7 * ROW_DIM, dtype = torch.int64).view(7, ROW_DIM)
         scales = torch.linspace(0.25, 1.0, 7, dtype = torch.half)
-        module.tables = [pack_rows(states, scales, module.K)]
+        table._set_stores([pack_rows(states, scales, 1)])
         module.head_bias = torch.linspace(-0.2, 0.2, ROW_DIM, device = DEVICE,
                                           dtype = torch.half).unsqueeze(0)
         module.codebook = mul1_codebook(DEVICE)
-        module._row_dtype = None
     else:
-        module.mode = "fp16_ram"
-        module.K = None
-        module.tables = [torch.arange(7 * ROW_DIM, dtype = torch.float16).view(7, ROW_DIM)]
+        table._set_stores([torch.arange(7 * ROW_DIM, dtype = torch.float16).view(7, ROW_DIM)])
         module.head_bias = None
         module.codebook = None
-        module._row_dtype = torch.float16
+    module._set_table(table, trellis)
     return module
 
 
@@ -93,7 +86,7 @@ def test_rocm_ngram_bindings_match_torch_helpers():
     bias = torch.linspace(-0.1, 0.1, ROW_DIM, device = DEVICE, dtype = torch.half).unsqueeze(0)
     row_heads = torch.zeros(2, device = DEVICE, dtype = torch.int32)
     out = torch.empty((2, ROW_DIM), device = DEVICE, dtype = torch.half)
-    native_ext.ngram_dequant(packed, K, row_heads, bias, out)
+    native_ext.ngram_dequant(packed, K, row_heads, bias, out, False)
     expected_rows = dequant_rows(packed, K, mul1_codebook(DEVICE), bias.expand(2, -1)).half()
     torch.testing.assert_close(out, expected_rows, rtol = 1e-3, atol = 1e-3)
 
@@ -109,24 +102,6 @@ def test_ngram_forward_falls_back_when_hash_or_dequant_is_missing(monkeypatch):
         actual = module.forward(ids, {})
         torch.testing.assert_close(actual, expected)
         monkeypatch.undo()
-
-
-def test_ngram_disk_gather_has_read_rows_fallback(monkeypatch):
-    table = torch.arange(8 * 3, dtype = torch.int16).view(8, 3)
-
-    class Handle:
-        def read_rows(self, rows):
-            return table.index_select(0, rows)
-
-    module = object.__new__(ne.NGramEmbedding)
-    module.tables = None
-    module.handles = [Handle()]
-    module.rows_per_shard = 8
-    uids = torch.tensor([1, 4, 7], dtype = torch.long)
-    out = torch.empty((3, 3), dtype = torch.int16)
-    monkeypatch.setattr(ne, "ext", SimpleNamespace())
-    module._gather_rows(uids, out)
-    assert torch.equal(out, table[uids])
 
 
 def _run_compressor(kv, gate, chunks, overlapping):

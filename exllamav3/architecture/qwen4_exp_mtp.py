@@ -10,7 +10,6 @@ from ..modules import Embedding, Linear, GatedResidual
 from ..modules.module import Module
 from ..modules.arch_specific.qwen4_exp_mtp import Qwen4ExpMTPInputLayer
 from ..modules.attn import prepare_for_attn
-import os
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -110,6 +109,7 @@ class Qwen4ExpMTPModel(Model):
             ),
         )
         self.modules.append(self.stack_out)
+        GatedResidual.link_sites(self.modules)
 
         self.caps.update({
             "supports_tp": False,
@@ -174,26 +174,5 @@ class Qwen4ExpMTPModel(Model):
         bsz, seq, _ = state.shape
         stack = to_device(state, mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
-        ll = self.attached_model().logit_layer_idx
-        lm = self.attached_model().modules[ll]
-        logits = lm.prepare_for_device(state, params)
-        # EXL3_DRAFT2S: two-stage draft head (modules/draft2s.py); its max probability goes to the depth rule via params
-        d2s = None
-        if bsz * seq == 1 and os.environ.get("EXL3_DRAFT2S") and not params.get("export_draft_logits"):
-            from ..modules import draft2s
-            d2s = draft2s.head_for(lm, self.attached_model().config.vocab_size)
-        if d2s is not None:
-            ids, p, conf = d2s(logits)
-            params["draft_p"] = p.clone()
-            if params.get("export_draft_conf"):
-                params["draft_conf"] = conf.clone().view(bsz, seq)
-            return ids.clone().view(bsz, seq)
-        logits = lm.forward(logits, params)
-        if params.get("export_draft_logits"):
-            params["draft_logits"] = logits   # spec_sample: the drafter's law for sampled jobs
-        if params.get("export_draft_conf"):
-            logits = logits[..., :self.attached_model().config.vocab_size]
-            conf, ids = torch.max(logits, dim = -1)
-            params["draft_conf"] = conf
-            return ids
-        return torch.argmax(logits, dim = -1)
+        # The target's head, TP-aware; exports draft confidence when the generator asks
+        return self.attached_model().lm_head_argmax(state, params, draft2s = True)

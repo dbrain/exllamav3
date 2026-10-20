@@ -251,6 +251,10 @@ __device__ __forceinline__ void dq8_aligned_4bits_bfe64(const uint32_t* ptr, int
     frag1[1] = decode_3inst_2_w16<cb>(w6, w7);
 }
 
+// Half-integer bitrate KA + 0.5 (mul1 codebook): positions alternate KA and KA + 1 bits (odd positions carry the
+// extra bit), so 8 consecutive positions starting at an even index take 8 * KA + 4 bits and a lane's window
+// ends are fixed. Two groups of four windows, each spanning 18 + 3 * KA <= 27 bits = at most two 32-bit words:
+// one funnel shift per group, the other three windows derived by shifting the 32-bit result
 template <int KA, int cb>
 __device__ __forceinline__ void dq8_half(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
 {

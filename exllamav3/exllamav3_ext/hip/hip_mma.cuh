@@ -20,29 +20,13 @@
 #if defined(__HIPCC__)
 
 #include <hip/hip_fp16.h>
+#include "../ptx.cuh"
 
 using half = __half;
 
-// ---- fragment shapes (mirrored from ../ptx.cuh names so the kernel body ports 1:1) ----
-
-template <typename T, int n>
-struct HipVec
-{
-    T elems[n];
-    __device__ T& operator[](int i) { return elems[i]; }
-    __device__ const T& operator[](int i) const { return elems[i]; }
-};
-
-using FragA   = HipVec<half2, 4>;   // m16 A operand / gfx12 WMMA operand: 8 fp16 per lane
-// FragB: when compat_rocm.cuh is already in scope (any ROCm extension TU that includes
-// util.cuh), defer to its layout-identical FragB instead of redefining the name; include
-// compat_rocm.cuh (directly or via hadamard_inner.cuh) before this header
-#ifndef EXL3_ROCM_FRAGB
-using FragB   = HipVec<half2, 2>;   // n8 B operand / A pieces: 4 fp16 per lane (CUDA shape parity)
-#endif
-using FragC   = HipVec<float, 4>;   // CDNA MFMA accumulator: 4 fp32 per lane  (fp32 accumulate)
-using FragC8  = HipVec<float, 8>;   // gfx12 WMMA accumulator: 8 fp32 per lane (fp32 accumulate)
-using FragC_h = HipVec<half2, 2>;   // legacy fp16-accumulate shape, kept for shape parity only
+// Fragment shapes are ptx.cuh's (FragA / FragB / FragC / FragC_h, also used by the ROCm MMA emulation),
+// so the kernel body ports 1:1 and TUs that include both headers see one set of types
+using FragC8  = Vec<float, 8>;   // gfx12 WMMA accumulator: 8 fp32 per lane (fp32 accumulate)
 
 // Arch family macros. gfx12 (RDNA4) and gfx11.5 (RDNA3.5) both have a wave32
 // v_wmma_f32_16x16x16_f16, but with DIFFERENT builtins and DIFFERENT fragment

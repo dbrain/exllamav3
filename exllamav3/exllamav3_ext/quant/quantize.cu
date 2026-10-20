@@ -96,6 +96,13 @@ bool quantize_tiles_use_optimized(int major, int minor, int K, int cb)
 {
     if (const char* env = std::getenv("EXL3_QT_OPTIMIZED"))
         return env[0] == '1';
+#if defined(USE_ROCM)
+    // HIP's major is the gfx generation (major == 12 would read as sm_120 on RDNA4), so RDNA gets its own
+    // rule: the dense specializations win at K = 1, 2, 3, 4, 5, 8 and at K = 7 with the 3INST/MCG codebooks;
+    // K = 6 and K = 7 mul1 run faster on the generic kernel. K = 1 and 2 fit the 64 KB LDS limit because the
+    // optimized kernel keeps only its cost arrays in shared memory there (QT_OPTIMIZED_COSTS_ONLY)
+    return K == 1 || K == 2 || K == 3 || K == 4 || K == 5 || (K == 7 && cb != 2) || K == 8;
+#endif
     if (major == 12) return true;
     if (major == 8 && minor == 9)
         return K == 1 || K == 2 || K == 4 || K == 5 || (K == 7 && cb == 0) || K == 8;
@@ -135,10 +142,9 @@ enum { QT_BASE = 0, QT_OPTIMIZED = 1, QT_RDNA = 2 };
 
 // Kernel family for (K, codebook, L). EXL3_QT_KERNEL=base/opt/rdna forces one for testing (rdna
 // falls back to base where it has no instance); EXL3_QT_OPTIMIZED=1/0 keeps its old meaning.
-// On ROCm the grouped kernel is the default for K = 2..3, the dense specialization for K = 4..5.
-// All are measured bit-identical to the base kernel on gfx1151. K = 4 routes to dense because the
-// grouped kernel only matches base there while dense is ~2.5-3x base (measured for K = 2..3
-// and K = 5 as well).
+// On ROCm the grouped kernel is the default for K = 2..3 (L = 256), measured bit-identical to the base
+// kernel on gfx1151; every other K follows quantize_tiles_use_optimized. K = 4 stays on the dense kernel
+// because the grouped kernel only matches base there while dense is ~2.5-3x base.
 static int quantize_tiles_mode(int major, int minor, int K, int cb, int L)
 {
     if (const char* env = std::getenv("EXL3_QT_KERNEL"))
@@ -154,11 +160,8 @@ static int quantize_tiles_mode(int major, int minor, int K, int cb, int L)
         return quantize_tiles_use_optimized(major, minor, K, cb) ? QT_OPTIMIZED : QT_BASE;
 #if defined(USE_ROCM)
     if (L == 256 && K >= 2 && K <= 3) return QT_RDNA;
-    if (K == 4 || K == 5) return QT_OPTIMIZED;
-    return QT_BASE;
-#else
-    return quantize_tiles_use_optimized(major, minor, K, cb) ? QT_OPTIMIZED : QT_BASE;
 #endif
+    return quantize_tiles_use_optimized(major, minor, K, cb) ? QT_OPTIMIZED : QT_BASE;
 }
 
 // Kernel and launch geometry for one (K, codebook, L) on the current device: which implementation,
@@ -195,19 +198,22 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     else
 #endif
     {
-#if defined(USE_ROCM)
-        // gfx1151's 64 KiB LDS cannot hold K=1/2 trellis costs plus the input tile and traceback scratch.
-        // Both HIP kernels use the caller-provided global cost buffers at those K values.
-        const int cost_arrays = K >= 3 ? 2 : 0;
-#else
-        const int cost_arrays = optimized && K == 1 ? 1 : (K >= 2 ? 2 : 0);
-#endif
-        shmem = cost_arrays * edges * sizeof(half) + L * sizeof(half) + 64 + 128;
+        const int cost_arrays = optimized ? (K == 1 ? 1 : 2) : (K >= QT_SHARED_COSTS_MIN_K ? 2 : 0);
+        // The costs-only layout (ROCm) drops the staged input tile and the argmin scratch from the
+        // optimized kernels' shared memory; the generic kernels keep their layout
+        shmem = cost_arrays * edges * sizeof(half)
+            + (optimized && QT_OPTIMIZED_COSTS_ONLY ? 0 : L * sizeof(half) + 64 + 128);
         const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
         const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
         kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
         history_bytes = optimized ? (int64_t) L * edges / (K == 1 ? 8 : 1) : (int64_t) L * edges * 2;
     }
+#if defined(USE_ROCM)
+    // Fail with a usable message rather than the attribute call's generic CUDA error
+    TORCH_CHECK(shmem <= (int) props->sharedMemPerBlock,
+                "quantize_tiles: K = ", K, " needs ", shmem, " bytes of shared memory, the device has ",
+                (int) props->sharedMemPerBlock);
+#endif
     cuda_check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     cudaFuncAttributes attr;
     cuda_check(cudaFuncGetAttributes(&attr, reinterpret_cast<const void*>(kernel)));
@@ -255,7 +261,6 @@ void quantize_tiles
 
     const int edges = 65536 >> K;
     const int num_tiles = input_tiles.size(0);
-    if (!num_tiles) return;
 
     for (const auto& tensor : {input_tiles, output_tiles, output_indices, temp_costs, temp_edges})
     {
@@ -263,13 +268,17 @@ void quantize_tiles
         TORCH_CHECK(tensor.is_contiguous(), "quantize_tiles tensors must be contiguous");
     }
     TORCH_CHECK_DTYPE(temp_costs, kHalf);
-    TORCH_CHECK(temp_costs.numel() > 0, "quantize_tiles requires nonempty cost scratch");
-    int device;
-    cuda_check(cudaGetDevice(&device));
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
     TORCH_CHECK(L == 256 || cb == 2, "quantize_tiles length 160 requires the mul1 codebook");
+
+    // No tiles: nothing to quantize, no scratch needed
+    if (!num_tiles) return;
+
+    TORCH_CHECK(temp_costs.numel() > 0, "quantize_tiles requires nonempty cost scratch");
+    int device;
+    cuda_check(cudaGetDevice(&device));
     const auto launch = qt_launch(device, K, cb, L);
     const bool optimized = launch.mode == QT_OPTIMIZED;
     const bool byte_layout = launch.mode != QT_BASE;
@@ -312,6 +321,70 @@ void quantize_tiles
             (half*) temp_costs.data_ptr(),
             (uint16_t*) temp_edges.data_ptr(),
             lut
+        );
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
+// Fractional-rate quantizer, mul1 codebook only: KA bits per position plus one extra bit where the 16-position MASK is set.
+// Costs and history live in the caller's scratch: temp_costs (batch, 2, 65536 >> KA) half,
+// temp_edges (batch, 256, 65536 >> KA) short
+void quantize_tiles_frac
+(
+    at::Tensor input_tiles,
+    at::Tensor output_tiles,
+    at::Tensor output_indices,
+    at::Tensor temp_costs,
+    at::Tensor temp_edges,
+    int KA,
+    int64_t MASK
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(input_tiles.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DIM(input_tiles, 2);
+    const int L = input_tiles.size(1);
+    TORCH_CHECK(L == 256, "quantize_tiles_frac: tile length must be 256");
+    TORCH_CHECK_SHAPES_FULL(input_tiles, output_indices);
+    TORCH_CHECK_SHAPES_FULL(input_tiles, output_tiles);
+    TORCH_CHECK_DTYPE(input_tiles, kFloat);
+    TORCH_CHECK_DTYPE(output_tiles, kFloat);
+    TORCH_CHECK_DTYPE(output_indices, kShort);
+    TORCH_CHECK_DTYPE(temp_costs, kHalf);
+    TORCH_CHECK_DTYPE(temp_edges, kShort);
+    const int edges_max = 65536 >> KA;
+    TORCH_CHECK_DIM(temp_costs, 3);
+    TORCH_CHECK_SIZE(temp_costs, 1, 2);
+    TORCH_CHECK_SIZE(temp_costs, 2, edges_max);
+    TORCH_CHECK_DIM(temp_edges, 3);
+    TORCH_CHECK_SIZE(temp_edges, 1, L);
+    TORCH_CHECK_SIZE(temp_edges, 2, edges_max);
+    for (const auto& tensor : {input_tiles, output_tiles, output_indices, temp_costs, temp_edges})
+        TORCH_CHECK(tensor.is_contiguous() && tensor.device() == input_tiles.device(), "quantize_tiles_frac: layout");
+    fp_quantize_tiles_kernel kernel = nullptr;
+    struct { int ka; uint32_t mask; fp_quantize_tiles_kernel (*fn)(); } const table[] = {
+        {1, 0xaaaau, &quantize_tiles_frac_kernel_a1_maaaa},
+        {2, 0xaaaau, &quantize_tiles_frac_kernel_a2_maaaa},
+        {3, 0xaaaau, &quantize_tiles_frac_kernel_a3_maaaa},
+    };
+    for (const auto& e : table) if (e.ka == KA && e.mask == (uint32_t) MASK) kernel = e.fn();
+    TORCH_CHECK(kernel, "quantize_tiles_frac: no instance for (KA, MASK) = (", KA, ", ", MASK, ")");
+    const int num_tiles = input_tiles.size(0);
+    if (!num_tiles) return;
+    const int shmem = L * sizeof(half) + 32 * sizeof(int) + 128;
+    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    const int max_batch_size = (int) MIN(temp_costs.size(0), temp_edges.size(0));
+    for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
+    {
+        const int bsz = MIN(max_batch_size, num_tiles - batch_i);
+        kernel<<<bsz, 512, shmem, stream>>>
+        (
+            ((const float*) input_tiles.data_ptr()) + (int64_t) L * batch_i,
+            ((float*) output_tiles.data_ptr()) + (int64_t) L * batch_i,
+            ((uint16_t*) output_indices.data_ptr()) + (int64_t) L * batch_i,
+            (half*) temp_costs.data_ptr(),
+            (uint16_t*) temp_edges.data_ptr(),
+            nullptr
         );
         cuda_check(cudaPeekAtLastError());
     }
@@ -371,9 +444,12 @@ void decode
     TORCH_CHECK_DIM(input_indices, 2);
     TORCH_CHECK_SHAPES_FULL(input_indices, output_tiles);
     TORCH_CHECK_DTYPE(input_indices, kShort);
+    TORCH_CHECK(output_tiles.dtype() == at::kFloat || output_tiles.dtype() == at::kHalf,
+                "decode: output_tiles must be float or half");
 
     int rows = input_indices.size(0);
     int cols = input_indices.size(1);
+    if (!rows || !cols) return;
 
     dim3 blockDim(64);
     dim3 gridDim(CEIL_DIVIDE(cols, 64), rows);
@@ -489,6 +565,8 @@ void test_distribution
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(input, kFloat);
+    TORCH_CHECK_DTYPE(dist_output, kFloat);
+    TORCH_CHECK_DTYPE_OPT(ref_output, kFloat);
 
     uint64_t numel = input.numel();
     float* ref_output_ptr = (float*) OPTPTR(ref_output);
@@ -496,6 +574,9 @@ void test_distribution
     TORCH_CHECK(num_bins <= MAX_BINS, "Too many bins");
     if (ref_output_ptr)
         TORCH_CHECK(num_bins == ref_output.value().numel());
+    // A normalized histogram needs at least one bin and one value
+    TORCH_CHECK(num_bins > 0, "test_distribution: empty histogram (no bins)");
+    TORCH_CHECK(numel > 0, "test_distribution: empty input, the distribution is undefined");
 
     test_distribution_kernel<<<1, NUM_THREADS_TD, 0, stream>>>
     (

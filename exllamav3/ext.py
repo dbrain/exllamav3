@@ -6,6 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
+from .util.cuda_flags import cuda_cflags, extension_sources, hip_include_flags, patch_hip_ninja_file_writer, use_rocm_sdk_devel
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling
@@ -38,8 +39,8 @@ else:
 
             # Possible locations for MSVC, in order of preference
 
-            program_files_x64 = os.environ["ProgramW6432"]
-            program_files_x86 = os.environ["ProgramFiles(x86)"]
+            program_files_x64 = os.environ.get("ProgramW6432", os.environ.get("ProgramFiles", r"C:\Program Files"))
+            program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
 
             msvc_dirs = \
             [
@@ -87,21 +88,12 @@ else:
 
     # compiler flags
 
-    library_dir = os.path.dirname(os.path.abspath(__file__))
-    sources_dir = os.path.join(library_dir, extension_name)
-
     extra_cflags = []
-    extra_cuda_cflags = []
-
-    if torch.version.hip:
-        extra_cuda_cflags += ["-Ofast", "-DUSE_ROCM", "-Wno-register"]
-        extra_cflags += ["-DUSE_ROCM"]
-    else:
-        extra_cuda_cflags += [
-            "-lineinfo", "-O3", "--use_fast_math",
-            "-Xcudafe", "--diag_suppress=177",
-            "-Xcudafe", "--diag_suppress=20012",
-        ]
+    extra_cuda_cflags = cuda_cflags(
+        cuda_home = torch.utils.cpp_extension.CUDA_HOME,
+        debug = ext_debug,
+        hip = bool(torch.version.hip),
+    )
 
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
@@ -114,6 +106,9 @@ else:
         if ext_debug:
             extra_cflags += ["/Zi"]
             extra_cuda_cflags += []
+    elif torch.version.hip:
+        # torch hands the C++ flags to hipcc as well, and -Ofast implies fast-math (see hip_cflags)
+        extra_cflags += ["-O3"]
     else:
         extra_cflags += ["-Ofast"]
         extra_cuda_cflags += []
@@ -121,17 +116,19 @@ else:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
             extra_cuda_cflags += []
 
-    if not windows and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
+    # Windows: torch's JIT runs bare cl for the C++ sources and never passes -ccbin, so keep nvcc on the same cl.exe.
+    # ROCm: CUDAHOSTCXX belongs to nvcc; hipcc takes no -ccbin
+    if not windows and not torch.version.hip and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
         extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
+    elif windows and os.environ.get("CUDAHOSTCXX"):
+        print(
+            " !! CUDAHOSTCXX is not used by the JIT build on Windows; "
+            "nvcc uses the same cl.exe as the C++ sources (see doc/env_vars.md)",
+            file = sys.stderr
+        )
 
-    if torch.version.hip:
-        extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
-
-    if verbose:
-        if torch.version.hip:
-            extra_cuda_cflags += ["-verbose"]
-        else:
-            extra_cuda_cflags += ["--ptxas-options=-v"]
+    if verbose and not torch.version.hip:
+        extra_cuda_cflags += ["--ptxas-options=-v"]
 
     # linker flags
 
@@ -141,71 +138,89 @@ else:
         extra_ldflags += ["cublas.lib"]
         if sys.base_prefix != sys.prefix:
             extra_ldflags += [f"/LIBPATH:{os.path.join(sys.base_prefix, 'libs')}"]
+    elif torch.version.hip:
+        # The ROCm extension calls hipBLAS directly (hgemm.cu, graph.cu) and rocBLAS for the hgemm algo tuner
+        extra_ldflags += ["-lhipblas", "-lrocblas"]
 
     # sources
 
-    from .exllamav3_ext.build_config import get_sources as _get_sources
-    is_rocm = bool(torch.version.hip)
-    sources = _get_sources(sources_dir, is_rocm)
+    library_dir = os.path.dirname(os.path.abspath(__file__))
+    sources_dir = os.path.join(library_dir, extension_name)
+    sources = extension_sources(sources_dir, hip = bool(torch.version.hip))
+    if torch.version.hip:
+        # With no target list, torch builds for every architecture it supports, wave64 ones included, which
+        # the kernels cannot compile for. maybe_set_rocm_arch_env fills it in from the visible devices, so an
+        # empty list here means HIP sees none (CUDA_VISIBLE_DEVICES is honored by HIP as well)
+        if not os.environ.get("PYTORCH_ROCM_ARCH"):
+            raise RuntimeError(
+                "No ROCm device is visible to build the extension for. Check CUDA_VISIBLE_DEVICES and "
+                "HIP_VISIBLE_DEVICES (HIP honors both), or set PYTORCH_ROCM_ARCH (e.g. gfx1100) explicitly."
+            )
+        use_rocm_sdk_devel(torch.utils.cpp_extension)
+        extra_cflags += hip_include_flags(sources_dir)
+        extra_cuda_cflags += hip_include_flags(sources_dir)
+        # Flags hipcc would add from its environment go on the command line instead, where the ccache wrapper
+        # (hip_compiler_wrapper) hashes them; left to hipcc, a changed define is a cache hit on the old object
+        extra_cuda_cflags += os.environ.get("HIPCC_COMPILE_FLAGS_APPEND", "").split()
 
     # Load extension
 
     maybe_set_arch_list_env()
-    exllamav3_ext = load(
-        name = extension_name,
-        sources = sources,
-        extra_include_paths = [sources_dir],
-        verbose = verbose,
-        extra_ldflags = extra_ldflags,
-        extra_cuda_cflags = extra_cuda_cflags,
-        extra_cflags = extra_cflags
-    )
+    if torch.version.hip:
+        # Dependency files for the HIP compile rule (header edits rebuild their includers) and the
+        # ccache/sccache wrapper torch applies to CUDA builds only
+        patch_hip_ninja_file_writer(torch.utils.cpp_extension)
+    try:
+        exllamav3_ext = load(
+            name = extension_name,
+            sources = sources,
+            extra_include_paths = [sources_dir],
+            verbose = verbose,
+            extra_ldflags = extra_ldflags,
+            extra_cuda_cflags = extra_cuda_cflags,
+            extra_cflags = extra_cflags
+        )
+    except IndexError as e:
+        # With no list given (or "native"), torch derives the architectures from the visible GPUs and
+        # fails with an IndexError when there are none
+        if torch.version.cuda and os.environ.get("TORCH_CUDA_ARCH_LIST", "") in ("", "native") and \
+                not torch.cuda.device_count():
+            raise RuntimeError(
+                f"No CUDA device is visible to determine the architectures to build {extension_name} for. "
+                "Set TORCH_CUDA_ARCH_LIST to the target architectures, e.g. TORCH_CUDA_ARCH_LIST=\"8.6;8.9+PTX\""
+            ) from e
+        raise
 
 
-# When a BC_* class is not compiled into the extension (e.g. on ROCm where the
-# libtorch/ sources are excluded), make attribute access return a callable that
-# yields None instead of raising AttributeError. This lets call sites write
-# ``self.bc = ext.BC_Mamba2(...)`` unconditionally — they get None on platforms
-# that lack the class, and the real object on platforms that have it.
+# Kyojin's ROCm module paths (hip_gemv, fused MoE, GDN/KDA HIP chains) are taken only when a module has no
+# bound C++ block (self.bc is None), so the BC_* classes stay masked on ROCm unless EXL3_HIP_BC=1. BC_SAM has
+# no Python-side equivalent and stays native.
 
 if torch.version.hip:
-    from .ext_fallbacks import _BCNone
-
-    _bc_none = _BCNone()
-
-    # BC_* constructors: return None when the class isn't compiled
-    for _name in [
-        'BC_Mamba2', 'BC_GatedDeltaNet', 'BC_GatedDeltaNetSplit',
-        'BC_MLP', 'BC_GatedMLP', 'BC_BlockSparseMLP',
-        'BC_Attention', 'BC_GatedRMSNorm',
-        'BC_LinearEXL3', 'BC_LinearFP16',
-        'BC_DSV4Compressor', 'BC_DSV4Attention', 'BC_DSV4BatchAttention',
-        'BC_MLAttention', 'BC_SAM',
-    ]:
-        if not hasattr(exllamav3_ext, _name):
-            setattr(exllamav3_ext, _name, _bc_none)
-
-    # C++ functions from excluded source files: replace with PyTorch implementations
     from . import ext_fallbacks as _fb
 
-    for _name in [
-        'silu_mul', 'silu_oai_mul', 'gelu_mul', 'relu2_mul', 'relu_mul', 'xielu',
-        'apply_logit_bitmask',
-        'mul_sigmoid_', 'mul_sigmoid_broadcast_', 'mul_softplus_broadcast_',
-        'add_sigmoid_gate', 'add_sigmoid_gate_proj', 'deinterleave_qg',
-        'rms_norm', 'rms_norm_res_in', 'gated_rms_norm',
-        'softcap',
-        'quant_cache_cont', 'dequant_cache_cont',
-        'quant_cache_paged', 'dequant_cache_paged', 'dequant_cache_paged_window',
-        'count_inf_nan', 'dsa_topk',
-    ]:
-        if not hasattr(exllamav3_ext, _name):
-            setattr(exllamav3_ext, _name, getattr(_fb, _name))
+    if os.environ.get("EXL3_HIP_BC", "0") != "1":
+        _bc_none = _fb._BCNone()
+        for _name in [
+            'BC_Mamba2', 'BC_GatedDeltaNet', 'BC_GatedDeltaNetSplit',
+            'BC_MLP', 'BC_GatedMLP', 'BC_BlockSparseMLP',
+            'BC_Attention', 'BC_GatedRMSNorm',
+            'BC_LinearEXL3', 'BC_LinearFP16',
+            'BC_DSV4Compressor', 'BC_DSV4Attention', 'BC_DSV4BatchAttention',
+            'BC_MLAttention',
+        ]:
+            setattr(exllamav3_ext, _name, _bc_none)
 
-    # Native RMSNorm (exl3_dec.cu) for the common shapes; everything else keeps the torch fallback
+    # r35: runtime-mutable knobs (in-process A/B)
+    ROCM_KNOBS = {"silu_lim": os.environ.get("EXL3_FUSE_SILU_LIM", "1") != "0",
+                  # fp16 gate (KDA z under EXL3_KDA_F16_GATES) into the fused gated norm; "0" = the torch
+                  # fallback chain (r2 glm-next: cost 4K prefill -2.5 %, the F16_GATES "loss")
+                  "gnorm_f16g": os.environ.get("EXL3_FUSE_GNORM_F16G", "1") != "0"}
+
+    # Native RMSNorm (exl3_dec.cu) for the common shapes; everything else goes to the upstream kernel (norm.cu)
     if hasattr(exllamav3_ext, "exl3_dec_rms_norm") and os.environ.get("EXL3_DEC_NORM", "1") != "0":
-        _fb_rms_norm = _fb.rms_norm
-        _fb_rms_norm_res_in = _fb.rms_norm_res_in
+        _fb_rms_norm = exllamav3_ext.rms_norm
+        _fb_rms_norm_res_in = exllamav3_ext.rms_norm_res_in
         _norm_dt = (torch.float16, torch.float32)
 
         def _w_ok(w, dim):
@@ -233,7 +248,16 @@ if torch.version.hip:
 
     # Fused elementwise ops (fused_elt_rocm.cu): one launch instead of the fallback's torch chain
     if hasattr(exllamav3_ext, "fused_gated_rms_norm") and os.environ.get("EXL3_FUSE_GNORM", "1") != "0":
-        _fb_gated_rms_norm = _fb.gated_rms_norm
+        _native_gated_rms_norm = exllamav3_ext.gated_rms_norm
+
+        def _fb_gated_rms_norm(x, w, y, g, eps, constant_bias, w_groups, gate_first, gate_act):
+            if (x.dtype == torch.bfloat16 and w.dtype in (torch.float32, torch.bfloat16) and
+                    y.dtype in (torch.float16, torch.float32) and g.dtype in (torch.bfloat16, torch.float32) and
+                    x.is_contiguous() and w.is_contiguous() and y.is_contiguous() and g.is_contiguous() and
+                    x.shape[-1] % 4 == 0):
+                _native_gated_rms_norm(x, w, y, g, eps, constant_bias, w_groups, gate_first, gate_act)
+            else:
+                _fb.gated_rms_norm(x, w, y, g, eps, constant_bias, w_groups, gate_first, gate_act)
 
         def _gated_rms_norm_rocm(x, w, y, g, eps, constant_bias, w_groups, gate_first, gate_act = 0, y_pitch = 0):
             if (x.is_cuda and x.dtype == torch.bfloat16 and y.dtype in (torch.float16, torch.float32) and
@@ -263,7 +287,7 @@ if torch.version.hip:
 
     # deinterleave_qg: hand HIP copy kernel (modules/ple_fn/ple_hip.hip), pure copy so bitwise equal; EXL3_DQ_HIP=1
     if True:  # flag read per call so one process can A/B it
-        _fb_deinterleave_qg = _fb.deinterleave_qg
+        _fb_deinterleave_qg = exllamav3_ext.deinterleave_qg
 
         def _deinterleave_qg_rocm(qg, q, g, head_dim):
             if (os.environ.get("EXL3_DQ_HIP", "0") == "1" and head_dim % 8 == 0 and qg.is_cuda and qg.dtype == torch.float16 and q.dtype == torch.float16
@@ -281,13 +305,8 @@ if torch.version.hip:
 
         setattr(exllamav3_ext, "deinterleave_qg", _deinterleave_qg_rocm)
 
-    # r35: runtime-mutable knobs (in-process A/B)
-    ROCM_KNOBS = {"silu_lim": os.environ.get("EXL3_FUSE_SILU_LIM", "1") != "0",
-                  # fp16 gate (KDA z under EXL3_KDA_F16_GATES) into the fused gated norm; "0" = the torch
-                  # fallback chain (r2 glm-next: cost 4K prefill -2.5 %, the F16_GATES "loss")
-                  "gnorm_f16g": os.environ.get("EXL3_FUSE_GNORM_F16G", "1") != "0"}
     if hasattr(exllamav3_ext, "fused_silu_mul") and os.environ.get("EXL3_FUSE_SILU", "1") != "0":
-        _fb_silu_mul = _fb.silu_mul
+        _fb_silu_mul = exllamav3_ext.silu_mul
 
         def _silu_mul_rocm(x, y, z, act_limit = 0.0):
             if ((act_limit == 0.0 or ROCM_KNOBS["silu_lim"]) and x.is_cuda and
@@ -296,13 +315,14 @@ if torch.version.hip:
                     y.is_contiguous() and z.is_contiguous() and x.shape == y.shape == z.shape):
                 exllamav3_ext.fused_silu_mul(x, y, z, float(act_limit))
                 return
-            _fb_silu_mul(x, y, z, act_limit)
+            _fb_silu_mul(x, y, z, float(act_limit))
 
         setattr(exllamav3_ext, "silu_mul", _silu_mul_rocm)
 
     # Keep the public API stable while using the native QSA kernel (k <= 512, moeA5) only for its
     # validated gfx12 wave32 shape. Everything else retains the general PyTorch fallback.
     if hasattr(exllamav3_ext, "dsa_topk_gfx12"):
+        _native_dsa_topk = exllamav3_ext.dsa_topk
         # EXL3_DSA_TOPK_V2=1 (default off; env read per call): the row-in-registers kernel (dsa_topk_gfx12_v2, one memory
         # pass instead of four, bitwise-identical selection) for rows of 8192 < width <= 32768 with a 16-byte aligned base
         # (narrower rows are not faster: 82 vs 115 us at 2048). topk_v2_switch['on'] lets a harness flip it without the env.
@@ -321,14 +341,34 @@ if torch.version.hip:
                         hasattr(exllamav3_ext, "dsa_topk_gfx12_v2")):
                     return exllamav3_ext.dsa_topk_gfx12_v2(scores, indices, k, topk_v2["threads"])
                 return exllamav3_ext.dsa_topk_gfx12(scores, indices, k)
-            return _fb.dsa_topk(scores, indices, k, t_ptr, t_seq)
+            return _native_dsa_topk(scores, indices, k, t_ptr, t_seq)
 
         setattr(exllamav3_ext, "dsa_topk", _dsa_topk_rocm)
 
-    # Constants and functions guarded by fused_sampler_enable in generator/sampler/custom.py.
-    # Disable the fused sampler path on ROCm by setting the flag and providing stub values.
-    if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS'):
-        setattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS', 0)
-    if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE'):
-        setattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE', 0)
-    os.environ['EXL3_FUSED_SAMPLER'] = '0'
+    if os.environ.get("EXL3_QWRITE_TRITON", "1") != "0":
+        _native_quant_cache_paged = exllamav3_ext.quant_cache_paged
+
+        def _quant_cache_paged_rocm(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
+                                    cache_seqlens, block_table, page_size, seq_len, compand_a = 0.0, in_contiguous = False):
+            if (
+                compand_a == 0.0 and seq_len > 0 and k_in.is_cuda and
+                k_out.ndim == 3 and v_out.ndim == 3 and k_out_scales.shape[-1] in (8, 16, 32, 64) and
+                k_out.shape[-1] == k_out_scales.shape[-1] * 8 and v_out.shape[-1] == k_out.shape[-1] and
+                v_out_scales.shape == k_out_scales.shape and
+                k_in.dtype == torch.float16 and v_in.dtype == torch.float16 and
+                k_in.is_contiguous() and v_in.is_contiguous() and page_size == 256 and
+                k_out.dtype == torch.int32 and v_out.dtype == torch.int32 and
+                k_out_scales.dtype == torch.float16 and v_out_scales.dtype == torch.float16 and
+                cache_seqlens.dtype == torch.int32 and block_table.dtype == torch.int32 and
+                k_in.shape == v_in.shape and
+                k_in.numel() >= block_table.shape[0] * seq_len * (k_out_scales.shape[-1] * 32) and
+                (in_contiguous or k_in.numel() == k_out.shape[0] * page_size * k_out_scales.shape[-1] * 32)
+            ):
+                from .modules.attention_fn.qwrite_triton import quant_cache_paged8
+                quant_cache_paged8(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
+                                   cache_seqlens, block_table, seq_len, in_contiguous)
+                return
+            _native_quant_cache_paged(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
+                                      cache_seqlens, block_table, page_size, seq_len, compand_a, in_contiguous)
+
+        setattr(exllamav3_ext, "quant_cache_paged", _quant_cache_paged_rocm)

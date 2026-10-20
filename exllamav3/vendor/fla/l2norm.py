@@ -12,12 +12,13 @@ import triton
 import triton.language as tl
 from .utils import IS_AMD
 from .utils import autotune_cache_kwargs
+from .utils import autotune
 
 BT_LIST = [8, 16, 32, 64, 128]
 NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 
 
-@triton.autotune(
+@autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in NUM_WARPS_AUTOTUNE],
     key=["D"],
     **autotune_cache_kwargs,
@@ -51,7 +52,7 @@ def l2norm_fwd_kernel1(
 L2_BT, L2_WARPS = 8, 8
 
 
-@triton.autotune(
+@autotune(
     configs=[triton.Config({"BT": L2_BT}, num_warps=L2_WARPS)],
     key=["D", "NB"],
     **autotune_cache_kwargs,

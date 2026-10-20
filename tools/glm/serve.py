@@ -134,9 +134,6 @@ SPEED_ENV = {
     # recurrent-state stashes (mid-prompt checkpoints, prompt-end tail) copy to pinned host memory without a host sync: bitwise
     # (first-token + tail-resume logits equal, 5 reps x 8K/32K, base vs on); removes ~33 x 0.6 ms of idle at the end of a prefill. 0 = off.
     "EXL3_NC2_ASYNC_STASH": "1",
-    # a speculative rewind records the accepted recurrent-state history index in a per-slot base instead of copying
-    # it back to index 0 (272 MiB, ~1.3 ms per launch): bit-exact (ids equal off vs on, GLM KDA depth 2). 0 = copy.
-    "EXL3_STATE_REBASE": "1",
     # 14/10: verify of 5..8 rows (GLM_NGRAM lookup rounds of 4..7 copied tokens), the Qwen server's switches: MoE row split,
     # one-launch 8-row fused MoE, one-launch 6-row dense GEMV. Bit-identical per row, rows <= 4 untouched (--num-draft 2 rounds).
     # Harness, one load each: 6-row round +6.9 % (RM6), 8-row round +2.6 %, ids equal. 0 = off.

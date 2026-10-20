@@ -1,5 +1,15 @@
 #pragma once
 
+#include "../ptx_portable.cuh"
+
+// Turns a 16-bit codebook index product into fp16 bit patterns: (x & 0x8fff8fff) ^ 0x3b603b60. The CUDA
+// build issues it as one lop3; ROCm has no inline PTX and uses the C form (ptx_portable.cuh)
+#if defined(USE_ROCM)
+    #define EXL3_CB_LOP3(x) (x) = exl3_lop3_6a((x), 0x8fff8fffu, 0x3b603b60u)
+#else
+    #define EXL3_CB_LOP3(x) asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x))
+#endif
+
 // This used to force integer MAD on sm_86 via inline asm, which outperformed the IMUL emitted by older
 // nvcc versions on the RTX 3090. As of CUDA 13.2 the workaround has inverted: the plain multiply is ~4%
 // faster end-to-end at m=1. Kept as a hook (CUDA-only; the inline PTX does not compile under hipcc)
@@ -82,18 +92,11 @@ __device__ inline half2 decode_mul1_product_2_sad(uint32_t x0, uint32_t x1)
 }
 #endif
 
-// PTX lop3 LUT 0x6a with operands (a, b, c) implements c ^ (a & b).
-// Keep this expression portable instead of relying on inline PTX.
-__device__ __forceinline__ uint32_t lop3_0x6a(uint32_t a, uint32_t b, uint32_t c)
-{
-    return c ^ (a & b);
-}
-
 // Ditto mcg (cb 1)
 __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)
 {
-    x0 = lop3_0x6a(x0, 0x8fff8fffu, 0x3b603b60u);
-    x1 = lop3_0x6a(x1, 0x8fff8fffu, 0x3b603b60u);
+    EXL3_CB_LOP3(x0);
+    EXL3_CB_LOP3(x1);
     half2_uint32 xu0(x0);
     half2_uint32 xu1(x1);
     half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
@@ -108,7 +111,7 @@ __device__ inline half decode_3inst(uint32_t x)
     {
         x *= 89226354u;
         x += 64248484u;
-        x = lop3_0x6a(x, 0x8fff8fffu, 0x3b603b60u);
+        EXL3_CB_LOP3(x);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -117,7 +120,7 @@ __device__ inline half decode_3inst(uint32_t x)
         x *= 0xCBAC1FEDu;
         // x = mul_const_u32<0xCBAC1FEDu>(x);
 
-        x = lop3_0x6a(x, 0x8fff8fffu, 0x3b603b60u);
+        EXL3_CB_LOP3(x);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -146,8 +149,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         x1 *= 89226354u;
         x0 += 64248484u;
         x1 += 64248484u;
-        x0 = lop3_0x6a(x0, 0x8fff8fffu, 0x3b603b60u);
-        x1 = lop3_0x6a(x1, 0x8fff8fffu, 0x3b603b60u);
+        EXL3_CB_LOP3(x0);
+        EXL3_CB_LOP3(x1);
         half2_uint32 xu0(x0);
         half2_uint32 xu1(x1);
         half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);

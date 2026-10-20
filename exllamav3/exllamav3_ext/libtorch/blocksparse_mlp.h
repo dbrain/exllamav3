@@ -42,19 +42,19 @@ struct BC_BlockSparseMLP
     at::Tensor gate_ptrs_trellis;   at::Tensor gate_ptrs_trellis_cpu;
     at::Tensor gate_ptrs_suh;       at::Tensor gate_ptrs_suh_cpu;
     at::Tensor gate_ptrs_svh;       at::Tensor gate_ptrs_svh_cpu;
-    int gate_K;
+    float gate_K;
     bool gate_mcg;
     bool gate_mul1;
     at::Tensor up_ptrs_trellis;     at::Tensor up_ptrs_trellis_cpu;
     at::Tensor up_ptrs_suh;         at::Tensor up_ptrs_suh_cpu;
     at::Tensor up_ptrs_svh;         at::Tensor up_ptrs_svh_cpu;
-    int up_K;
+    float up_K;
     bool up_mcg;
     bool up_mul1;
     at::Tensor down_ptrs_trellis;   at::Tensor down_ptrs_trellis_cpu;
     at::Tensor down_ptrs_suh;       at::Tensor down_ptrs_suh_cpu;
     at::Tensor down_ptrs_svh;       at::Tensor down_ptrs_svh_cpu;
-    int down_K;
+    float down_K;
     bool down_mcg;
     bool down_mul1;
     bool act_silu;
@@ -83,7 +83,26 @@ struct BC_BlockSparseMLP
 
     // Validated static parameter block of the fused decode kernels (built in the constructor)
     MoeCoopParams coop_p;
-    int coop_K_gu, coop_K_d, coop_cb;
+    float coop_K_gu, coop_K_d; int coop_cb;
+
+    // Shared expert as its own one-expert fused launch (at its own bit width) instead of the
+    // three latency-bound GEMV launches of the BC_GatedMLP graph; the routed launch merges its
+    // output (through the sigmoid gate when there is one) exactly as before. Built when enabled
+    // and the shared MLP is EXL3 with 128-aligned widths
+    bool sh_coop = false;
+    MoeCoopParams sh_coop_p;
+    float sh_K_gu = 0, sh_K_d = 0; int sh_cb = 0;
+    std::vector<at::Tensor> sh_tables;      // int64 pointer tables (one expert) and scratch, kept alive
+    at::Tensor sh_sel, sh_rw;               // (MAX_BSZN, 1): expert 0, weight 1
+
+#if defined(USE_ROCM)
+    // RDNA fused decode (rocm/quant/exl3_gemv_multirow_rdna.cu, exl3_rocm_moe_decode): taken by run_bszN
+    // for gated SiLU experts without biases or expert-range masking; anything else keeps the kernels above
+    bool rdna_moe = false;
+    at::Tensor rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh;     // (2E) gate tables then up tables
+    int rdna_K_gu = 0, rdna_K_d = 0, rdna_cb = 0;
+    bool run_bszN_rdna(const at::Tensor& y, const at::Tensor& selected_experts, const at::Tensor& routing_weights);
+#endif
 
     int max_experts_per_token;
     int max_tokens_per_expert;
@@ -117,19 +136,19 @@ struct BC_BlockSparseMLP
         at::Tensor _gate_ptrs_trellis,
         at::Tensor _gate_ptrs_suh,
         at::Tensor _gate_ptrs_svh,
-        int _gate_K,
+        float _gate_K,
         bool _gate_mcg,
         bool _gate_mul1,
         at::Tensor _up_ptrs_trellis,
         at::Tensor _up_ptrs_suh,
         at::Tensor _up_ptrs_svh,
-        int _up_K,
+        float _up_K,
         bool _up_mcg,
         bool _up_mul1,
         at::Tensor _down_ptrs_trellis,
         at::Tensor _down_ptrs_suh,
         at::Tensor _down_ptrs_svh,
-        int _down_K,
+        float _down_K,
         bool _down_mcg,
         bool _down_mul1,
         bool _act_silu,
@@ -148,7 +167,8 @@ struct BC_BlockSparseMLP
         c10::optional<at::Tensor> _gate_bias_ptrs,
         c10::optional<at::Tensor> _up_bias_ptrs,
         c10::optional<at::Tensor> _down_bias_ptrs,
-        bool _act_relu2 = false
+        bool _act_relu2 = false,
+        bool _sh_coop = false
     );
 
     void run_bszN

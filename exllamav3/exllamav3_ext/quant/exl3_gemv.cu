@@ -1,28 +1,18 @@
 #if defined(USE_ROCM)
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#else
-#include <cuda_fp16.h>
-#endif
 #include "exl3_gemv.cuh"
 #include "hadamard.cuh"
-#if defined(USE_ROCM)
 #include "exl3_gemv_int8.cuh"   // fused int8-activation GEMV (mul1 tensors, m <= 2), opt-in via EXL3_INT8_GEMV
-#endif
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/ops/empty.h>
-#if !defined(USE_ROCM)
-#include <cooperative_groups.h>
-namespace cg = cooperative_groups;
-#endif
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
-#if defined(USE_ROCM)
 #include "exl3_moe_valu.cuh"   // VALU grouped-MoE decode matvec, opt-in EXL3_MOE_VALU=1 (K2 and K4 experts)
-#endif
 #include "exl3_devctx.cuh"
 #include <cstdio>
 #include <cstring>
@@ -32,19 +22,15 @@ namespace cg = cooperative_groups;
 #include <algorithm>
 
 /*
-QTIP-style small-m GEMV path, kernel in exl3_gemv_kernel.cuh. Dispatched from exl3_gemm via
-exl3_gemv_try_launch when the shape heuristic applies, or forced through the exl3_gemv entry
-point. Kernel arguments and graph parameter offsets are identical to exl3_gemm_kernel.
-
-Env: EXL3_GEMV = 0 disables the path, 1/unset = heuristic (default), 2 = use wherever the hard
-constraints allow (testing). EXL3_GEMV_DEBUG=1 prints each newly queried kernel occupancy.
-
-The CUDA heuristic envelope (measured on RTX 3090 at 4 bpw and m <= 8) favors the narrow
-config at attention-projection sizes (n <= 4096) and the wide config at large-n/small-k FFN
-sizes. HIP gfx12 additionally supports m <= 16 through its 16-row WMMA mode.
+RDNA (gfx11.5 / gfx12) WMMA small-m GEMV and the grouped-MoE decode/prefill paths built on it, kernel body
+in exl3_gemv_kernel.cuh. The host applies the input and output Hadamard transforms around the main GEMV loop.
+exl3_gemv_hip is the forced entry point: it returns false, launching nothing, for calls its kernels do not
+instantiate (fractional K other than 1.5 / 2.5 / 3.5, K > 6, m > 16, unsupported arch), which the caller
+then hands to the RDNA GEMV behind exl3_gemv (rocm/quant/exl3_gemv_rdna.cu). exl3_gemm's small-m dispatch
+(exl3_gemv_try_launch) is the RDNA GEMV's as well. EXL3_GEMV_DEBUG=1 prints each newly queried kernel
+occupancy.
 */
 
-#if defined(USE_ROCM)
 constexpr int EXL3_GEMV_ROCM_MAX_M = 16;
 
 
@@ -1152,15 +1138,6 @@ void exl3_moe_gfx12_k3_prefill
     cuda_check(hipPeekAtLastError());
 }
 
-#endif // USE_ROCM
-
-static int exl3_gemv_env_mode()
-{
-    const char* env = std::getenv("EXL3_GEMV");
-    if (!env) return 1;
-    return atoi(env);
-}
-
 static bool exl3_gemv_debug()
 {
     static const bool enabled = []
@@ -1176,7 +1153,6 @@ static bool exl3_gemv_debug()
 //   0 = none, 1 = gfx12 (RDNA4), 2 = gfx11.5 (RDNA3.5 / Strix Halo)
 int exl3_gemv_wmma_family(int device)
 {
-#if defined(USE_ROCM)
     static std::map<int, int> family_cache;
     static std::mutex family_cache_mtx;
     std::lock_guard<std::mutex> lock(family_cache_mtx);
@@ -1195,52 +1171,273 @@ int exl3_gemv_wmma_family(int device)
     else if (is("gfx1150") || is("gfx1151") || is("gfx1152")) family = 2;
     family_cache[device] = family;
     return family;
-#else
-    (void) device;
-    return 1;
-#endif
 }
 
 // True when the EXL3 WMMA GEMV can run. NOTE: the gfx12-only MoE/routing entry
 // points must check exl3_gemv_wmma_family(device) == 1 instead of this.
 bool exl3_gemv_supported(int device)
 {
-#if defined(USE_ROCM)
     return exl3_gemv_wmma_family(device) != 0;
-#else
-    (void) device;
+}
+
+static void* exl3_gemv_hip_select_kernel(int bits, int cb, bool c_fp32, int mmode, int cfg)
+{
+    // Only the smem-staged extraction is instantiated: gfx12 WMMA operands must not be fed
+    // through __shfl_sync (hardware exception)
+    #define SEL(bits_, cb_, fp32_, mm_, cfg_) \
+        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_) \
+            return (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, true>;
+    #define SEL_GRID(bits_, cb_) \
+        SEL(bits_, cb_, false, 0, 0) SEL(bits_, cb_, false, 0, 1) \
+        SEL(bits_, cb_, false, 1, 0) SEL(bits_, cb_, false, 1, 1) \
+        SEL(bits_, cb_, true,  0, 0) SEL(bits_, cb_, true,  0, 1) \
+        SEL(bits_, cb_, true,  1, 0) SEL(bits_, cb_, true,  1, 1)
+    #define SEL_MMODE2_GRID(bits_, cb_) \
+        SEL(bits_, cb_, false, 2, 0) SEL(bits_, cb_, false, 2, 1) \
+        SEL(bits_, cb_, true,  2, 0) SEL(bits_, cb_, true,  2, 1)
+    SEL_GRID(4, 0) SEL_GRID(4, 1) SEL_GRID(4, 2)
+    SEL_GRID(2, 1) SEL_GRID(2, 2)
+    SEL_GRID(3, 1) SEL_GRID(3, 2)
+    SEL_GRID(5, 1) SEL_GRID(5, 2)
+    SEL_GRID(6, 1) SEL_GRID(6, 2)
+    SEL_MMODE2_GRID(3, 2) SEL_MMODE2_GRID(4, 1) SEL_MMODE2_GRID(4, 2)
+    SEL_MMODE2_GRID(5, 2) SEL_MMODE2_GRID(6, 1) SEL_MMODE2_GRID(6, 2)
+    #undef SEL_MMODE2_GRID
+    #undef SEL_GRID
+    #undef SEL
+    return nullptr;
+}
+
+static void* exl3_gemv_hip_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg)
+{
+    #define SEL_HALF(bits_, fp32_, mm_, cfg_) \
+        if (bits == bits_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_) \
+            return (void*) exl3_gemv_kernel<bits_, fp32_, 2, mm_, cfg_, true, true>;
+    #define SEL_HALF_GRID(bits_) \
+        SEL_HALF(bits_, false, 0, 0) SEL_HALF(bits_, false, 0, 1) \
+        SEL_HALF(bits_, false, 1, 0) SEL_HALF(bits_, false, 1, 1) \
+        SEL_HALF(bits_, true,  0, 0) SEL_HALF(bits_, true,  0, 1) \
+        SEL_HALF(bits_, true,  1, 0) SEL_HALF(bits_, true,  1, 1)
+    #define SEL_HALF_MMODE2(bits_) \
+        SEL_HALF(bits_, false, 2, 0) SEL_HALF(bits_, false, 2, 1) \
+        SEL_HALF(bits_, true,  2, 0) SEL_HALF(bits_, true,  2, 1)
+    SEL_HALF_GRID(1) SEL_HALF_GRID(2) SEL_HALF_GRID(3)
+    SEL_HALF_MMODE2(1) SEL_HALF_MMODE2(2) SEL_HALF_MMODE2(3)
+    #undef SEL_HALF_MMODE2
+    #undef SEL_HALF_GRID
+    #undef SEL_HALF
+    return nullptr;
+}
+
+// Kernel for a GEMV call the RDNA WMMA body can take (2..6 bpw, or 1.5 / 2.5 / 3.5 bpw with mul1, m <= 16,
+// k and n multiples of 128, gfx11.5 / gfx12), else nullptr. Narrow config up to n = 8192, wide above
+static void* exl3_gemv_hip_select
+(
+    int size_m,
+    int size_k,
+    int size_n,
+    int K,
+    bool half_k,
+    int cb,
+    bool c_fp32,
+    int device,
+    int& grid,
+    int& block_dim
+)
+{
+    if (half_k)
+    {
+        if (K < 1 || K > 3 || cb != 2) return nullptr;
+    }
+    else
+    {
+        if (K < 2 || K > 6) return nullptr;
+        if (K != 4 && cb == 0) return nullptr;
+        // Integer K2 has no MMODE-2 instantiation; its established envelope ends at eight rows
+        if (K == 2 && size_m > EXL3_GEMV_MAX_M) return nullptr;
+    }
+    if (size_m < 1 || size_m > EXL3_GEMV_ROCM_MAX_M) return nullptr;
+    if (size_k % 128 || size_n % 128 || !size_n) return nullptr;
+    if (!exl3_gemv_supported(device)) return nullptr;
+
+    const int mmode = size_m == 1 ? 0 : (size_m <= EXL3_GEMV_MAX_M ? 1 : 2);
+    const int cfg = size_n <= 8192 ? 0 : 1;
+    void* kernel = half_k ? exl3_gemv_hip_select_kernel_half(K, c_fp32, mmode, cfg)
+                          : exl3_gemv_hip_select_kernel(K, cb, c_fp32, mmode, cfg);
+    if (!kernel) return nullptr;
+    block_dim = cfg == 0 ? 512 : 256;
+
+    if (exl3_gemv_debug())
+    {
+        static std::map<void*, int> occ_cache[MAX_DEVICES];
+        if (occ_cache[device].find(kernel) == occ_cache[device].end())
+        {
+            int blocks_per_sm;
+            cuda_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+            occ_cache[device][kernel] = blocks_per_sm;
+            std::fprintf(stderr, "EXL3_GEMV_DEBUG device=%d kernel=%p block_dim=%d blocks_per_sm=%d\n",
+                         device, kernel, block_dim, blocks_per_sm);
+        }
+    }
+
+    // The body is a grid-stride loop and every group is processed exactly once by one block with a
+    // block-local reduction, so output is bit-identical for any grid >= 1. The launch is an ordinary
+    // stream-ordered one (extra blocks queue behind the co-resident ones); capping the grid at
+    // co-residency measurably throttles the multi-row cells (M=4: -4.5..-10.7% per call, lm_head
+    // M=16: -15.5%; M=1 neutral)
+    grid = size_n / (cfg == 0 ? 32 : 64);
+    return kernel;
+}
+
+bool exl3_gemv_hip
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const c10::optional<at::Tensor>& suh,
+    const c10::optional<at::Tensor>& A_had,
+    const c10::optional<at::Tensor>& svh,
+    bool mcg,
+    bool mul1
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    if (B.dim() != 3 || A.dim() < 1 || C.dim() < 1) return false;
+    if (A.dtype() != at::kHalf || B.dtype() != at::kShort) return false;
+    const bool c_fp32 = C.dtype() == at::kFloat;
+    if (!c_fp32 && C.dtype() != at::kHalf) return false;
+    if (mcg && mul1) return false;
+    if (!A.is_contiguous() || !B.is_contiguous() || !C.is_contiguous()) return false;
+    if (B.device() != A.device() || C.device() != A.device()) return false;
+    if (!suh.has_value() || !A_had.has_value() || !svh.has_value()) return false;
+
+    int size_m = 1;
+    for (int d = 0; d < A.dim() - 1; ++d) size_m *= A.size(d);
+    const int size_k = A.size(-1);
+    const int size_n = B.size(1) * 16;
+    if (B.size(0) * 16 != size_k || C.size(-1) != size_n) return false;
+    if (C.numel() < (int64_t) size_m * size_n) return false;
+    const int tile_u16 = B.size(2);
+    const bool half_k = tile_u16 % 16 != 0;
+    const int K = tile_u16 / 16;
+    if (half_k && (tile_u16 % 16 != 8 || !mul1)) return false;
+
+    const at::Tensor& suh_t = suh.value();
+    const at::Tensor& A_had_t = A_had.value();
+    const at::Tensor& svh_t = svh.value();
+    if (suh_t.dtype() != at::kHalf || A_had_t.dtype() != at::kHalf || svh_t.dtype() != at::kHalf) return false;
+    if (suh_t.device() != A.device() || A_had_t.device() != A.device() || svh_t.device() != A.device()) return false;
+    if (!suh_t.is_contiguous() || !A_had_t.is_contiguous() || !svh_t.is_contiguous()) return false;
+    if (suh_t.numel() != size_k || A_had_t.sizes() != A.sizes() || svh_t.numel() != size_n) return false;
+
+    int cb = 0;
+    if (mcg) cb = 1;
+    if (mul1) cb = 2;
+
+    int device;
+    hipGetDevice(&device);
+    int grid = 0, block_dim = 0;
+    void* kernel = exl3_gemv_hip_select(size_m, size_k, size_n, K, half_k, cb, c_fp32, device, grid, block_dim);
+    if (!kernel) return false;
+
+    // Same gate as the exl3_gemm call site: the fused int8 kernel does its own input Hadamard (from A with
+    // suh) and output Hadamard (svh), so it must run BEFORE the had_r_128 pre-pass below and returns the
+    // finished C. Off unless EXL3_INT8_GEMV is set to 1 or 2 on ROCm
+    if (!half_k && mul1 && exl3_gemv_int8_enabled() && exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, nullptr))
+    {
+        cuda_check(hipPeekAtLastError());
+        return true;
+    }
+
+    const half* suh_ptr = (const half*) suh_t.data_ptr();
+    half* A_had_ptr = (half*) A_had_t.data_ptr();
+    const half* svh_ptr = (const half*) svh_t.data_ptr();
+    int* locks = DevCtx::instance().get_locks(device);
+
+    at::Tensor A_view = A.view({size_m, size_k});
+    at::Tensor A_had_view = A_had_t.view({size_m, size_k});
+    had_r_128(A_view, A_had_view, suh, c10::nullopt, 1.0f);
+    const half* A_ptr = (const half*) A_had_view.data_ptr();
+    const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
+    void* C_ptr = (void*) C.data_ptr();
+    int sm = size_m, sk = size_k, sn = size_n;
+
+    void* kernel_args[] =
+    {
+        (void*)& A_ptr,
+        (void*)& B_ptr,
+        (void*)& C_ptr,
+        (void*)& sm,
+        (void*)& sk,
+        (void*)& sn,
+        (void*)& locks,
+        (void*)& suh_ptr,
+        (void*)& A_had_ptr,
+        (void*)& svh_ptr
+    };
+    cuda_check(hipLaunchKernel(kernel, dim3(grid), dim3(block_dim), kernel_args, 0, stream));
+
+    at::Tensor C_view = C.view({size_m, size_n});
+    had_r_128(C_view, C_view, c10::nullopt, svh, 1.0f);
+    cuda_check(hipPeekAtLastError());
     return true;
-#endif
+}
+
+#else
+
+#include <cuda_fp16.h>
+#include "exl3_gemv.cuh"
+
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+#include "../util.h"
+#include "../util.cuh"
+#include "exl3_gemv_kernel.cuh"
+#include "exl3_devctx.cuh"
+#include <map>
+
+/*
+QTIP-style small-m GEMV path, kernel in exl3_gemv_kernel.cuh. Dispatched from exl3_gemm via
+exl3_gemv_try_launch when the shape heuristic applies, or forced through the exl3_gemv entry
+point. Kernel arguments and graph parameter offsets are identical to exl3_gemm_kernel.
+
+Env: EXL3_GEMV = 0 disables the path, 1/unset = heuristic (default), 2 = use wherever the hard
+constraints allow (testing).
+
+Heuristic envelope (measured, RTX 3090, 4 bpw, m <= 8, vs the tuned regular kernel): the narrow
+config wins 15-60% at attention-projection sizes (n <= 4096), the wide config wins ~8% at
+large-n/small-k FFN sizes. Big-k x big-n shapes lose slightly and fall through to the regular
+kernel, as do other architectures (Ada/Blackwell are memory-bound here and keep the regular
+kernel), bpw != 4, and m > 8.
+*/
+
+static int exl3_gemv_env_mode()
+{
+    const char* env = std::getenv("EXL3_GEMV");
+    if (!env) return 1;
+    return atoi(env);
 }
 
 // -1 = default per bits, 0 = force shuffle extraction, 1 = force smem staging (testing)
-#if !defined(USE_ROCM)
 static int exl3_gemv_env_smem()
 {
     const char* env = std::getenv("EXL3_GEMV_SMEM");
     if (!env) return -1;
     return atoi(env);
 }
-#endif
 
 // -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
 // blocks that fit on the device at once (its grid is one block per 32 output columns)
 static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
 {
     if (mode == 0) return -1;
-#if defined(USE_ROCM)
-    if (K < 2 || K > 6) return -1;
-#else
     if (K < 2 || K > 4) return -1;
-#endif
     if (K != 4 && cb == 0) return -1;
-#if defined(USE_ROCM)
-    // K2 has no HIP MMODE-2 instantiation; its established envelope ends at eight rows.
-    if (K == 2 && size_m > EXL3_GEMV_MAX_M) return -1;
-    if (size_m > EXL3_GEMV_ROCM_MAX_M) return -1;
-#else
     if (size_m > EXL3_GEMV_MAX_M) return -1;
-#endif
     if (size_k % 128 || size_n % 128) return -1;
     //if (cc != CC_AMPERE) return -1;  // measured win on Ampere; Ada/Blackwell are memory-bound here
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
@@ -1265,32 +1462,6 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
 
 static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem)
 {
-#if defined(USE_ROCM)
-    // HIP: only the smem-staged extraction is instantiated. gfx12 WMMA operands must not
-    // be fed through __shfl_sync (hardware exception), so SMEM_STAGE is forced true and
-    // the `smem` argument is ignored.
-    #define SEL(bits_, cb_, fp32_, mm_, cfg_) \
-        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_) \
-            return (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, true>;
-    #define SEL_GRID(bits_, cb_) \
-        SEL(bits_, cb_, false, 0, 0) SEL(bits_, cb_, false, 0, 1) \
-        SEL(bits_, cb_, false, 1, 0) SEL(bits_, cb_, false, 1, 1) \
-        SEL(bits_, cb_, true,  0, 0) SEL(bits_, cb_, true,  0, 1) \
-        SEL(bits_, cb_, true,  1, 0) SEL(bits_, cb_, true,  1, 1)
-    #define SEL_MMODE2_GRID(bits_, cb_) \
-        SEL(bits_, cb_, false, 2, 0) SEL(bits_, cb_, false, 2, 1) \
-        SEL(bits_, cb_, true,  2, 0) SEL(bits_, cb_, true,  2, 1)
-    SEL_GRID(4, 0) SEL_GRID(4, 1) SEL_GRID(4, 2)
-    SEL_GRID(2, 1) SEL_GRID(2, 2)
-    SEL_GRID(3, 1) SEL_GRID(3, 2)
-    SEL_GRID(5, 1) SEL_GRID(5, 2)
-    SEL_GRID(6, 1) SEL_GRID(6, 2)
-    SEL_MMODE2_GRID(3, 2) SEL_MMODE2_GRID(4, 1) SEL_MMODE2_GRID(4, 2)
-    SEL_MMODE2_GRID(5, 2) SEL_MMODE2_GRID(6, 1) SEL_MMODE2_GRID(6, 2)
-    #undef SEL_MMODE2_GRID
-    #undef SEL_GRID
-    #undef SEL
-#else
     #define SEL(bits_, cb_, fp32_, mm_, cfg_, sm_) \
         if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_) \
             return (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, sm_>;
@@ -1304,32 +1475,8 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     #undef SEL_GRID
     #undef SEL
-#endif
     return nullptr;
 }
-
-#if defined(USE_ROCM)
-static void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg)
-{
-    #define SEL_HALF(bits_, fp32_, mm_, cfg_) \
-        if (bits == bits_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_) \
-            return (void*) exl3_gemv_kernel<bits_, fp32_, 2, mm_, cfg_, true, true>;
-    #define SEL_HALF_GRID(bits_) \
-        SEL_HALF(bits_, false, 0, 0) SEL_HALF(bits_, false, 0, 1) \
-        SEL_HALF(bits_, false, 1, 0) SEL_HALF(bits_, false, 1, 1) \
-        SEL_HALF(bits_, true,  0, 0) SEL_HALF(bits_, true,  0, 1) \
-        SEL_HALF(bits_, true,  1, 0) SEL_HALF(bits_, true,  1, 1)
-    #define SEL_HALF_MMODE2(bits_) \
-        SEL_HALF(bits_, false, 2, 0) SEL_HALF(bits_, false, 2, 1) \
-        SEL_HALF(bits_, true,  2, 0) SEL_HALF(bits_, true,  2, 1)
-    SEL_HALF_GRID(1) SEL_HALF_GRID(2) SEL_HALF_GRID(3)
-    SEL_HALF_MMODE2(1) SEL_HALF_MMODE2(2) SEL_HALF_MMODE2(3)
-    #undef SEL_HALF_MMODE2
-    #undef SEL_HALF_GRID
-    #undef SEL_HALF
-    return nullptr;
-}
-#endif
 
 bool exl3_gemv_try_launch
 (
@@ -1343,11 +1490,7 @@ bool exl3_gemv_try_launch
     bool c_fp32,
     bool has_su_sv,
     int device,
-#if defined(USE_ROCM)
-    hipStream_t stream,
-#else
     cudaStream_t stream,
-#endif
     void** launched_kernel,
     bool force
 )
@@ -1357,46 +1500,25 @@ bool exl3_gemv_try_launch
     if (!has_su_sv) return false;
     if (half_k)
     {
-#if defined(USE_ROCM)
         if (K < 1 || K > 3 || cb != 2) return false;
-#else
-        return false;
-#endif
     }
     else
     {
-#if defined(USE_ROCM)
-        if (K < 2 || K > 6) return false;
-#else
         if (K < 2 || K > 4) return false;
-#endif
         if (K != 4 && cb == 0) return false;
     }
-#if defined(USE_ROCM)
-    // Integer K2 has no HIP MMODE-2 instantiation; fractional kernels do.
-    if (!half_k && K == 2 && size_m > EXL3_GEMV_MAX_M) return false;
-    if (size_m > EXL3_GEMV_ROCM_MAX_M) return false;
-#else
     if (size_m > EXL3_GEMV_MAX_M) return false;
-#endif
     if (size_k % 128 || size_n % 128) return false;
-#if defined(USE_ROCM)
-    if (!exl3_gemv_supported(device)) return false;
-#endif
 
     int mode = force ? 2 : exl3_gemv_env_mode();
     if (mode == 0) return false;
     int cc = DevCtx::instance().get_cc(device);
     // if (cc != CC_AMPERE) return false;
-#if defined(USE_ROCM)
-    int mmode = size_m == 1 ? 0 : (size_m <= EXL3_GEMV_MAX_M ? 1 : 2);
-#else
     int mmode = size_m == 1 ? 0 : 1;
-#endif
     int num_sms = DevCtx::instance().get_num_sms(device);
 
-    // CUDA's cooperative grid is capped at full co-residency. HIP retains the same grid sizing
-    // for the shape heuristic and grid-stride main loop, but uses an ordinary launch.
+    // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
+    // narrow config's co-residency also feeds the shape heuristic
     static std::map<void*, int> occ_cache[MAX_DEVICES];
     auto& cache = occ_cache[device];
     auto occupancy = [&] (void* kernel, int block_dim) -> int
@@ -1404,38 +1526,25 @@ bool exl3_gemv_try_launch
         auto it = cache.find(kernel);
         if (it != cache.end()) return it->second;
         int blocks_per_sm;
-#if defined(USE_ROCM)
-        cuda_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
-#else
         cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
-#endif
         cache[kernel] = blocks_per_sm;
-        if (exl3_gemv_debug())
-            std::fprintf(stderr, "EXL3_GEMV_DEBUG device=%d kernel=%p block_dim=%d blocks_per_sm=%d\n",
-                         device, kernel, block_dim, blocks_per_sm);
         return blocks_per_sm;
     };
 
-#if defined(USE_ROCM)
-    // Extraction style on HIP: smem staging is the only safe mode (gfx12 shfl->WMMA hazard),
-    // so the EXL3_GEMV_SMEM override is ignored and staging is always on
-    bool smem = true;
-#else
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
-#endif
 
     auto select = [&] (int cfg_) -> void*
     {
-#if defined(USE_ROCM)
-        if (half_k) return exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_);
-#endif
-        return exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
+        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
+                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
     };
     void* narrow_kernel = select(0);
     if (!narrow_kernel) return false;
     int narrow_coresident = occupancy(narrow_kernel, 512) * num_sms;
 
+    // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
+    // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
     int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
     if (cfg < 0) return false;
 
@@ -1446,37 +1555,18 @@ bool exl3_gemv_try_launch
     int cols = cfg == 0 ? 32 : 64;
 
     int max_blocks = occupancy(kernel, block_dim) * num_sms;
-    // Grid sizing: the body is a grid-stride loop and every group is processed exactly
-    // once by one block with a block-local reduction, so output is bit-identical for any
-    // grid >= 1 and grid size is a performance knob only. The CUDA path launches
-    // cooperatively, which requires grid <= co-resident blocks, so the occupancy cap
-    // stays there; the HIP launch is an ordinary stream-ordered launch (extra blocks
-    // queue behind the co-resident ones), where the cap measurably throttles the
-    // multi-row cells (M=4: -4.5..-10.7% per call, lm_head M=16: -15.5%; M=1 neutral).
-#if defined(USE_ROCM)
-    int grid = size_n / cols;
-#else
     int grid = MIN(size_n / cols, max_blocks);
-#endif
-    (void) max_blocks;
     if (grid < 1) return false;
 
-    cuda_check
+    cuda_check(cudaLaunchCooperativeKernel
     (
-#if defined(USE_ROCM)
-        hipLaunchKernel
-#else
-        cudaLaunchCooperativeKernel
-#endif
-        (
-            kernel,
-            dim3(grid),
-            dim3(block_dim),
-            kernel_args,
-            0,
-            stream
-        )
-    );
+        kernel,
+        dim3(grid),
+        dim3(block_dim),
+        kernel_args,
+        0,
+        stream
+    ));
 
     if (launched_kernel) *launched_kernel = kernel;
     return true;
@@ -1495,14 +1585,9 @@ void exl3_gemv
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
-#if defined(USE_ROCM)
-    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-#else
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-#endif
 
     TORCH_CHECK_DIM(B, 3);
-    TORCH_CHECK(A.dim() >= 1 && C.dim() >= 1, "exl3_gemv requires non-scalar A and C");
     TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
     TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
     TORCH_CHECK_DTYPE(A, kHalf);
@@ -1510,74 +1595,40 @@ void exl3_gemv
     bool c_fp32 = C.dtype() == at::kFloat;
     if (!c_fp32) TORCH_CHECK_DTYPE(C, kHalf);
     TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && C.is_contiguous(),
-                "exl3_gemv requires contiguous A, B and C");
-    TORCH_CHECK(B.device() == A.device() && C.device() == A.device(),
-                "exl3_gemv requires A, B and C on the same device");
+
+    const half* suh_ptr = (const half*) OPTPTR(suh);
+    half* A_had_ptr = (half*) OPTPTR(A_had);
+    const half* svh_ptr = (const half*) OPTPTR(svh);
+    TORCH_CHECK(suh.has_value() && A_had.has_value() && svh.has_value(), "exl3_gemv requires suh, A_had and svh");
 
     int size_m = 1;
     int dim = A.dim();
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
+    TORCH_CHECK(C.numel() >= (int64_t) size_m * size_n, "exl3_gemv: C must hold one output row per row of A");
     const int tile_u16 = B.size(2);
-    const bool half_k = tile_u16 % 16 != 0;
+    const bool half_k = (tile_u16 % 16) != 0;
     int K = tile_u16 / 16;
-    TORCH_CHECK(!half_k || (tile_u16 % 16 == 8 && mul1),
-                "exl3_gemv: half-integer bitrates require a valid MUL1 tensor");
-
-    TORCH_CHECK(suh.has_value() && A_had.has_value() && svh.has_value(),
-                "exl3_gemv requires suh, A_had and svh");
-    const at::Tensor& suh_t = suh.value();
-    const at::Tensor& A_had_t = A_had.value();
-    const at::Tensor& svh_t = svh.value();
-    TORCH_CHECK_DTYPE(suh_t, kHalf);
-    TORCH_CHECK_DTYPE(A_had_t, kHalf);
-    TORCH_CHECK_DTYPE(svh_t, kHalf);
-    TORCH_CHECK(suh_t.device() == A.device() && A_had_t.device() == A.device() &&
-                svh_t.device() == A.device(),
-                "exl3_gemv requires workspaces on the A device");
-    TORCH_CHECK(suh_t.is_contiguous() && A_had_t.is_contiguous() && svh_t.is_contiguous(),
-                "exl3_gemv requires contiguous workspaces");
-    TORCH_CHECK(suh_t.numel() == size_k, "exl3_gemv suh size mismatch");
-    TORCH_CHECK(A_had_t.sizes() == A.sizes(), "exl3_gemv A_had shape mismatch");
-    TORCH_CHECK(svh_t.numel() == size_n, "exl3_gemv svh size mismatch");
-
-    const half* suh_ptr = (const half*) suh_t.data_ptr();
-    half* A_had_ptr = (half*) A_had_t.data_ptr();
-    const half* svh_ptr = (const half*) svh_t.data_ptr();
+    TORCH_CHECK(!half_k || (tile_u16 % 16 == 8 && mul1), "exl3_gemv: half-integer bitrates require the mul1 codebook");
 
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
 
+    // No rows or no output columns: nothing to compute. Empty reduction (k = 0): the product is zero
+    if (!size_m || !size_n) return;
+    if (!size_k)
+    {
+        cuda_check(cudaMemsetAsync(C.data_ptr(), 0, (size_t) size_m * size_n * C.element_size(), stream));
+        return;
+    }
+
     int device;
-#if defined(USE_ROCM)
-    hipGetDevice(&device);
-#else
     cudaGetDevice(&device);
-#endif
     int* locks = DevCtx::instance().get_locks(device);
 
-#if defined(USE_ROCM)
-    // Same gate as the CUDA exl3_gemm call site: the fused int8 kernel does its own input Hadamard
-    // (from A with suh) and output Hadamard (svh), so it must run BEFORE the had_r_128 pre-pass
-    // below and returns the finished C. Off unless EXL3_INT8_GEMV is set to 1 or 2 on ROCm
-    if (!half_k && mul1 && exl3_gemv_int8_enabled())
-    {
-        if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, nullptr))
-        {
-            cuda_check(hipPeekAtLastError());
-            return;
-        }
-    }
-    at::Tensor A_view = A.view({size_m, size_k});
-    at::Tensor A_had_view = A_had.value().view({size_m, size_k});
-    had_r_128(A_view, A_had_view, suh, c10::nullopt, 1.0f);
-    const half* A_ptr = (const half*) A_had_view.data_ptr();
-#else
     const half* A_ptr = (const half*) A.data_ptr();
-#endif
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
     void* C_ptr = (void*) C.data_ptr();
 
@@ -1602,11 +1653,7 @@ void exl3_gemv
     );
     TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");
 
-#if defined(USE_ROCM)
-    at::Tensor C_view = C.view({size_m, size_n});
-    had_r_128(C_view, C_view, c10::nullopt, svh, 1.0f);
-    cuda_check(hipPeekAtLastError());
-#else
     cuda_check(cudaPeekAtLastError());
-#endif
 }
+
+#endif

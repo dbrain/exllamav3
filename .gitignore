@@ -13,10 +13,10 @@ dist
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
 
-# hipify-generated files
+# hipify-generated files (written next to the sources by torch's hipify during ROCm builds)
 exllamav3/exllamav3_ext/**/*_hip.*
 exllamav3/exllamav3_ext/**/*.hip
-exllamav3/exllamav3_ext/**/hip_*.*
+exllamav3/exllamav3_ext/**/hip_*
 !exllamav3/exllamav3_ext/hip/hip_mma.cuh
 .sdk-deps/
 .rebuild.*/
@@ -31,3 +31,6 @@ sse.out
 scratch/pfskip1/*.logits.pt
 scratch/pfskip1/pfb1_results.json
 .venv*
+
+# per-machine test model registry overrides (tests/testlib/models.py)
+tests/models.local.yaml

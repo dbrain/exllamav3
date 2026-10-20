@@ -6,9 +6,14 @@
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include "pad_pitch.h"
+#include "cublas_handle.cuh"
 #include <limits>
 #include <cstdlib>
 #include <type_traits>
+#if defined(USE_ROCM)
+    #include "rocm/wmma_gemm.cuh"
+    #include "rocm/hgemm_narrow_rdna.cuh"
+#endif
 
 /*
 
@@ -51,6 +56,9 @@ static void hgemm_gemmex_impl
     cudaStream_t stream
 )
 {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda() &&
+                a.device() == b.device() && a.device() == c.device(),
+                "hgemm: all tensors must be on the same CUDA device");
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
 
     bool output_fp32 = c.dtype() == at::kFloat;
@@ -71,7 +79,9 @@ static void hgemm_gemmex_impl
     const half* b_ptr = (const half*) b.data_ptr();
 
     int size_k = a.size(-1);
-    int size_m = a.numel() / size_k;
+    int64_t size_m_ = 1;
+    for (int d = 0; d < a.dim() - 1; ++d) size_m_ *= a.size(d);
+    int size_m = (int) size_m_;
     int size_n = b.size(-1);
     int64_t a_pitch = 0;
     TORCH_CHECK(a_row_pitch(a, a_pitch), "hgemm: a must be contiguous or a row-padded view inside its storage");
@@ -79,14 +89,35 @@ static void hgemm_gemmex_impl
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
 
+    // No rows or no output columns: nothing to compute. Empty reduction (k = 0): the product is zero
+    if (!size_m || !size_n) return;
+    if (!size_k)
+    {
+        const size_t es = c.element_size();
+        cuda_check(cudaMemset2DAsync(c.data_ptr(), c_stride_m * es, 0, size_n * es, size_m, stream));
+        return;
+    }
+
+#if defined(USE_ROCM)
+    // The RDNA kernels take A with row pitch k; a row-padded A goes to hipBLAS
+    if (a_pitch == size_k)
+    {
+        // RDNA: narrow outputs at decode-class row counts on a split-K GEMV (rocm/hgemm_narrow_rdna.cuh)
+        if (hgemm_narrow_try(a_ptr, b_ptr, c.data_ptr(), output_fp32, size_m, size_k, size_n, c_stride_m, a.get_device(), stream))
+            return;
+
+        // RDNA: the WMMA GEMM (rocm/wmma_gemm.cu) for the shapes its per-arch table routes there, mainly fp32
+        // output, for which rocBLAS/hipBLASLt have no matrix-core kernels on these parts
+        if (wmma_gemm_try(a_ptr, b_ptr, c.data_ptr(), output_fp32, size_m, size_k, size_n, c_stride_m, a.get_device(), stream))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return;
+        }
+    }
+#endif
+
     // Set cuBLAS modes and workspace
-    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetStream(cublas_handle, stream);
-    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    int device;
-    cudaGetDevice(&device);
-    void* ws = DevCtx::instance().get_ws(device);
-    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+    cublasHandle_t cublas_handle = exl3_cublas_handle(stream);
 
     float alpha_ = 1.0f;
     float beta_ = 0.0f;
@@ -175,7 +206,7 @@ static void load(int device)
     cudaGetDeviceProperties(&prop, device);
     g_tag = std::string(ver) + "|" + prop.gcnArchName;
     for (auto& ch : g_tag) if (ch == ' ') ch = '_';
-    g_tag += "|exact1";   // only bit-exact winners; older free-pick lines no longer match
+    g_tag += "|exact2";   // only bit-exact winners against the current untuned path (RDNA narrow/WMMA kernels included)
     FILE* f = fopen(cache_path().c_str(), "r");
     if (!f) return;
     char tag[512]; int n, k, mc, ldn, f32, sol;
@@ -831,6 +862,7 @@ void hgemm_gr
     Graph* graph
 )
 {
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 #if defined(USE_ROCM)
     if (skinny::try_launch(a, b, c, stream)) return;
@@ -851,6 +883,14 @@ void hgemm
     hgemm_gr(a, b, c, nullptr);
 }
 
+#if defined(USE_ROCM)
+// Reconstruct-path GEMM. On CUDA this lives in hgemm_f16acc.cu, which ROCm builds leave out: always hipBLAS
+void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
+{
+    hgemm(a, b, c);
+}
+#endif
+
 /*
 Strided-batched row-major matmul, a[b] @ w[b] -> c[b] for b in [0, B), fp16 inputs with fp32
 accumulation (same cuBLAS setup as hgemm). a: [B, m, k], w: [B, k, n], c: [B, m, n], all
@@ -863,8 +903,14 @@ void hgemm_batched
     at::Tensor c
 )
 {
-    // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays (GeForce), else cuBLAS
+    TORCH_CHECK(a.is_cuda() && w.is_cuda() && c.is_cuda() &&
+                a.device() == w.device() && a.device() == c.device(),
+                "hgemm_batched: all tensors must be on the same CUDA device");
+    // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays (GeForce), else cuBLAS. The ROCm build
+    // has no fp16-accumulator kernel (hgemm_f16acc.cu is CUDA-only)
+#if !defined(USE_ROCM)
     if (hgemm_f16acc_try(a, w, c)) return;
+#endif
 
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -887,15 +933,15 @@ void hgemm_batched
     int size_m = a.size(1);
     int size_k = a.size(2);
     int size_n = w.size(2);
-    if (!batch || !size_m || !size_n || !size_k) return;
+    // No batches, rows or output columns: nothing to compute. Empty reduction (k = 0): the product is zero
+    if (!batch || !size_m || !size_n) return;
+    if (!size_k)
+    {
+        cuda_check(cudaMemsetAsync(c.data_ptr(), 0, c.nbytes(), stream));
+        return;
+    }
 
-    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetStream(cublas_handle, stream);
-    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    int device;
-    cudaGetDevice(&device);
-    void* ws = DevCtx::instance().get_ws(device);
-    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+    cublasHandle_t cublas_handle = exl3_cublas_handle(stream);
 
     float alpha_ = 1.0f;
     float beta_ = 0.0f;

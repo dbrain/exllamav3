@@ -24,7 +24,7 @@ def _causal_conv1d_update_slotted_kernel(
     out,
     dim: tl.constexpr,
     seq_len,             # runtime: chunk length varies per job; only masks and address math
-    sxb, sxd, sxs,       # x strides (batch, channel, time): x may be a transposed fp16 view
+    sxb, sxd, sxs,       # x strides (batch, channel, time): channel-major, token-major or a transposed view
     state_size: tl.constexpr,
     conv_kernel_size: tl.constexpr,
     history: tl.constexpr,
@@ -65,9 +65,8 @@ def _causal_conv1d_update_slotted_kernel(
                 x + pid_b * sxb + offs_d[:, None] * sxd + x_t[None, :] * sxs,
                 mask = mask_d[:, None] & mask_s[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
                 other = 0.0,
-            )
-            x_vals = x_vals.to(conv_state.dtype.element_ty)
-            vals = tl.where(from_x[None, :], x_vals, state_vals)
+            ).to(tl.float32)
+            vals = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
             w = tl.load(weight + offs_d * conv_kernel_size + k, mask = mask_d, other = 0.0)
             acc += vals * w[:, None]
 
@@ -107,9 +106,8 @@ def _causal_conv1d_update_slotted_kernel(
         x + pid_b * sxb + offs_d[:, None] * sxd + x_t[None, :] * sxs,
         mask = mask_d[:, None] & valid_state[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
         other = 0.0,
-    )
-    x_vals = x_vals.to(conv_state.dtype.element_ty)
-    new_state = tl.where(from_x[None, :], x_vals, state_vals)
+    ).to(tl.float32)
+    new_state = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
     tl.store(
         conv_state + (slot * dim + offs_d[:, None]) * state_size + offs_state[None, :],
         new_state,
@@ -127,7 +125,7 @@ def _causal_conv1d_update_slotted_output_kernel(
     out,
     dim: tl.constexpr,
     seq_len,             # runtime: chunk length varies per job; only masks and address math
-    sxb, sxd, sxs,       # x strides (batch, channel, time): x may be a transposed fp16 view
+    sxb, sxd, sxs,       # x strides (batch, channel, time): channel-major, token-major or a transposed view
     state_size: tl.constexpr,
     conv_kernel_size: tl.constexpr,
     has_bias: tl.constexpr,
@@ -165,9 +163,8 @@ def _causal_conv1d_update_slotted_output_kernel(
                 x + pid_b * sxb + offs_d[:, None] * sxd + x_t[None, :] * sxs,
                 mask = mask_d[:, None] & mask_s[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
                 other = 0.0,
-            )
-            x_vals = x_vals.to(conv_state.dtype.element_ty)
-            vals = tl.where(from_x[None, :], x_vals, state_vals)
+            ).to(tl.float32)
+            vals = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
             w = tl.load(weight + offs_d * conv_kernel_size + k, mask = mask_d, other = 0.0)
             acc += vals * w[:, None]
 
@@ -207,7 +204,7 @@ def _causal_conv1d_update_slotted_state_kernel(
     slots,
     dim: tl.constexpr,
     seq_len,             # runtime: chunk length varies per job; only masks and address math
-    sxb, sxd, sxs,       # x strides (batch, channel, time): x may be a transposed fp16 view
+    sxb, sxd, sxs,       # x strides (batch, channel, time): channel-major, token-major or a transposed view
     state_size: tl.constexpr,
     conv_kernel_size: tl.constexpr,
     history: tl.constexpr,
@@ -242,9 +239,8 @@ def _causal_conv1d_update_slotted_state_kernel(
         x + pid_b * sxb + offs_d[:, None] * sxd + x_t[None, :] * sxs,
         mask = mask_d[:, None] & valid_state[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
         other = 0.0,
-    )
-    x_vals = x_vals.to(conv_state.dtype.element_ty)
-    new_state = tl.where(from_x[None, :], x_vals, state_vals)
+    ).to(tl.float32)
+    new_state = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
     tl.store(
         conv_state + (slot * dim + offs_d[:, None]) * state_size + offs_state[None, :],
         new_state,
@@ -264,7 +260,15 @@ def causal_conv1d_update_slotted_triton(
     transpose_output: bool = False,
     history: bool = False,
     plane: int = 0,
+    token_major: bool = False,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    """
+    token_major: x is (bsz, seq, dim), e.g. a projection output read in place, instead of the
+    (bsz, dim, seq) layout; any float dtype and any strides (values are widened to fp32 in the
+    kernel, so an fp16 projection or its transposed view needs no bf16 copy). out_dtype defaults
+    to x's dtype.
+    """
     if not x.is_cuda:
         raise RuntimeError("causal_conv1d_update_slotted_triton requires CUDA tensors")
     if not conv_state.is_contiguous() or not weight.is_contiguous():
@@ -278,8 +282,12 @@ def causal_conv1d_update_slotted_triton(
     if bias is not None and bias.device != x.device:
         raise RuntimeError(f"bias is on {bias.device}, expected {x.device}")
 
-    bsz, dim, seq_len = x.shape
-    sxb, sxd, sxs = x.stride()
+    if token_major:
+        bsz, seq_len, dim = x.shape
+        sxb, sxs, sxd = x.stride()
+    else:
+        bsz, dim, seq_len = x.shape
+        sxb, sxd, sxs = x.stride()
     state_size = conv_state.shape[-1]
     conv_kernel_size = weight.shape[-1]
     if slots.shape != (bsz,):
@@ -300,8 +308,7 @@ def causal_conv1d_update_slotted_triton(
         plane = 0
     if plane:
         out_shape = (dim // plane, bsz, seq_len, plane)
-    # x is cast to the state dtype in-kernel (fp16 views skip a separate transpose-cast pass)
-    out = torch.empty(out_shape, dtype = conv_state.dtype, device = x.device)
+    out = torch.empty(out_shape, dtype = out_dtype or x.dtype, device = x.device)
     block_d = 32
     block_k = triton.next_power_of_2(conv_kernel_size)
     block_state = triton.next_power_of_2(state_size)
@@ -411,9 +418,20 @@ def causal_conv1d_update(
     conv1d_bias: torch.Tensor,
     history: bool = False,
     params: dict = None,
+    token_major: bool = False,
+    incremental: bool = False,
     plane: int = 0,
 ):
-    bsz, dim, seqlen = mixed_qkv.shape
+    """
+    token_major: mixed_qkv is the (bsz, seqlen, dim) projection output (fp16/bf16/fp32) read
+    in place by the Triton kernel; output is (bsz, seqlen, dim) bf16 either way.
+    incremental: a later step of a history pass fed one step at a time (the window is the tail of
+    the ring, see conv1d_update_kernel); CUDA path only
+    """
+    if token_major:
+        bsz, seqlen, dim = mixed_qkv.shape
+    else:
+        bsz, dim, seqlen = mixed_qkv.shape
 
     if params is None:
         params = {}
@@ -427,7 +445,7 @@ def causal_conv1d_update(
 
     # A non-bf16 or strided mixed_qkv (the fp16 (bsz, dim, seq) transposed view of the projection) is
     # read and cast in-kernel by the Triton path; the short-sequence CUDA path needs contiguous bf16
-    if mixed_qkv.is_cuda and seqlen <= MAX_CUDA_SEQLEN and \
+    if not token_major and mixed_qkv.is_cuda and seqlen <= MAX_CUDA_SEQLEN and \
             (mixed_qkv.dtype != torch.bfloat16 or not mixed_qkv.is_contiguous()):
         if host_cuts():
             # One kernel instead of two. The decode input is the fp16 (bsz, f, seq) transposed
@@ -441,6 +459,7 @@ def causal_conv1d_update(
             mixed_qkv = mixed_qkv.to(torch.bfloat16).contiguous()
 
     if (
+        not token_major and
         mixed_qkv.is_cuda and
         seqlen <= MAX_CUDA_SEQLEN and
         conv1d_weight.shape[-1] <= MAX_CUDA_K and
@@ -459,9 +478,11 @@ def causal_conv1d_update(
             out,
             True,
             history,
+            incremental,
         )
         return out
 
+    assert not incremental, "incremental conv steps need the CUDA conv kernel (bf16, channel-major, short)"
     if dummy_slots:
         recurrent_slots = buffered_arange(bsz, mixed_qkv.device)
     mixed_qkv = causal_conv1d_update_slotted_triton(
@@ -473,6 +494,8 @@ def causal_conv1d_update(
         transpose_output = True,
         history = history,
         plane = plane,
+        token_major = token_major,
+        out_dtype = torch.bfloat16,
     )
 
     return mixed_qkv

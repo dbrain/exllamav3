@@ -8,11 +8,6 @@ namespace py = pybind11;
 #include <cuda_fp16.h>
 #include <cuda.h>
 
-// hipify doesn't map this type
-#if defined(USE_ROCM)
-using cudaKernelNodeParams = hipKernelNodeParams;
-#endif
-
 using PPTR = std::tuple<int, void*>;
 
 enum GraphedParams
@@ -70,7 +65,7 @@ enum GraphedParams
     GP_conv1d_slots,
     GP_gdn_rule_state,
     GP_gdn_rule_slots,
-    GP_gdn_rule_base,
+    GP_gdn_rule_slots_in,
 
     GP_rope_inv_freq,
     GP_rope_position,
@@ -121,13 +116,12 @@ public:
     std::vector<cudaKernelNodeParams> node_params;
     // Kernel nodes captured from driver-API launches (Triton cubins) cannot be read through the
     // runtime API ("invalid device function"); their params live here instead
-#if !defined(USE_ROCM)
     std::vector<CUDA_KERNEL_NODE_PARAMS> node_params_drv;
-#endif
     std::vector<char> node_is_driver;
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;
 
+    bool capture_active;
     bool need_cublas;
     bool ready;
     bool ready_to_record;
@@ -138,6 +132,8 @@ public:
 
     cudaStream_t capture_begin();
     void capture_end();
+    // Best effort, no throwing. Call on the thread/device that began capture.
+    void capture_abort() noexcept;
 
     void record_param(void* kernel, int param_id, int param_offset, int size = 8);
     void launch(std::vector<PPTR> params, cudaStream_t stream);
@@ -145,3 +141,17 @@ public:
     void inspect_graph();
 };
 
+
+// Keep capture lifetime on the same thread/device as the launch sequence.
+// All native capture callers use this scope, including failures in run_gr.
+class GraphCapture
+{
+    Graph& owner;
+    bool finished = false;
+public:
+    explicit GraphCapture(Graph& graph) : owner(graph) { owner.capture_begin(); }
+    ~GraphCapture() noexcept { if (!finished) owner.capture_abort(); }
+    GraphCapture(const GraphCapture&) = delete;
+    GraphCapture& operator=(const GraphCapture&) = delete;
+    void finish() { owner.capture_end(); finished = true; }
+};

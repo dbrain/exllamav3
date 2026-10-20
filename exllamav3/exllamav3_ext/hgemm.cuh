@@ -13,10 +13,8 @@ void hgemm_gr
 
 #if defined(USE_ROCM)
 void skinny_set_onepass(int64_t on);
-#if defined(USE_ROCM)
 void skinny_cat(at::Tensor a, at::Tensor b, std::vector<at::Tensor> outs);
 void skinny_cat_w(at::Tensor a, std::vector<at::Tensor> ws, std::vector<at::Tensor> outs);
-#endif
 #endif
 
 void hgemm

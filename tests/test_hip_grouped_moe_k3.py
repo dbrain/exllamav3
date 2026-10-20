@@ -736,9 +736,14 @@ def test_expert_lora_permanently_invalidates_grouped_route(flash_model, device_i
         mlp.unload()
 
 
-def test_grouped_source_is_hip_only_and_does_not_enable_generic_mgemm():
-    from exllamav3.exllamav3_ext.build_config import ROCM_EXCLUDE_FILES
-    assert "quant/exl3_gemm.cu" in ROCM_EXCLUDE_FILES
-    assert "libtorch/blocksparse_mlp.cpp" in ROCM_EXCLUDE_FILES
-    if torch.version.hip:
-        assert not hasattr(ext, "exl3_mgemm")
+def test_grouped_source_is_hip_only():
+    import exllamav3
+    from exllamav3.util.cuda_flags import extension_sources
+    sources_dir = os.path.join(os.path.dirname(exllamav3.__file__), "exllamav3_ext")
+
+    def rel(hip):
+        return {os.path.relpath(p, sources_dir).replace(os.sep, "/") for p in extension_sources(sources_dir, hip = hip)}
+
+    hip_sources, cuda_sources = rel(True), rel(False)
+    for f in ("quant/exl3_moe_prefill.cu", "quant/exl3_dec.cu", "quant/exl3_moe_fused.cu"):
+        assert f in hip_sources and f not in cuda_sources

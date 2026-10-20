@@ -27,7 +27,3 @@ __inline__ __device__ float tanh_opt(float x)
 }
 
 #endif
-
-#if defined(USE_ROCM)
-#include "compat_rocm.cuh"
-#endif

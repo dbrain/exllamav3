@@ -24,7 +24,7 @@ Based on [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3) branch 
   register-staged B pipeline replacing `cp.async`, cooperative launch verified on gfx1151.
   Parity-proven on real tensors (argmax 1.00). **Default off on ROCm** (`EXL3_INT8_GEMV=1|2`).
 - **SAD trellis decode** on gfx1151 (`v_sad_u8` gate was gfx12-only): −3–4 % kernel time.
-- **CPU expert offload** port (`moe_cpu_host.py`, `block_sparse_mlp*.py`, `moe_handoff_amdgpu.cu`):
+- **CPU expert offload** (`moe_cpu_host.py`, `block_sparse_mlp*.py`, upstream's unified `cpu/moe_handoff.cu`):
   loads and runs; measured net loss on unified memory. Default off (`-mcs 0`).
 - **Build-time kernel variants** via `EXL3_HIP_DEFINES` (setup.py): `EXL3_HIP_PF_AFTER_STAGE`,
   `EXL3_MUL1_DECODE_DOT4`, `EXL3_HIP_A_RING`. All measured null (±2 %) — see below.

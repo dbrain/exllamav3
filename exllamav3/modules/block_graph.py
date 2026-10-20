@@ -127,15 +127,20 @@ def _pool_for(device_index: int):
     return pool
 
 
+# Slot-index params the captured forward reads from device memory (GDN: the conv-ring slots, the pool rows the
+# scan writes and, on a speculative pass, the base rows it starts from; see recurrent_util.prepare_for_recurrence)
+_SLOT_KEYS = ("recurrent_slots", "recurrent_slots_scan", "recurrent_slots_scan_in")
+
+
 class _BlockGraphSlot:
     __slots__ = ("graph", "x_in", "slots_dev", "last_used", "slots_src")
 
     def __init__(self, graph, x_in, slots_dev, stamp):
         self.graph = graph
         self.x_in = x_in
-        self.slots_dev = slots_dev
+        self.slots_dev = slots_dev      # {params key: static device buffer}
         self.last_used = stamp
-        self.slots_src = None
+        self.slots_src = {}
 
 
 def _verify_union_dev_ok(x: torch.Tensor, params: dict, draft: bool = False) -> bool:
@@ -205,6 +210,9 @@ class BlockGraphRunner:
             self.stats["declines"]["recurrent_slots"] += 1
             return None
         history = bool(params.get("recurrent_history", False))
+        if history and params.get("recurrent_spec_step") is not None:
+            self.stats["declines"]["spec_step"] += 1
+            return None
         return (x.device.index, bsz, seqlen, history, id(rsg[0].cache),
                 params.get("layer_instance", 0),
                 tuple(x.shape), str(x.dtype), bool(params.get("dflash_verify")), _VF["on"], _R8["on"])
@@ -325,11 +333,14 @@ class BlockGraphRunner:
                 torch.cuda.synchronize(d)
         torch.cuda.synchronize(dev)
         x_in = _shared_buf(x) if BG_KNOBS["shared_x"] else torch.empty_like(x)
-        live_slots = params["recurrent_slots"]
-        slots_cpu = live_slots.clone()  # stable CPU source; its device copy is slot-static
-        slots_dev = get_static_device_copy(slots_cpu, dev)
         params_cap = dict(params)
-        params_cap["recurrent_slots"] = slots_cpu
+        slots_dev = {}
+        for k in _SLOT_KEYS:
+            if params.get(k) is None:
+                continue
+            slots_cpu = params[k].clone()  # stable CPU source; its device copy is slot-static
+            slots_dev[k] = get_static_device_copy(slots_cpu, dev)
+            params_cap[k] = slots_cpu
         graph = torch.cuda.CUDAGraph()
         try:
             self._capturing = True
@@ -406,12 +417,15 @@ class BlockGraphRunner:
             # reassignment); same-tuple continuations upload nothing (a blocking pageable H2D
             # here would drain the queue once per captured block). The held reference makes
             # object identity exact: a recycled allocation address cannot alias the source.
-            live = params["recurrent_slots"]
-            if live is not slot.slots_src:
-                from ..util.tensor import get_for_device
-                live_dev = get_for_device(params, "recurrent_slots", x.device)
-                slot.slots_dev.copy_(live_dev)
-                slot.slots_src = live
+            for k, dv in slot.slots_dev.items():
+                live = params[k]
+                if live is not slot.slots_src.get(k):
+                    from ..util.tensor import get_for_device
+                    dv.copy_(get_for_device(params, k, x.device))
+                    slot.slots_src[k] = live
+            note = getattr(self.block.attn, "note_graph_replay", None)
+            if note is not None:
+                note(params, x.shape[0], x.shape[1])
             with torch.cuda.device(x.device):
                 slot.graph.replay()
         except Exception as e:
@@ -527,14 +541,10 @@ class BlockGraphRunner:
             return self._mla_plain_forward(key, x, params, pre_ok, shared)
 
         def seg_a(x_):
-            fused = block.attn_hc.mix_norm(x_, params, block.attn_norm) if block.attn_norm else None
-            if fused is not None:
-                hc_post, hc_comb, y = fused
-            else:
-                hc_post, hc_comb, y = block.attn_hc.mix(x_, params)
-                y = y.half()
-                if block.attn_norm:
-                    y = block.attn_norm.forward(y, params, out_dtype = torch.half)
+            hc_post, hc_comb, y, normed = block.attn_hc.mix_norm(x_, params, block.attn_norm)
+            y = y.half()
+            if block.attn_norm and not normed:
+                y = block.attn_norm.forward(y, params, out_dtype = torch.half)
             pre = attn._attend_pre(y, bsz, seqlen, params, 0, None, None, None) if pre_ok else None
             return x_, hc_post, hc_comb, y, pre
 

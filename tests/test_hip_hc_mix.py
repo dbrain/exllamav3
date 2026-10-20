@@ -36,8 +36,10 @@ def _gated_residual(d: int, rank: int, use_combine: bool):
     module.norm_w_raw = (torch.randn((H, d), device=DEVICE) * 0.15).half()
     module.norm_w = module.w_h = None
     module.down_h = module.up_h = module.upx_h = None
-    module.inject_h = module.proj_h = module.fn_h = None
+    module.inject_h = module.proj_h = None
     module.rank = 0
+    module.key = "test.gr"
+    module.next_site = None
     down = (torch.randn((rank, H * d), device=DEVICE) * 0.08).half()
     up = (torch.randn((H * d, rank), device=DEVICE) * 0.08).half()
     inject = (torch.randn((H, H * d), device=DEVICE) * 0.08).half() if use_combine else None
@@ -55,10 +57,10 @@ def test_gr_mix_matches_torch_reference_fp16(rows, use_combine):
     streams = torch.randn((1, rows, H, d), device=DEVICE) * 0.25
     expected_post, expected_mixed = module._mix_ref(streams)
 
-    dots = torch.empty((rows, module.fn_h.shape[0] + 1, H), dtype=torch.float, device=DEVICE)
+    dots = torch.empty((rows, module.proj_m + 1, H), dtype=torch.float, device=DEVICE)
     post = torch.empty((rows, H), dtype=torch.float, device=DEVICE) if use_combine else None
     mixed = torch.empty((rows, d), dtype=torch.half, device=DEVICE)
-    ext.gr_mix(streams.view(rows, H, d), module.fn_h, module.upx_h, module.w_h,
+    ext.gr_mix(streams.view(rows, H, d), None, module.proj_h[: module.proj_m], module.upx_h, module.w_h,
                module.rms_eps, dots, post, mixed)
 
     assert mixed.dtype == torch.float16
@@ -87,7 +89,7 @@ def test_hc_apply_matches_reference_and_updates_in_place(rows, y_dtype, with_com
         )
     ptr = x.data_ptr()
 
-    result = ext.hc_apply(x, y, post, comb)
+    result = ext.hc_apply(x, y, post, comb, None, None)
 
     assert result is None
     assert x.data_ptr() == ptr
@@ -280,7 +282,7 @@ def test_native_launch_uses_current_custom_stream_after_producer():
         post.normal_()
         original = x.clone()
         expected = original + post.unsqueeze(-1) * y.float().unsqueeze(1)
-        ext.hc_apply(x, y, post, None)
+        ext.hc_apply(x, y, post, None, None, None)
     stream.synchronize()
     torch.testing.assert_close(x, expected, rtol=2e-5, atol=2e-5)
 
@@ -315,28 +317,29 @@ def test_wrappers_reject_invalid_dtype_shape_device_and_alignment():
     y = torch.randn((2, 64), device=DEVICE)
     post = torch.randn((2, H), device=DEVICE)
     with pytest.raises(RuntimeError, match="y must have dtype float32 or float16"):
-        ext.hc_apply(x, y.bfloat16(), post, None)
+        ext.hc_apply(x, y.bfloat16(), post, None, None, None)
     with pytest.raises(RuntimeError, match="post must have shape"):
-        ext.hc_apply(x, y, torch.randn((2, 3), device=DEVICE), None)
+        ext.hc_apply(x, y, torch.randn((2, 3), device=DEVICE), None, None, None)
     offset_y = torch.empty((y.numel() + 1,), device=DEVICE)[1:].view_as(y)
     with pytest.raises(RuntimeError, match="y must be 16-byte aligned"):
-        ext.hc_apply(x, offset_y, post, None)
+        ext.hc_apply(x, offset_y, post, None, None, None)
 
     module = _gated_residual(64, 17, True)
     streams = torch.randn((2, H, 64), device=DEVICE)
-    dots = torch.empty((2, module.fn_h.shape[0] + 1, H), device=DEVICE)
+    dots = torch.empty((2, module.proj_m + 1, H), device=DEVICE)
     gr_post = torch.empty((2, H), device=DEVICE)
     mixed = torch.empty((2, 64), dtype=torch.half, device=DEVICE)
     with pytest.raises(RuntimeError, match="mixed must have dtype float32 or float16"):
-        ext.gr_mix(streams, module.fn_h, module.upx_h, module.w_h, 1e-5, dots, gr_post,
+        ext.gr_mix(streams, None, module.proj_h[: module.proj_m], module.upx_h, module.w_h, 1e-5, dots, gr_post,
                    mixed.bfloat16())
     with pytest.raises(RuntimeError, match="upt must have shape"):
-        ext.gr_mix(streams, module.fn_h, module.upx_h[:, :-1].contiguous(), module.w_h, 1e-5, dots,
+        ext.gr_mix(streams, None, module.proj_h[: module.proj_m], module.upx_h[:, :-1].contiguous(), module.w_h, 1e-5, dots,
                    gr_post, mixed)
-    offset_fn = torch.empty((module.fn_h.numel() + 1,), dtype=torch.half,
-                            device=DEVICE)[1:].view_as(module.fn_h)
+    fn = module.proj_h[: module.proj_m]
+    offset_fn = torch.empty((fn.numel() + 1,), dtype=torch.half,
+                            device=DEVICE)[1:].view_as(fn)
     with pytest.raises(RuntimeError, match="fn must be 16-byte aligned"):
-        ext.gr_mix(streams, offset_fn, module.upx_h, module.w_h, 1e-5, dots, gr_post, mixed)
+        ext.gr_mix(streams, None, offset_fn, module.upx_h, module.w_h, 1e-5, dots, gr_post, mixed)
 
 
 def test_zero_rows_still_validate_dtype_before_return():
@@ -363,12 +366,12 @@ def test_zero_rows_validate_then_return_without_launch(wrapper, d):
     elif wrapper == "apply":
         ext.hc_apply(torch.empty((0, H, d), device=DEVICE),
                      torch.empty((0, d), dtype=torch.half, device=DEVICE),
-                     torch.empty((0, H), device=DEVICE), None)
+                     torch.empty((0, H), device=DEVICE), None, None, None)
     else:
         module = _gated_residual(d, 17, True)
         ext.gr_mix(
-            torch.empty((0, H, d), device=DEVICE), module.fn_h, module.upx_h, module.w_h,
-            1e-5, torch.empty((0, module.fn_h.shape[0] + 1, H), device=DEVICE),
+            torch.empty((0, H, d), device=DEVICE), None, module.proj_h[: module.proj_m], module.upx_h, module.w_h,
+            1e-5, torch.empty((0, module.proj_m + 1, H), device=DEVICE),
             torch.empty((0, H), device=DEVICE),
             torch.empty((0, d), dtype=torch.half, device=DEVICE),
         )
@@ -388,7 +391,7 @@ def test_small_dimensions_have_nonzero_launch_chunks():
     x = torch.randn((1, H, 4), device=DEVICE)
     y = torch.randn((1, 4), dtype=torch.half, device=DEVICE)
     post = torch.randn((1, H), device=DEVICE)
-    ext.hc_apply(x, y, post, None)
+    ext.hc_apply(x, y, post, None, None, None)
     assert torch.isfinite(x).all()
 
 

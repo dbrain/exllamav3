@@ -7,12 +7,25 @@
 // heuristic applies; also exposed directly for testing. Same kernel arguments as
 // exl3_gemm_kernel, so graph recording/patching is identical.
 
-// True when `device` can execute the GEMV tensor-core kernel. On ROCm this is limited to
-// the oracle-verified gfx1200/gfx1201 WMMA implementations.
+#if defined(USE_ROCM)
+// RDNA WMMA family of `device` (0 none, 1 gfx12, 2 gfx11.5) and whether exl3_gemv_hip can run on it
 bool exl3_gemv_supported(int device);
 int exl3_gemv_wmma_family(int device);
 
-#if defined(USE_ROCM)
+// RDNA WMMA GEMV (quant/exl3_gemv.cu), same contract as exl3_gemv. Returns false without launching anything
+// when its kernels do not cover the call (K, codebook, rows, shape or arch); the caller then uses exl3_gemv
+bool exl3_gemv_hip
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const c10::optional<at::Tensor>& suh,
+    const c10::optional<at::Tensor>& A_had,
+    const c10::optional<at::Tensor>& svh,
+    bool mcg,
+    bool mul1
+);
+
 // Grouped MoE decode/verification path (routed experts, one launch per projection over every
 // (token, expert) assignment). Supports 1..16 token rows and top-k 8 (MiMo-V2) or 10 (Qwen3.8);
 // routing IDs and weights remain device-resident and duplicate assignment slots are preserved
@@ -90,6 +103,9 @@ bool exl3_gemv_try_launch
     void** launched_kernel,
     bool force
 );
+
+// Kernel instances for the half-integer bitrates (comp_units/exl3_gemv_half_inst.cu)
+void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg, bool smem);
 
 // Direct entry point (testing): errors if the call is not hard-eligible
 void exl3_gemv

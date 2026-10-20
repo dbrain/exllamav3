@@ -220,3 +220,12 @@ explicit = true
 # via `nix hash convert --hash-algo sha256 --from nix32 --to base16`).
 # If a future re-lock drops them, Nix evaluation fails loudly asking for
 # a sha256 (`uv lock --check` does NOT verify hashes) — re-add them.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["tools", "_retired", "testlib", "__disk_lru_cache__", ".*"]
+addopts = ["-p", "no:cacheprovider"]
+filterwarnings = [
+    # Triton's code generator on Python 3.14
+    "ignore:AnnAssign.__init__ missing:DeprecationWarning",
+]
