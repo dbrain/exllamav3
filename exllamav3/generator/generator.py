@@ -839,7 +839,14 @@ class Generator:
             inner_fn = draft_fn
             draft_fn = lambda results: self.iterate_hybrid_gen(inner_fn(results))
 
-        if self.spec_gate is not None and (self.dflash_draft or self.mtp_draft):
+        # A round in which every generating job needs exactly one more token cannot accept a single
+        # drafted token, so the draft forwards and the wider verify window are pure cost. Plain
+        # generation still exports the target state, so an MTP carry and the lazy drafter KV stay
+        # valid; it is the same path a one-token prompt or a spec-gate plain step takes. Kept out of
+        # the spec gate's timing: a last-token round says nothing about spec vs plain throughput
+        if (self.draft_model is not None or self.ngram_match_min) and self.all_jobs_need_one_token():
+            self._skip_draft_round(results)
+        elif self.spec_gate is not None and (self.dflash_draft or self.mtp_draft):
             self._iterate_gated(results, draft_fn)
         else:
             self.iterate_gen(results, draft_fn(results))
@@ -1137,6 +1144,33 @@ class Generator:
                 print(f" ## Warning: recurrent checkpoint failed for job "
                       f"{getattr(job, 'serial_number', '?')} ({repr(e)}); checkpointing "
                       f"disabled for this job, generation continues")
+
+
+    def all_jobs_need_one_token(self) -> bool:
+        """
+        True when at least one job generates this round and every such job stops after its next token on
+        max_new_tokens. Stop tokens and strings are not consulted: they only ever end a job earlier.
+        A healing job (new_tokens == -1) needs two.
+        """
+        n = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done():
+                continue
+            if job.max_new_tokens is None or job.max_new_tokens - job.new_tokens > 1:
+                return False
+            n += 1
+        return n > 0
+
+
+    def _skip_draft_round(self, results: list):
+        self._spec_round = None
+        self._draft_conf_round = None
+        pend = self._dkv_pending
+        if pend is not None:
+            gen_jobs = [j for j in self.active_jobs if j.is_prefill_done()]
+            if len(gen_jobs) != 1 or id(gen_jobs[0]) != pend["job"]:
+                self._flush_dkv()
+        self.iterate_gen(results, None)
 
 
     def update_visualizer(self):
