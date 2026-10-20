@@ -2251,7 +2251,32 @@ class Generator:
         # Requeue jobs. Puts replacement jobs at the front so long generations continue promptly after they yield
         # their cache pages.
         for job in requeuing_jobs:
-            rq_job = job.prepare_for_requeue()
+            # 🔴 THE REQUEUE IS A THIRD FAILURE SITE, and the one that actually killed
+            # the service on 2026-09-05. prepare_for_requeue() builds the replacement
+            # job and calls prepare_for_queue(..., rq = True), which ends in
+            #     assert total_pages <= max_pages, "... cannot be enqueued"
+            # So a long generation that yields at max_rq_tokens and whose REMAINING
+            # max_new_tokens no longer fits the cache raises HERE, inside iterate(),
+            # from a call the upstream #318 containment does not wrap (it guards
+            # allocate_pages() and prefill() only). The exception escapes to
+            # AsyncGenerator._run_iteration, which latches self.error, ends the single
+            # iteration task serving EVERY job, and hands that exception to all of them.
+            #
+            # Measured: the failing request ran ~100 s (103.7 s and 106.0 s in two
+            # independent runs) before the requeue, then the whole service went down —
+            # which is why this looked like a mysterious ~100 s delay rather than a
+            # rejection, and why it survived both the enqueue-path fix (patch 04) and
+            # the TabbyAPI recreate fix (tabbyAPI patch 05).
+            #
+            # reap_failed_job is safe here even though the loop above already ran
+            # deallocate_pages() and removed the job from active_jobs: deallocate_pages
+            # skips sequences whose allocated_pages is None, and the removal is guarded
+            # by `if job in self.active_jobs`.
+            try:
+                rq_job = job.prepare_for_requeue()
+            except Exception as e:
+                self.reap_failed_job(job, e, results)
+                continue
             self.pending_jobs.insert(0, rq_job)
 
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
