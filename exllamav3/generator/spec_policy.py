@@ -676,5 +676,9 @@ def install_draft_policy(generator, rule=None, ngram=NGRAM_DEFAULT, stats=None):
     if generator.dynamic_draft:
         raise ValueError("the draft policy sets the draft length itself: build the Generator with dynamic_draft_tokens=False")
     if rule is None:
-        rule = TierRule(maxd=generator.num_draft_tokens)
+        tier = os.environ.get("EXL3_TIER")
+        kw = dict(zip(("thf", "thv", "thfd", "thvd", "dsplit"), (float(v) for v in tier.split(",")))) if tier else {}
+        if "dsplit" in kw:
+            kw["dsplit"] = int(kw["dsplit"])
+        rule = TierRule(maxd=generator.num_draft_tokens, **kw)
     return install(generator, generator.draft_model, generator.model, ngram=ngram, stats=stats, rule=rule)
