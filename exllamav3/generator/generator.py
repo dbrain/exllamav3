@@ -1042,6 +1042,76 @@ class Generator:
         malloc_trim()
 
 
+    def requeue_one(self, job, results) -> bool:
+        """
+        Put a yielding job back on the queue, shrinking its headroom rather than killing it.
+
+        Returns True if the job was requeued, False if it was reaped.
+
+        A job yields every max_rq_tokens generated tokens so it does not monopolise the page
+        table. prepare_for_requeue() turns everything generated so far into the new prompt and
+        re-validates — and that validation can fail once two long conversations are competing
+        for one page table. Patch 05 made that failure survivable for the SERVICE. This makes
+        it survivable for the REQUEST.
+
+        🔴 The page requirement is driven by max_rq_tokens, NOT max_new_tokens:
+            Sequence.prepare(has_prefix, max_new_tokens = self.max_rq_tokens)
+            max_len     = len(sequence_ids) + max_rq_tokens
+            total_pages = ceil(max_len / PAGE_SIZE)
+        So a job that no longer fits is asking for too much GENERATION HEADROOM PER YIELD,
+        not too many tokens overall. Halving max_rq_tokens makes it yield twice as often and
+        reserve half the headroom; the work still completes, just in smaller slices.
+        Clamping max_new_tokens instead would do NOTHING AT ALL — that is the trap this
+        docstring exists to prevent.
+        """
+        try:
+            self.pending_jobs.insert(0, job.prepare_for_requeue())
+            return True
+        except Exception as e:
+            # prepare_for_requeue() does `rq_job = self` and re-inits IN PLACE before calling
+            # prepare_for_queue(), so on a raise `job` IS the fully-formed replacement job and
+            # only the final validation failed. Retrying prepare_for_queue() on it is safe.
+            boundary = (self.recurrent_checkpoint_interval
+                        if self.recurrent_cache is not None else PAGE_SIZE)
+            # orig_max_rq_tokens is None only when output_chunking is off, in which case
+            # prepare_for_queue set max_rq_tokens = max_new_tokens + 1. Clamping THAT makes a
+            # non-chunking job start chunking — a behaviour change, but strictly better than
+            # failing it.
+            clamped = job.orig_max_rq_tokens or job.max_rq_tokens
+            for _ in range(8):
+                prev = clamped
+                clamped = max(boundary, (clamped // 2 // boundary) * boundary)
+                # 🔴 NEVER CLAMP UPWARD. boundary comes from the model
+                # (default_recurrent_checkpoint_interval, 2048 here) and nothing stops a future
+                # model declaring one LARGER than max_rq_tokens — in which case
+                # max(boundary, ...) would ask for MORE headroom than the attempt that just
+                # failed, and retry forever on a request that only grows.
+                if clamped >= prev:
+                    break
+                job.max_rq_tokens = clamped
+                try:
+                    job.prepare_for_queue(self, job.serial_number, rq = True)
+                except Exception:
+                    if clamped <= boundary:
+                        break
+                    continue
+                # Persist it. The sequence only ever grows, so pressure only increases; letting
+                # the next yield start from orig_max_rq_tokens again would just repeat the
+                # failed attempt every single time.
+                job.orig_max_rq_tokens = clamped
+                self.pending_jobs.insert(0, job)
+                print(f" ## Note: job {getattr(job, 'serial_number', '?')} no longer fits its "
+                      f"requeue headroom; max_rq_tokens clamped to {clamped} (yields more "
+                      f"often) instead of failing the request")
+                return True
+            # Genuinely impossible: even one checkpoint interval of headroom does not fit, i.e.
+            # the SEQUENCE ITSELF has outgrown the page table. No amount of yielding helps, so
+            # the job dies here — but alone, and with the ORIGINAL exception so the client sees
+            # the real reason.
+            self.reap_failed_job(job, e, results)
+            return False
+
+
     def recurrent_checkpoint(self):
         for job in self.active_jobs:
             # 🔴 FOURTH FAILURE SITE. iterate() calls this UNGUARDED on every iteration, and
@@ -2305,12 +2375,7 @@ class Generator:
             # deallocate_pages() and removed the job from active_jobs: deallocate_pages
             # skips sequences whose allocated_pages is None, and the removal is guarded
             # by `if job in self.active_jobs`.
-            try:
-                rq_job = job.prepare_for_requeue()
-            except Exception as e:
-                self.reap_failed_job(job, e, results)
-                continue
-            self.pending_jobs.insert(0, rq_job)
+            self.requeue_one(job, results)
 
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs() and not self.deferred_jobs:
