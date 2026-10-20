@@ -138,3 +138,18 @@ def test_refuses_generators_it_cannot_drive(attr, value):
     setattr(g, attr, value)
     with pytest.raises(ValueError):
         sp.install_draft_policy(g)
+
+
+@pytest.mark.parametrize("uninstall_old_after", [False, True])
+def test_reinstall_on_a_new_generator_over_the_same_models(uninstall_old_after):
+    old = Gen([1, 2, 3], [0.5, 0.4])
+    uninstall_old = sp.install_draft_policy(old)
+    assert old.iterate_draftmodel_mtp_gen([]).shape[-1] == 1
+    new = Gen([1, 2, 3], [])
+    new.draft_model, new.model = old.draft_model, old.model
+    old.draft_model.ps, old.draft_model.k = [0.95, 0.95, 0.95, 0.9] + [0.5] * 4, 0
+    sp.install_draft_policy(new)
+    if uninstall_old_after:
+        uninstall_old()
+    assert new.iterate_draftmodel_mtp_gen([]).tolist() == [[100, 101, 102]]
+    assert old.draft_model.forwards == 1 + 3

@@ -538,6 +538,10 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
     log = list: logging arm. Drafts log_depth depths whatever the rule says, appends one dict per round
       (n, ng, ps, ids, keep) and verifies what `rule` would have kept (the stream is the baseline stream)."""
     lm = model.modules[model.logit_layer_idx]
+    # the hooks below sit on the models, which outlive a Generator: a new Generator over them (a server rebuilding its
+    # generator) replaces the old policy instead of stacking on it, and a late uninstall of the old one is a no-op there
+    prev = dm.__dict__.get("_spec_policy_uninstall")
+    if prev is not None: prev()
     if rule is None: rule = ProductRule(thf, thv, maxd)
     maxd = rule.maxd                  # the rule owns the depth cap
     st = {"i": 0, "stop": False, "keep": None, "ps": [], "job": None, "n": None, "drafted": 0}
@@ -655,8 +659,11 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
     ndt0 = g.num_draft_tokens; g.num_draft_tokens = win
     def uninstall():
         g.num_draft_tokens = ndt0
-        lm.forward = orig_lmf; dm.forward = orig_fwd; dm.sample_from_state = orig_sfs
+        if dm.__dict__.get("_spec_policy_uninstall") is uninstall:
+            lm.forward = orig_lmf; dm.forward = orig_fwd; dm.sample_from_state = orig_sfs
+            del dm._spec_policy_uninstall
         g.__dict__.pop("iterate_draftmodel_mtp_gen", None); g.__dict__.pop("enqueue", None)
+    dm._spec_policy_uninstall = uninstall
     return uninstall
 
 def install_draft_policy(generator, rule=None, ngram=NGRAM_DEFAULT, stats=None):
