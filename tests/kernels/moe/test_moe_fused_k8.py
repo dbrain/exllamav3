@@ -153,6 +153,7 @@ def test_decode_rows_take_fused_and_match_reconstruct(k8_block, rows, variant, m
     assert err < LAYER_TOL, f"rows={rows} variant={variant:#x}: fused MoE output vs reconstruct rel err {err:.2e}"
     if rows > 4:
         monkeypatch.setitem(moe_fused.R8, "on", False)
+        monkeypatch.setattr(moe_fused, "SPLIT_MAX_ROWS", 8)
         split, n = _forward(blk, x, True, monkeypatch)
         assert n == 1 + (rows + 3) // 4
         assert torch.equal(out, split), "one-launch 8 rows != 4 + 4 split"
