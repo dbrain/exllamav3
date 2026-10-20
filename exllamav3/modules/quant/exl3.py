@@ -19,6 +19,9 @@ DEC_GEMV_R_LOOP_MIN_K = int(os.environ.get("EXL3_DEC_GEMV_R_LOOP_MIN_K", "99"))
 # Mutable at run time for one-load A/B: set VERIFY_FUSE["on"] (the harness also calls block_graph.purge()).
 VERIFY_FUSE = {"on": os.environ.get("EXL3_VERIFY_FUSE", "0") != "0"}
 AUTO_RECONSTRUCT_THRESHOLD = 144
+# K7 / K8 rows that exl3_dec does not take go to the native EXL3 GEMM up to here (gfx1150, K8 2560x12288: 0.46 vs 2.2 ms at 1..8 rows,
+# 1.2 vs 2.3 ms at 16, 4.5 vs 2.4 ms at 64 against reconstruct + hgemm)
+NATIVE_GEMM_MAX_M = 16
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
@@ -231,8 +234,9 @@ _hip_gemv_support_cache: dict[int, bool] = {}
 # fused. EXL3_DEC=0 disables them (falls back to exl3_gemv / reconstruct).
 EXL3_DEC = os.environ.get("EXL3_DEC", "1") != "0"
 _DEC_KB2 = (4, 5, 6, 8, 10, 12)
-# dense projections also decode K7 (attention, linear-attention and shared-expert projections of 5 bpw packs); the routed-MoE kernels stop at K6
-_DEC_KB2_DENSE = _DEC_KB2 + (14,)
+# dense projections also decode K7 (attention, linear-attention and shared-expert projections of 5 bpw packs) and K8 (every dense
+# projection of the 4.18 bpw SC pack); the routed-MoE kernels stop at K6
+_DEC_KB2_DENSE = _DEC_KB2 + (14, 16)
 DEC_SCRATCH_FLOATS = 2 << 20
 _dec_workspaces: dict = {}
 
@@ -471,6 +475,9 @@ class LinearEXL3:
                         and self.frac is None and 2 <= self.K <= 6
                         and (self.K == 4 or self.mcg or self.mul1)):
                     return self.hip_gemv(x, out_dtype)
+                # hip_gemv stops at K6 and the BC classes are masked on ROCm
+                if torch.version.hip and self.K in (7, 8) and rows <= NATIVE_GEMM_MAX_M:
+                    return self.native_gemm(x, out_dtype)
 
         return self.reconstruct_hgemm(x, out_dtype)
 
@@ -544,6 +551,19 @@ class LinearEXL3:
         A_had = g_tensor_cache.get(
             x.device, (rows, self.in_features), torch.half, "exl3_gemv_a_had")
         ext.exl3_gemv(x_flat, self.trellis, y_flat, self.suh, A_had, self.svh, self.mcg, self.mul1)
+        if self.bias is not None:
+            y += self.bias
+        return y
+
+
+    def native_gemm(self, x: torch.Tensor, out_dtype):
+        rows = x.numel() // x.shape[-1]
+        y = torch.empty(x.shape[:-1] + (self.out_features,), dtype = out_dtype or self.default_out_dtype, device = x.device)
+        x_flat = x.view(rows, self.in_features)
+        if x_flat.dtype != torch.half:
+            x_flat = x_flat.half()
+        xh = g_tensor_cache.get(x.device, (rows, self.in_features), torch.half, "exl3_gemm_xh")
+        ext.exl3_gemm(x_flat, self.trellis, y.view(rows, self.out_features), self.suh, xh, self.svh, -1, self.mcg, self.mul1, 0)
         if self.bias is not None:
             y += self.bias
         return y

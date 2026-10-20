@@ -42,11 +42,13 @@ def test_wmma_prefill_dispatch_covers_k5_k6():
     assert t.count("case 10: MPW2_K(5, false)") == 1 and t.count("case 12: MPW2_K(6, false)") == 1
     assert t.count("case 10: MPW_K(5, false)") == 1 and t.count("case 12: MPW_K(6, false)") == 1
 
-def test_dense_decode_dispatch_covers_k7():
+def test_dense_decode_dispatch_covers_k7_k8():
     t = _read("exl3_dec.cu")
-    assert "kb2 <= 14" in t and "case 14: { constexpr int KB2 = 14;" in t and "case 14: gemv_kernel<14, CB>" in t
-    # the routed-MoE launches must still reject K7
-    assert "moe_gu_kernel<14" not in t and "moe_down_kernel<14" not in t
+    assert "kb2 <= 16" in t
+    for kb2 in (14, 16):
+        assert f"case {kb2}: {{ constexpr int KB2 = {kb2};" in t and f"case {kb2}: gemv_kernel<{kb2}, CB>" in t
+        # the routed-MoE launches must still reject K7 / K8
+        assert f"moe_gu_kernel<{kb2}" not in t and f"moe_down_kernel<{kb2}" not in t
 
 def test_python_gates():
     b = open(os.path.join(ROOT, "exllamav3", "modules", "block_sparse_mlp.py")).read()

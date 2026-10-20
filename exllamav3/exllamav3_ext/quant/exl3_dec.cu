@@ -348,7 +348,8 @@ __device__ __forceinline__ void load_tile(const u32x4* p, u32x4* r)
 #if !defined(EXL3_DEC_PF)
 #define EXL3_DEC_PF 0
 #endif
-template <int KB2> constexpr int ring_of() { return Fmt<KB2>::WORDS <= 32 ? EXL3_DEC_RING_SMALL : EXL3_DEC_RING_BIG; }
+// K8 (64-word tiles) keeps ring 1: two 64-word tiles spilled 96 VGPRs at batch 1 (gfx1150, 2560x10240: 473 us vs 354 us at ring 1)
+template <int KB2> constexpr int ring_of() { return Fmt<KB2>::WORDS <= 32 ? EXL3_DEC_RING_SMALL : Fmt<KB2>::WORDS <= 56 ? EXL3_DEC_RING_BIG : 1; }
 
 // Accumulate x[kt0 .. kt0 + n) . W[.., nt] for one lane (n % RING == 0), tile words streamed
 // through a RING-deep register ring. xs: LDS input (fp16) for this wave's k range, 16 per k-tile.
@@ -1929,7 +1930,7 @@ inline int pick_ktw(int kt, int strips_total, int ring, int min_blocks, int forc
 inline int ring_of_kb2(int kb2)
 {
     const int words = 4 * kb2;   // u32 words per tile
-    return words <= 32 ? EXL3_DEC_RING_SMALL : EXL3_DEC_RING_BIG;
+    return words <= 32 ? EXL3_DEC_RING_SMALL : words <= 56 ? EXL3_DEC_RING_BIG : 1;
 }
 
 static int env_int(const char* name, int dflt)
@@ -1941,7 +1942,7 @@ static int env_int(const char* name, int dflt)
 inline int kb2_of(double K)
 {
     const int kb2 = (int) (K * 2.0 + 0.5);
-    TORCH_CHECK(kb2 >= 4 && kb2 <= 14 && (double) kb2 == K * 2.0, "exl3_dec: unsupported K ", K);
+    TORCH_CHECK(kb2 >= 4 && kb2 <= 16 && (double) kb2 == K * 2.0, "exl3_dec: unsupported K ", K);
     return kb2;
 }
 
@@ -1955,6 +1956,7 @@ inline int kb2_of(double K)
         case 10: { constexpr int KB2 = 10; __VA_ARGS__; } break;                     \
         case 12: { constexpr int KB2 = 12; __VA_ARGS__; } break;                     \
         case 14: { constexpr int KB2 = 14; __VA_ARGS__; } break;                     \
+        case 16: { constexpr int KB2 = 16; __VA_ARGS__; } break;                     \
         default: TORCH_CHECK(false, "exl3_dec: unsupported K*2 ", kb2);              \
     }
 
@@ -1983,6 +1985,7 @@ inline void launch_gemv_cb(int kb2, int blocks, const half* xp, const Jobs& jobs
         case 10: gemv_kernel<10, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         case 12: gemv_kernel<12, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         case 14: gemv_kernel<14, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
+        case 16: gemv_kernel<16, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         default: TORCH_CHECK(false, "exl3_dec_gemv: unsupported K*2 ", kb2);
     }
 }

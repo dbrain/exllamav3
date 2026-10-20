@@ -101,8 +101,7 @@ EXL3_MLA_ATTN_ROWLOOP = os.environ.get("EXL3_MLA_ATTN_ROWLOOP", "1") != "0"
 # near-ties). Both halves exact = MTP greedy ids equal plain greedy ids (step 7: 32/32 cases).
 EXL3_MLA_PROJ_R = os.environ.get("EXL3_MLA_PROJ_R", "gemv_r")
 
-# K*2 values the exl3_dec GEMV kernels are instantiated for (quant/exl3.py: _DEC_KB2)
-_DEC_KB2 = (4, 5, 6, 8, 10, 12)
+from .quant.exl3 import _DEC_KB2_DENSE
 
 
 def dec_proj_ok(lin) -> bool:
@@ -121,7 +120,7 @@ def dec_proj_ok(lin) -> bool:
     return (
         EXL3_MLA_DEC and bool(torch.version.hip) and hasattr(ext, "exl3_dec_gemv") and
         getattr(lin, "quant_type", None) == "exl3" and (inner.mul1 or inner.mcg) and
-        int(round(k2)) in _DEC_KB2 and k2 == int(round(k2)) and
+        int(round(k2)) in _DEC_KB2_DENSE and k2 == int(round(k2)) and
         inner.in_features % 512 == 0 and inner.out_features % 128 == 0 and
         tuple(inner.trellis.shape[:2]) == (inner.in_features // 16, inner.out_features // 16) and
         inner.suh is not None and inner.svh is not None and inner.bias is None and
