@@ -1,7 +1,7 @@
-// CPU proof for the K6 (and K5 reference) lane word sets of the fused MoE half-layer. Includes the REAL index header of the kernel.
+// CPU proof for the K6 / K8 (and K5 reference) lane word sets of the fused MoE half-layer. Includes the REAL index header of the kernel.
 // For every lane of a trellis tile (32 lanes x 2 groups) it compares the kernel's word extraction (mf::kn_words on the lane set {wrap, own0..}) with the engine's
 // dq4<bits> arithmetic (exl3_dq.cuh, copied formula by formula, cyclic over the tile), checks every index is inside the lane set / the tile, the 64 bit shifts stay < 64,
-// the group stays inside two words, the lane sets of the 8 g8 cover the tile once, and the 8 byte alignment of the uint2 loads.
+// the group stays inside two words, the lane sets of the 8 g8 cover the tile once, and the alignment of the uint2 (K6) / uint4 (K8) loads.
 #include "exl3_moe_fused_idx.h"
 #include <cstdio>
 #include <cstdint>
@@ -11,7 +11,7 @@ static int fails = 0;
 static uint32_t fshift_eng(uint32_t b, uint32_t a, int shift) { uint64_t merged = ((uint64_t) a << 32) | (uint64_t) b; return (uint32_t) (merged >> shift); }
 int main(int argc, char** argv)
 {
-    int bitsv[] = {5, 6};
+    int bitsv[] = {5, 6, 8};
     for (int bits : bitsv)
     {
         const int tw = mf::tw(bits);
@@ -28,8 +28,9 @@ int main(int argc, char** argv)
                 CHECK(wrp >= 0 && wrp < tw, "wrap range");
                 CHECK(wrp == (own + tw - 1) % tw, "wrap is the word before own (cyclic)");
                 CHECK(((own * 4) % 8) == 0 || bits % 2 == 1, "uint2 alignment of own words, bits=%d g8=%d", bits, g8);
+                CHECK(bits != 8 || ((own * 4) % 16) == 0, "uint4 alignment of own words, bits=%d g8=%d", bits, g8);
                 for (int k = 0; k < bits; ++k) cover[own + k]++;
-                uint32_t w[7] = {0, 0, 0, 0, 0, 0, 0};
+                uint32_t w[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
                 w[0] = tile[wrp];
                 for (int k = 0; k < bits; ++k) w[1 + k] = tile[own + k];
                 for (int t = 0; t < 4; ++t)
@@ -76,6 +77,7 @@ int main(int argc, char** argv)
                             const long own = base + mf::own_i(bits, g8, s, ss), wrp = base + mf::wrp_i(bits, g8, s, ss);
                             CHECK(own >= 0 && own + bits <= words && wrp >= 0 && wrp < words, "matrix range bits=%d nat=%d tile=%d s=%d", bits, nat, tile, s);
                             CHECK(bits != 6 || own % 2 == 0, "uint2 loads 8-byte aligned in the matrix (even word offset) bits=%d", bits);
+                            CHECK(bits != 8 || own % 4 == 0, "uint4 loads 16-byte aligned in the matrix (word offset % 4) bits=%d", bits);
                         }
             }
         }

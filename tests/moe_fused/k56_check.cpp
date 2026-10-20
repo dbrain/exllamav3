@@ -37,6 +37,7 @@ template <class S> static void shape(const char* name)
 int main()
 {
     shape<mf::QwenK4S6>("QwenK4S6"); shape<mf::QwenK5S6>("QwenK5S6"); shape<mf::SmallK4S6>("SmallK4S6"); shape<mf::SmallK5S6>("SmallK5S6");
+    shape<mf::QwenK4S8>("QwenK4S8"); shape<mf::QwenK5S8>("QwenK5S8"); shape<mf::SmallK4S8>("SmallK4S8"); shape<mf::SmallK5S8>("SmallK5S8");
     // grouped GEMV staging: TWORDS = 8 * bits per tile, WNT tiles per warp (CFG 0: 2, CFG 1/2: 4), loads of LSTRIDE = min(TWORDS, 32) lanes
     for (int bits = 2; bits <= 6; ++bits)
         for (int cfg = 0; cfg < 3; ++cfg)

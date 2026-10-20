@@ -1,4 +1,4 @@
-"""CPU proof of the K6 instance of the fused MoE half-layer (word extraction vs the engine's dq4<6>, index bounds, alignment), with mutants that must fail,
+"""CPU proof of the K6 / K8 instances of the fused MoE half-layer (word extraction vs the engine's dq4<6> / dq4<8>, index bounds, alignment), with mutants that must fail,
 plus a source guard that the kernels use the proven helpers. No GPU."""
 import os, re, shutil, subprocess, sys
 import pytest
@@ -38,10 +38,18 @@ def test_k6_mutants_fail(tmp_path, name):
 def test_kernels_use_proven_helpers():
     for f in ("exl3_moe_fused.cuh", "exl3_moe_fused7_mv.cuh"):
         t = open(os.path.join(QD, f)).read()
-        assert "BITS == 6) mf_dq8_k6(wa[u], t, f0[t], f1[t])" in t
+        assert "BITS == 6 || BITS == 8) mf_dq8_kn<BITS>(wa[u], t, f0[t], f1[t])" in t
         assert "const uint2 v0 = *(const uint2*) q, v1 = *(const uint2*) (q + 2), v2 = *(const uint2*) (q + 4); w[1] = v0.x; w[2] = v0.y; w[3] = v1.x; w[4] = v1.y; w[5] = v2.x; w[6] = v2.y;" in t
+        assert "BITS == 8) { const uint4 v0 = *(const uint4*) q, v1 = *(const uint4*) (q + 4); w[1] = v0.x; w[2] = v0.y; w[3] = v0.z; w[4] = v0.w; w[5] = v1.x; w[6] = v1.y; w[7] = v1.z; w[8] = v1.w; }" in t
+        assert "VUM = BITS == 8 ? 4 : 5, VU = CH > VUM ? VUM : CH;" in t
     t = open(os.path.join(QD, "exl3_moe_fused.cuh")).read()
-    m = re.search(r"void mf_dq8_k6\(.*?\n\}\n", t, re.S)
-    assert m and "kn_words(6, w, t, v);" in m.group(0) and "decode8<2>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], f0, f1)" in m.group(0)
+    m = re.search(r"void mf_dq8_kn\(const uint32_t \(&w\)\[BITS \+ 1\].*?\n\}\n", t, re.S)
+    assert m and "kn_words(BITS, w, t, v);" in m.group(0) and "decode8<2>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], f0, f1)" in m.group(0)
     assert "X9D(mf::QwenK6S6)" in open(os.path.join(QD, "exl3_moe_fused9.cu")).read()
     assert "X(mf::QwenK6S6)" in open(os.path.join(QD, "exl3_moe_fused.cu")).read()
+
+def test_k8_shapes_are_instantiated_everywhere():
+    f, f9 = (open(os.path.join(QD, n)).read() for n in ("exl3_moe_fused.cu", "exl3_moe_fused9.cu"))
+    for s in ("QwenK4S8", "QwenK5S8", "SmallK4S8", "SmallK5S8"):
+        assert f"X(mf::{s})" in f and f"X9D(mf::{s})" in f9 and f"XW(mf::{s})" in f9
+    assert "else if (bits == 8) ok = mf_tt_dispatch<8>(" in f

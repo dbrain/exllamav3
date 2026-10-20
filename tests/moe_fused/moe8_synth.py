@@ -2,13 +2,13 @@
 against the same rows run as <= 4-row launches and as single rows. Bitwise equality is required. Routings: random rows, duplicated rows (every expert group has
 R rows, the unit cut at 4 rows is exercised), pairs of duplicated rows, all-NaN rows. Also: ctl words zero after each launch, x canaries, workspace tail canary,
 read-only inputs unchanged, repeat launches identical. BENCH=1 adds a timing of the wide launch against the 4 + (R-4) split (CUDA events, us per call).
-env: SHAPE = small (D 256, 64 experts) | real (Qwen D 2560, 512 experts), SYNTH = k24 | k3s4 | k3s5 | k4s4 | k4s5 (bits of routed / shared experts)."""
+env: SHAPE = small (D 256, 64 experts) | real (Qwen D 2560, 512 experts), SYNTH = k24 | k3s4 | k3s5 | k4s4 | k4s5 | k4s6 | k5s6 | k4s8 | k5s8 (bits of routed / shared experts)."""
 import os, sys, torch
 TREE = os.environ.get('EXL3_TREE', os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))); sys.path.insert(0, TREE)
 import exllamav3
 from exllamav3.ext import exllamav3_ext as ext
 assert exllamav3.__file__.startswith(TREE)
-RBSB = {'k24': (2, 4), 'k3s4': (3, 4), 'k3s5': (3, 5), 'k4s4': (4, 4), 'k4s5': (4, 5)}[os.environ.get('SYNTH', 'k24')]
+RBSB = {'k24': (2, 4), 'k3s4': (3, 4), 'k3s5': (3, 5), 'k4s4': (4, 4), 'k4s5': (4, 5), 'k4s6': (4, 6), 'k5s6': (5, 6), 'k4s8': (4, 8), 'k5s8': (5, 8)}[os.environ.get('SYNTH', 'k24')]
 KIND = os.environ.get('SHAPE', 'small')
 D, H, LR, NEXP, TOPK, INTER = (256, 4, 32, 64, 4, 128) if KIND == 'small' else (2560, 4, 320, 512, 10, 640)
 RB, SB = RBSB
