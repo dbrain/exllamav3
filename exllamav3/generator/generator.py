@@ -1166,22 +1166,7 @@ class Generator:
         if batch_size == 0:
             return None
 
-        # Create block index table for batch
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
-        # pageable copies; the draft's own buffers, since the target's are still in flight
-        max_pages_batch = (max_pages_batch + 15) // 16 * 16
-        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
-        block_index.zero_()
-        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
-        batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                batch += 1
+        block_index, cache_seqlens = self._draft_batch_tables(batch_size, max_seq_len)
 
         # Indexed embeddings not supported when drafting
         # TODO: Allow multimodal draft model, perhaps with dummy embeddings?
@@ -1248,7 +1233,11 @@ class Generator:
             else:
                 new_ids = torch.argmax(batch_logits, dim = -1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
+            # Feed the next step from the host copy just made rather than a
+            # second device-to-host copy of the same value. Each one is a full
+            # sync, and syncs are what leave the GPU idle while the host
+            # re-dispatches the next draft step
+            batch_ids.copy_(self.draft_ids_pinned[:batch_size, idx:idx+1])
             cache_seqlens += 1
             if cal is not None:
                 c = conf.float().cpu()
@@ -1335,24 +1324,8 @@ class Generator:
         if batch_size == 0:
             return None
 
-        # Create block index table for batch (lean: reuse pinned staging like iterate_gen
-        # instead of fresh zeros + allocator traffic every round)
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         lean_mtp = _host_lean()
-        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
-        # pageable copies; the draft's own buffers, since the target's are still in flight
-        max_pages_batch = (max_pages_batch + 15) // 16 * 16
-        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
-        block_index.zero_()
-        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
-        batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                batch += 1
+        block_index, cache_seqlens = self._draft_batch_tables(batch_size, max_seq_len)
 
         # Collect input IDs
         input_ids_list = []
@@ -1441,7 +1414,11 @@ class Generator:
                     spec_q.append(q)
                     new_ids = spec_sample.draw(q, spec_job.rng.random()).view(1, 1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
+            # Feed the next step from the host copy just made rather than a
+            # second device-to-host copy of the same value. Each one is a full
+            # sync, and syncs are what leave the GPU idle while the host
+            # re-dispatches the next draft step
+            batch_ids.copy_(self.draft_ids_pinned[:batch_size, idx:idx+1])
             cache_seqlens += 1 + (n_pend if idx == 0 else 0)
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
@@ -1588,22 +1565,7 @@ class Generator:
         # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
         window = self.num_draft_tokens
 
-        # Create block index table for batch
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
-        # pageable copies; the draft's own buffers, since the target's are still in flight
-        max_pages_batch = (max_pages_batch + 15) // 16 * 16
-        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
-        block_index.zero_()
-        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
-        batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                batch += 1
+        block_index, cache_seqlens = self._draft_batch_tables(batch_size, max_seq_len)
 
         # Collect input IDs
         input_ids_list = []
@@ -1675,6 +1637,32 @@ class Generator:
 
         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
         return self.draft_ids_pinned[:, :window]
+
+
+    def _draft_batch_tables(self, batch_size: int, max_seq_len: int):
+        """
+        Block table and cache lengths for one draft round, in pinned staging.
+
+        Same contract as iterate_gen's: pinned, so every upload of them is
+        stream-ordered instead of a blocking pageable copy, and the width padded
+        to 16 pages, so a growing context crosses a width boundary once every
+        PAGE_SIZE * 16 tokens instead of every PAGE_SIZE -- which is what keeps
+        one captured decode-graph signature alive across a generation.
+        """
+        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
+        batch = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            for seq in job.sequences:
+                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+                cache_seqlens[batch] = seq.kv_position
+                batch += 1
+        return block_index, cache_seqlens
 
 
     def iterate_ngram_gen(self, results: list):
