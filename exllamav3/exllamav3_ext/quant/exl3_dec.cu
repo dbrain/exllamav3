@@ -2450,7 +2450,7 @@ static void dec_gemv_r_impl
     // EXL3_GEMV_R_RM6=1 (needs EXL3_GEMV_R_DEC1=1): 5 or 6 rows run in ONE launch of the 6-row instantiation (one decode pass,
     // no VGPR spill at K*2 = 8 / 10) instead of a 4-row chunk plus a 1..2 row chunk. Same per-row arithmetic (rows are independent
     // in lane_gemv_r1 / pair_dot_r), rows 1..4 keep their own instantiations untouched.
-    const bool rm6 = R >= 5 && R <= 6 && (kb2 == 8 || kb2 == 10) && env_int("EXL3_GEMV_R_RM6", 0) != 0 &&
+    const bool rm6 = R >= 5 && R <= 6 && (kb2 == 8 || kb2 == 10 || kb2 == 12) && env_int("EXL3_GEMV_R_RM6", 0) != 0 &&
                      env_int("EXL3_GEMV_R_DEC1", 0) == 1 && GEMV_R_ROW_BUDGET / ktw >= R;
     if (rm6) rpb = R;
 
@@ -2498,8 +2498,9 @@ static void dec_gemv_r_impl
     {
         EXL3_DEC_DISPATCH_CB(mcg ? 1 : 2,
         {
-            if (kb2 == 8) { auto kfn = gemv_kernel_r<8, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
-            else          { auto kfn = gemv_kernel_r<10, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+            if (kb2 == 8)       { auto kfn = gemv_kernel_r<8, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+            else if (kb2 == 10) { auto kfn = gemv_kernel_r<10, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+            else                { auto kfn = gemv_kernel_r<12, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
         });
         cuda_check(cudaPeekAtLastError());
         return;
