@@ -55,9 +55,10 @@ template <int BITS, bool CF32, int RW, int KS, int ABL>
 __device__ __forceinline__ void mf7_tile(const uint32_t* __restrict__ A32, const uint32_t* __restrict__ Bt, long ss, void* __restrict__ C,
                                         int size_n, int tile, float* red, int wave, int lane)
 {
-    static_assert(BITS >= 2 && BITS <= 6, "K1, K7.. need their own per-lane word set and decode body: not implemented");
+    static_assert(bits_ok(BITS), "K1, K7 need their own per-lane word set and decode body: not implemented");
     constexpr int NWD = BITS + 1, CH = (KS + 15) / 16, NRND = 4, K = KS * 16;
-    constexpr int VU = CH > 5 ? 5 : CH;
+    // K8 lane sets are 9 words: a 4-deep ring keeps wa + wb at 72 registers, about K6's 70 (the other bit widths keep 5)
+    constexpr int VUM = BITS == 8 ? 4 : 5, VU = CH > VUM ? VUM : CH;
     const int g8 = lane & 7, cq = lane >> 3;
     float rs0[RW], rs1[RW];
     #pragma unroll
@@ -72,6 +73,7 @@ __device__ __forceinline__ void mf7_tile(const uint32_t* __restrict__ A32, const
         else if constexpr (BITS == 3) { w[1] = q[0]; w[2] = q[1]; w[3] = q[2]; }
         else if constexpr (BITS == 5) { w[1] = q[0]; w[2] = q[1]; w[3] = q[2]; w[4] = q[3]; w[5] = q[4]; }
         else if constexpr (BITS == 6) { const uint2 v0 = *(const uint2*) q, v1 = *(const uint2*) (q + 2), v2 = *(const uint2*) (q + 4); w[1] = v0.x; w[2] = v0.y; w[3] = v1.x; w[4] = v1.y; w[5] = v2.x; w[6] = v2.y; }
+        else if constexpr (BITS == 8) { const uint4 v0 = *(const uint4*) q, v1 = *(const uint4*) (q + 4); w[1] = v0.x; w[2] = v0.y; w[3] = v0.z; w[4] = v0.w; w[5] = v1.x; w[6] = v1.y; w[7] = v1.z; w[8] = v1.w; }
         else { const uint4 v = *(const uint4*) q; w[1] = v.x; w[2] = v.y; w[3] = v.z; w[4] = v.w; }
     };
     auto ldst = [&](uint32_t (&w)[VU][NWD], int rnd, int sg0)
@@ -115,7 +117,7 @@ __device__ __forceinline__ void mf7_tile(const uint32_t* __restrict__ A32, const
                         else if constexpr (BITS == 2) exl3_gemv_ns::dq8_regs_2bits<2>(wa[u][t >> 1], wa[u][1 + (t >> 1)], t << 3, f0[t], f1[t]);
                         else if constexpr (BITS == 3) exl3_gemv_ns::dq8_regs_3bits<2>(wa[u][t == 0 ? 0 : (t == 1 ? 1 : 2)], wa[u][t == 0 ? 1 : (t == 1 ? 2 : 3)], t == 0 ? 8 : (t == 1 ? 16 : (t == 2 ? 24 : 0)), f0[t], f1[t]);
                         else if constexpr (BITS == 5) mf_dq8_k5(wa[u], t, f0[t], f1[t]);
-                        else if constexpr (BITS == 6) mf_dq8_k6(wa[u], t, f0[t], f1[t]);
+                        else if constexpr (BITS == 6 || BITS == 8) mf_dq8_kn<BITS>(wa[u], t, f0[t], f1[t]);
                         else exl3_gemv_ns::dq8_regs_4bits<2>(wa[u][t], wa[u][t + 1], f0[t], f1[t]);
                     }
                     #pragma unroll

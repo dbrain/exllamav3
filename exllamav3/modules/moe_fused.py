@@ -166,9 +166,9 @@ class FusedMoEHalf:
         return 1 <= x.shape[0] * x.shape[1] <= (8 if R8["on"] else SPLIT_MAX_ROWS)
 
     def _wide_ok(self) -> bool:
-        """The one-launch 5..8 row path exists for this block: mf9 at the default variant 0x160000 (six stage launches), native layout, no timing. The wide instantiations cover K2..K5 only (the K6 drafter layer takes the split path)."""
+        """The one-launch 5..8 row path exists for this block: mf9 at the default variant 0x160000 (six stage launches), native layout, no timing. The wide instantiations cover routed K2..K5 (shared K4, K5, K6, K8); the K6 drafter layer takes the split path."""
         v = MF9["variant"] & 0x1f0000
-        return bool(self.native and self.RB <= 5 and self.SB <= 5 and hasattr(torch.ops, "mf9") and hasattr(torch.ops.mf9, "half") and v == 0x160000 and not MF9["timing"])
+        return bool(self.native and self.RB <= 5 and hasattr(torch.ops, "mf9") and hasattr(torch.ops.mf9, "half") and v == 0x160000 and not MF9["timing"])
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """x (b, s, H, D) fp32 residual stack, updated in place and returned."""

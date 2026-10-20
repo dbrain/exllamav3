@@ -102,7 +102,8 @@ template <class S> void mf_launch
 }
 }  // namespace
 
-#define MF_SHAPES(X) X(mf::QwenShape) X(mf::SmallTestShape) X(mf::SmallK3Shape) X(mf::QwenK3S4) X(mf::QwenK3S5) X(mf::QwenK4S4) X(mf::QwenK4S5) X(mf::SmallK3S4) X(mf::SmallK3S5) X(mf::SmallK4S4) X(mf::SmallK4S5) X(mf::QwenK6S6) X(mf::SmallK6S6) X(mf::QwenK4S6) X(mf::QwenK5S6) X(mf::SmallK4S6) X(mf::SmallK5S6)
+#define MF_SHAPES(X) X(mf::QwenShape) X(mf::SmallTestShape) X(mf::SmallK3Shape) X(mf::QwenK3S4) X(mf::QwenK3S5) X(mf::QwenK4S4) X(mf::QwenK4S5) X(mf::SmallK3S4) X(mf::SmallK3S5) X(mf::SmallK4S4) X(mf::SmallK4S5) X(mf::QwenK6S6) X(mf::SmallK6S6) X(mf::QwenK4S6) X(mf::QwenK5S6) X(mf::SmallK4S6) X(mf::SmallK5S6) \
+                       X(mf::QwenK4S8) X(mf::QwenK5S8) X(mf::SmallK4S8) X(mf::SmallK5S8)
 
 bool exl3_moe_fused_supported(int64_t D, int64_t H, int64_t LR, int64_t NEXP, int64_t TOPK, int64_t INTER, int64_t RB, int64_t SB)
 {
@@ -153,7 +154,7 @@ void exl3_moe_fused_half
     TORCH_CHECK(false, "exl3_moe_fused: shape not instantiated");
 }
 
-// ---- tile test entry: (bits, K, cf32) combinations instantiated: K = 640 / 2048 (down, float out), 2560 / 4096 (gate/up, half out); bits 2, 3, 4
+// ---- tile test entry: (bits, K, cf32) combinations instantiated: K = 640 / 2048 (down, float out), 2560 / 4096 (gate/up, half out); bits 2 .. 6, 8
 namespace {
 template <int BITS, bool CF, int KS>
 bool mf_tt_launch(const at::Tensor& A, const at::Tensor& B, at::Tensor& C, int R, int nt, int native, hipStream_t stream)
@@ -194,6 +195,7 @@ void exl3_moe_fused_tile_test(const at::Tensor& A, const at::Tensor& B, at::Tens
     else if (bits == 4) ok = mf_tt_dispatch<4>(ks, cf, A, B, C, R, nt, (int) native, stream);
     else if (bits == 5) ok = mf_tt_dispatch<5>(ks, cf, A, B, C, R, nt, (int) native, stream);
     else if (bits == 6) ok = mf_tt_dispatch<6>(ks, cf, A, B, C, R, nt, (int) native, stream);
+    else if (bits == 8) ok = mf_tt_dispatch<8>(ks, cf, A, B, C, R, nt, (int) native, stream);
     TORCH_CHECK(ok, "tile test: (bits, K, output dtype) not instantiated");
 }
 #endif

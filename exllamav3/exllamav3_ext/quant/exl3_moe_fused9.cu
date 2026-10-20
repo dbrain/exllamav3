@@ -104,6 +104,7 @@ void mf9_half(at::Tensor& x, const at::Tensor& fn, const at::Tensor& fn_scale, c
         XW(mf::QwenShape) XW(mf::SmallTestShape) XW(mf::QwenK3S4) XW(mf::QwenK3S5) XW(mf::QwenK4S4) XW(mf::QwenK4S5)
         XW(mf::SmallK3S4) XW(mf::SmallK3S5) XW(mf::SmallK4S4) XW(mf::SmallK4S5)
         XW(mf::QwenK4S6) XW(mf::QwenK5S6) XW(mf::SmallK4S6) XW(mf::SmallK5S6)
+        XW(mf::QwenK4S8) XW(mf::QwenK5S8) XW(mf::SmallK4S8) XW(mf::SmallK5S8)
 #undef XW
         TORCH_CHECK(false, "mf9: shape not instantiated for wide launches");
     }
@@ -128,6 +129,7 @@ void mf9_half(at::Tensor& x, const at::Tensor& fn, const at::Tensor& fn_scale, c
     X9D(mf::QwenK3S4) X9D(mf::QwenK3S5) X9D(mf::QwenK4S4) X9D(mf::QwenK4S5)
     X9D(mf::QwenK6S6) X9D(mf::SmallK6S6)
     X9D(mf::QwenK4S6) X9D(mf::QwenK5S6) X9D(mf::SmallK4S6) X9D(mf::SmallK5S6)
+    X9D(mf::QwenK4S8) X9D(mf::QwenK5S8) X9D(mf::SmallK4S8) X9D(mf::SmallK5S8)
     X9D(mf::SmallK3S4) X9D(mf::SmallK3S5) X9D(mf::SmallK4S4) X9D(mf::SmallK4S5)
 #undef X9D
     TORCH_CHECK(false, "mf9: shape not instantiated");

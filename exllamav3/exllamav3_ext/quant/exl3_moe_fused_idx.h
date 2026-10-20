@@ -54,6 +54,13 @@ struct QwenK4S6 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TO
 struct QwenK5S6 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TOPK = 10, INTER = 640, RB = 5, SB = 6; };
 struct SmallK4S6 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 4, SB = 6; };
 struct SmallK5S6 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 5, SB = 6; };
+// 4 bpw and 5 bpw routed experts with a K8 shared expert (the 4.18 bpw "SC" pack: K5 routed in layers 0, 1, 47, K4 elsewhere), and small twins
+struct QwenK4S8 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TOPK = 10, INTER = 640, RB = 4, SB = 8; };
+struct QwenK5S8 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TOPK = 10, INTER = 640, RB = 5, SB = 8; };
+struct SmallK4S8 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 4, SB = 8; };
+struct SmallK5S8 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 5, SB = 8; };
+
+MF_FN bool bits_ok(int bits)                                        { return (bits >= 2 && bits <= 6) || bits == 8; }
 
 template <class S>
 struct Dm
@@ -86,7 +93,7 @@ struct Dm
     static_assert(TOPK >= 1 && TOPK <= 15, "combine uses wave <= TOPK, 16 waves");
     static_assert(MAXR * TOPK <= THREADS && MAXR * TOPK <= 40, "sort/group arrays");
     static_assert(TRows<S>::v >= MAXR && TRows<S>::v <= MAXRT && TRows<S>::v * TOPK <= THREADS, "wide instantiation: sort/group arrays (one thread per slot)");
-    static_assert((RB >= 2 && RB <= 6) && (SB >= 2 && SB <= 6), "K2, K3, K4, K5, K6");
+    static_assert(bits_ok(RB) && bits_ok(SB), "K2, K3, K4, K5, K6, K8");
     static_assert(H >= 1 && H <= 4, "dred/rmr scratch");
     static_assert(LR % 1 == 0 && LR <= 1024, "t scratch");
     // dynamic-free LDS: A + A2 for MAXR rows of the larger of D / INTER
@@ -120,13 +127,14 @@ MF_FN int k5_s2(int t, int g)                                       { return (k5
 // K6 (and any K whose 4-value group spans <= 2 words, K5 / K6 / K8 style): lane (g8, t) is the engine's lane L = 4 g8 + t; its group g (values 4g .. 4g + 3, engine dq4<bits>)
 // starts at bit (8L + 4g + 257) bits - 16; relative to the first bit of the lane set's wrap word (global word bits g8 - 1, cyclic) that is
 // 8 bits t + 4 bits g + bits + 16 (256 bits = 8 tiles of 32 bits cancels). The group ends 3 bits + 16 bits later; both words of the funnel shift are local
-// indices 0 .. bits of {wrap, own0 .. own(bits-1)}. K6: 34 bits per group, the engine's alignment keeps it inside two words (checked on CPU for every lane).
+// indices 0 .. bits of {wrap, own0 .. own(bits-1)}. K6: 34 bits per group, K8: 40 bits starting at bit 24 of a word; the engine's alignment keeps both inside two words
+// (checked on CPU for every lane).
 MF_FN int kn_rel(int bits, int t, int g)                            { return 8 * bits * t + 4 * bits * g + bits + 16; }
 MF_FN int kn_i0(int bits, int t, int g)                             { return kn_rel(bits, t, g) / 32; }
 MF_FN int kn_i2(int bits, int t, int g)                             { return (kn_rel(bits, t, g) + 3 * bits + 15) / 32; }
 MF_FN int kn_s2(int bits, int t, int g)                             { return (kn_i2(bits, t, g) + 1) * 32 - (kn_rel(bits, t, g) + 3 * bits + 16); }
 // the 8 trellis words (16 bit each, low half) of lane (g8, t) from its lane set w[0 .. bits] (wrap, own0 ..), in the order the decoder takes them
-template <class W> MF_FN void kn_words(int bits, const W (&w)[7], int t, unsigned (&v)[8])
+template <class W, int N> MF_FN void kn_words(int bits, const W (&w)[N], int t, unsigned (&v)[8])
 {
     for (int g = 0; g < 2; ++g)
     {
