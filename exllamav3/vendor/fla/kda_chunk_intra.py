@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 from .kda_chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
-from .kda_wy_fast import recompute_w_u_fwd
+from .kda_wy_fast import recompute_w_u_fwd, kda_tune_cfg, _jit_of
 from .index import prepare_chunk_indices
 from .op import exp2
 from .op import gather
@@ -511,6 +511,7 @@ def chunk_kda_fwd_intra(
     chunk_indices: torch.LongTensor | None = None,
     safe_gate: bool = False,
     disable_recompute: bool = False,
+    skip_wu: bool = False,
 ):
     B, T, H, K, HV = *k.shape, gk.shape[2]
     BT = chunk_size
@@ -568,26 +569,43 @@ def chunk_kda_fwd_intra(
 
     # Step 2: Fused inter + solve_tril (works for both fixed-len and varlen)
     grid = (NT, B * HV)
-    chunk_kda_fwd_kernel_inter_solve_fused[grid](
-        q=q,
-        k=k,
-        g=gk,
-        beta=beta,
-        Aqk=Aqk,
-        Akkd=Akkd,
-        Akk=Akk,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        HV=HV,
-        K=K,
-        BT=BT,
-        BC=BC,
-        NC=NC,
-        USE_SAFE_GATE=safe_gate,
-    )
+    cfg = kda_tune_cfg()
+    from .kda_inter_split import inter_split_mode, inter_solve_split
+    split = inter_split_mode(T, BT, BC, cu_seqlens, safe_gate) if NC == 4 else 0
+    if split:
+        # EXL3_KDA_IS_SPLIT (default 3 = HIP off + head-fastest merge, kdaC7): spill-free two-kernel inter-solve (kdaC6)
+        inter_solve_split(q, k, gk, beta, Aqk, Akkd, Akk, scale, split)
+    elif cfg is not None:
+        _jit_of(chunk_kda_fwd_kernel_inter_solve_fused)[grid](
+            q, k, gk, beta, Aqk, Akkd, Akk, scale, cu_seqlens, chunk_indices, T,
+            H=H, HV=HV, K=K, BT=BT, BC=BC, NC=NC, BK=cfg[0],
+            IS_VARLEN=cu_seqlens is not None, USE_SAFE_GATE=safe_gate,
+            num_warps=cfg[1],
+        )
+    else:
+        chunk_kda_fwd_kernel_inter_solve_fused[grid](
+            q=q,
+            k=k,
+            g=gk,
+            beta=beta,
+            Aqk=Aqk,
+            Akkd=Akkd,
+            Akk=Akk,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            HV=HV,
+            K=K,
+            BT=BT,
+            BC=BC,
+            NC=NC,
+            USE_SAFE_GATE=safe_gate,
+        )
+    if skip_wu:
+        # exllamav3: the fused KDA h kernel recomputes w, u, kg per chunk from Akk
+        return None, None, None, None, Aqk, Akk
     w, u, qg, kg = recompute_w_u_fwd(
         k=k,
         v=v,

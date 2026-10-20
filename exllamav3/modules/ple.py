@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import math
+import os
 import torch
 import torch.nn.functional as F
 from .module import Module
@@ -26,6 +27,12 @@ Recurrent state per sequence: the (kernel-1)*dilation trailing positions of the 
 values (conv_state), plus the ngram_size-1 previous token ids (carried in token_history by the
 caller). Norms are grouped RMS (rms per 2560-stream, zero-init weight applied as 1 + w).
 """
+
+
+def _ple_gate_torch(gate, value, gate_scale):
+    scaled = gate.float() * gate_scale
+    signed_sqrt = torch.sign(scaled) * torch.sqrt(torch.clamp(scaled.abs(), min = 1e-6))
+    return torch.sigmoid(signed_sqrt).unsqueeze(-1) * value.float().unsqueeze(-2)
 
 
 class PLELayerState:
@@ -101,7 +108,9 @@ class PLELayerState:
             self.id_state[slot, :self.ctx].copy_(temp)
 
     def stash(self, slot, position: int = 0):
-        return (self.conv_state[slot, :, :self.win].cpu(), self.id_state[slot, :self.ctx].cpu())
+        # id_state lives on the CPU: .cpu() would return a view of the live slot, so a stashed checkpoint
+        # changes whenever the slot advances; clone it
+        return (self.conv_state[slot, :, :self.win].cpu(), self.id_state[slot, :self.ctx].cpu().clone())
 
     def unstash(self, slot, stashed, position: int = 0):
         self.conv_state[slot, :, :self.win].copy_(stashed[0])
@@ -269,7 +278,8 @@ class PLELayer(Module):
         bsz, seq = streams.shape[:2]
         H, D = self.hc_mult, self.hidden_size
         emb = self.ple_embedding.forward(token_history, params)               # (bsz, seq, ple_dim)
-        if self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
+        if hasattr(ext, "ple_forward_streams") \
+                and self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
                 and streams.dtype == torch.float and streams.is_contiguous() \
                 and self.key_proj.inner.bias is None and self.value_proj.inner.bias is None:
             delta = torch.empty_like(streams)
@@ -287,22 +297,59 @@ class PLELayer(Module):
             return delta, conv_stream
         return self.forward_streams_reference(streams, emb, params, conv_state)
 
+    def _streams_chain_hip(self, streams, key, value, conv_state):
+        """ple_fn/ple_hip.hip chain; None when the shapes/dtypes are not the proved ones (caller keeps the torch chain)."""
+        try:
+            from .ple_fn import ple_hip
+            if not (torch.version.hip and self.norm_key.rms_norm_eps == self.norm_query.rms_norm_eps == self.norm_conv.rms_norm_eps
+                    and self.norm_key.constant_bias == 1.0 and self.norm_key.constant_scale == 1.0
+                    and self.norm_query.constant_bias == 1.0 and self.norm_query.constant_scale == 1.0
+                    and self.norm_conv.constant_bias == 1.0 and self.norm_conv.constant_scale == 1.0
+                    and self.conv_state_len == ple_hip.ST and self.conv_dilation == 3 and self.conv_kernel_size == 4):
+                return None
+            bsz, seq = streams.shape[:2]
+            key = key.reshape(bsz * seq, -1)
+            value = value.reshape(bsz * seq, -1)
+            if conv_state is not None:
+                conv_state = conv_state.contiguous()
+            wts = (self.norm_key.weight.data, self.norm_query.weight.data, self.norm_conv.weight.data)
+            if not ple_hip.supported(key, value, streams, conv_state, wts, self.conv_w, 1.0, self.hc_mult, self.hidden_size):
+                return None
+            return ple_hip.ple_chain(key, value, streams, conv_state, *wts, self.conv_w,
+                                     self.norm_key.rms_norm_eps, self.gate_scale)
+        except Exception:
+            return None
+
     def forward_streams_reference(self, streams, emb, params, conv_state = None):
         """Op-by-op form of forward_streams (torch + individual ext kernels)."""
         bsz, seq = streams.shape[:2]
         H, D = self.hc_mult, self.hidden_size
         key = self.key_proj.forward(emb, params).view(bsz, seq, H, D)
-        key = self.norm_key.forward(key, params, out_dtype = torch.float)
         value = self.value_proj.forward(emb, params)                          # (bsz, seq, hidden) fp16
+        if os.environ.get("EXL3_PLE_HIP", "0") == "1":
+            # hand HIP kernels for everything after the projections (bitwise equal to the torch chain below)
+            out = self._streams_chain_hip(streams, key, value, conv_state)
+            if out is not None:
+                return out
+        key = self.norm_key.forward(key, params, out_dtype = torch.float)
         query = self.norm_query.forward(streams, params, out_dtype = torch.float)
         # per-stream key/query dots as a batched (1, D) x (D, 1) matmul, then the fused gate
         # kernel: gated = sigmoid(signed_sqrt(dot * scale)) * value broadcast over streams
         gate = torch.bmm(query.view(-1, 1, D), key.reshape(-1, D, 1)).view(bsz, seq, H)
-        gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = value.device)
-        ext.ple_gate(gate, value, gated, self.gate_scale)
+        ple_gate = getattr(ext, "ple_gate", None)
+        if ple_gate is not None:
+            gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = value.device)
+            ple_gate(gate, value, gated, self.gate_scale)
+        else:
+            gated = _ple_gate_torch(gate, value, self.gate_scale)
         normed = self.norm_conv.forward(gated, params, out_dtype = torch.half).flatten(-2)
         conv_out, conv_stream = self._short_conv(normed, conv_state)
-        delta = gated + conv_out.view(bsz, seq, H, D)
+        if os.environ.get("EXL3_PFE_PLE", "1") != "0":
+            # gated is a local temp that is dead after the conv: add in place, no 84 MB fresh allocation
+            # (same fp32 elementwise sum, bit-identical)
+            delta = gated.add_(conv_out.view(bsz, seq, H, D))
+        else:
+            delta = gated + conv_out.view(bsz, seq, H, D)
         return delta, conv_stream
 
     def _prepare_ids(self, ids: torch.Tensor) -> torch.Tensor:
@@ -359,6 +406,10 @@ class PLELayer(Module):
         conventions as ShortConv: state window in [:, ..., :width], history writes right-aligned
         for rewind).
         """
+        pending = params.pop("hc_pending", None)     # EXL3_PF_GR_FUSE / EXL3_PF_HC_FUSE: apply the deferred residual first
+        if pending is not None:
+            from .hyperconnections import HyperConnection
+            HyperConnection.flush_pending(x, pending)
         bsz, seq = x.shape[:2]
         ids = params.get("input_ids")
         if ids is None:
@@ -384,6 +435,24 @@ class PLELayer(Module):
                 else:
                     conv_state[s, :, :win].copy_(conv_stream[i, :, -win:])
                     id_state[s, :ctx].copy_(history[i, -ctx:])
+            # EXL3_PF_NO_TAIL: the state after row r of this chunk (what stash() would hold if the forward had ended there) =
+            # conv columns [r, r + win) of the full conv stream and ids [r, r + ctx) of the history; the job stashes them
+            # (Job.stash_midchunk, 3-tuple form: pinned host copy + event)
+            rows = params.get("checkpoint_rows")
+            if rows and params.get("midchunk_mode") == 2 and not save_history and bsz == 1 and len(slots) == 1:
+                saved = params.setdefault("midchunk_states", {})
+                layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+                for r in rows:
+                    if not 0 < r < seq:
+                        continue
+                    hs = torch.empty((conv_stream.shape[1], win), dtype = conv_stream.dtype, pin_memory = True)
+                    hs.copy_(conv_stream[0, :, r:r + win], non_blocking = True)
+                    ev = torch.cuda.Event()
+                    ev.record()
+                    saved.setdefault(r, {})[layer_instance] = (hs, history[0, r:r + ctx].clone(), ev)
         else:
             delta, _ = self.forward_streams(x, history, params)
+        if os.environ.get("EXL3_PFE_PLE", "1") != "0":
+            # delta is a fresh tensor owned here; x stays untouched (conversion-safe). fp32 add commutes exactly
+            return delta.add_(x)
         return x + delta

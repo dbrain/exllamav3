@@ -9,6 +9,26 @@ from .linear import Linear
 from .rmsnorm import RMSNorm
 from ..model.config import Config
 
+# row-invariant verify in the sparse regime. In a verify forward (R = 2..8 rows) the indexer's qk
+# projection, the per-row top-k selection and the gathered sparse attention are launched once for R rows, a different
+# float order than the R = 1 launches plain decode makes. Both knobs run the exact R = 1 call per row.
+#   EXL3_VERIFY_QSA_PROJ=1   qk projection per row
+#   EXL3_VERIFY_QSA_ATTN=all|sel|att   selection and attention per row / selection only / attention only
+# EXL3_QSA_SHADOW=1 (diagnostic): also run the per-row twin and count bitwise mismatches in SHADOW.
+VERIFY_QSA_PROJ = {"on": os.environ.get("EXL3_VERIFY_QSA_PROJ", "0") not in ("", "0")}
+VERIFY_QSA_ATTN = {"mode": {"": "", "0": "", "1": "all", "all": "all", "sel": "sel", "att": "att"}.get(os.environ.get("EXL3_VERIFY_QSA_ATTN", ""), "")}
+QSA_SHADOW = {"on": os.environ.get("EXL3_QSA_SHADOW", "0") not in ("", "0")}
+SHADOW: dict = {}
+
+
+def shadow_note(key: str, a: torch.Tensor, b: torch.Tensor) -> None:
+    n = SHADOW.setdefault(key, [0, 0, 0.0])
+    n[0] += 1
+    if not torch.equal(a, b):
+        n[1] += 1
+        if a.is_floating_point():
+            n[2] = max(n[2], float((a.float() - b.float()).abs().max()))
+
 """
 QSA (Qwen sparse attention) indexer: selects which tokens each query may attend to, at 4-token
 block granularity (Qwen3.8-Flash-Next full-attention layers).
@@ -36,6 +56,118 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
     h = r // 2
     rot = torch.cat((-x_rope[..., h:], x_rope[..., :h]), dim = -1)
     return torch.cat((x_rope * cos + rot * sin, x_pass), dim = -1)
+
+
+_PF_HIP = {"ok": None}
+def _pf_hip_ready() -> bool:
+    """EXL3_QSA_PF_HIP (default 1, 0 = Triton pair): first use loads the proven HIP prefill kernel; a missing compiler or proof disables it with a warning."""
+    if _PF_HIP["ok"] is None:
+        try:
+            from .attention_fn.qsa_prefill_hip import _load
+            _load()
+            _PF_HIP["ok"] = True
+        except Exception as e:
+            print(f" !! QSA prefill HIP kernel unavailable, using the Triton pair: {str(e)[:200]}")
+            _PF_HIP["ok"] = False
+    return _PF_HIP["ok"]
+
+
+def tile_candidates(scores, tile_idx, t0):
+    """One tile's top-k as composite int64 keys: the top-k kernel's 16-bit order key (topk_key) above, 0xFFFFFFFF - global
+    index below, -1 for padding and -inf scores (the kernel's own validity test). scores (R, W) fp16 view, tile_idx (R, kp)
+    int32 local indices (-1 padded) as the kernel wrote them, t0 the tile's first pool."""
+    li = tile_idx.long()
+    bits = torch.gather(scores, 1, li.clamp(min = 0)).view(torch.int16).to(torch.int32) & 0xFFFF
+    key = torch.where(bits >= 0x8000, ~bits & 0xFFFF, bits | 0x8000).long()
+    return torch.where((li >= 0) & (key > 0x03FF), (key << 32) | (0xFFFFFFFF - (li + t0)), -1)
+
+
+def merge_candidates(cand, k):
+    """Top-k of the concatenated tile candidates under (score descending, index ascending), the single-pass kernel's order,
+    returned as ascending global indices, -1 padded: (R, k) int32. Valid keys are unique, so the selection is exact."""
+    top = torch.topk(torch.cat(cand, dim = 1), k, dim = 1, largest = True, sorted = False).values
+    gi = torch.where(top >= 0, 0xFFFFFFFF - (top & 0xFFFFFFFF), 0x7FFFFFFF).sort(dim = 1).values
+    return torch.where(gi == 0x7FFFFFFF, -1, gi).to(torch.int32)
+
+
+def gather_tile(scores, tile_idx, t0, cand_s, cand_i):
+    """Write one tile's top-k into its slot of the candidate buffers: the tile's own fp16 scores (bits untouched, -inf at the
+    -1 pads) into cand_s (R, kp) and global pool indices (-1 pads) into cand_i (R, kp). Valid entries are ascending."""
+    li = tile_idx.long()
+    ok = li >= 0
+    cand_s.copy_(torch.where(ok, torch.gather(scores, 1, li.clamp(min = 0)), float("-inf")))
+    cand_i.copy_(torch.where(ok, li + t0, -1))
+
+
+def merge_tiles_topk(topk_fn, cand_s, cand_i, pos_out, pool_idx, k):
+    """Exact merge: one top-k pass of the single-pass kernel over the concatenated candidates (R, W), W a multiple of 128.
+    Tiles are disjoint and ascending and each tile's valid entries ascend, so buffer position order is global index order:
+    the kernel's rule (score descending, lowest position first among ties, ascending output) is the single pass's rule.
+    pos_out (R, kp) int32 scratch, pool_idx (R, kp) int32 result (-1 padded)."""
+    topk_fn(cand_s, pos_out, k, None, 0)
+    pool_idx.copy_(torch.where(pos_out >= 0, torch.gather(cand_i, 1, pos_out.long().clamp(min = 0)), -1))
+
+
+# EXL3_TOPK_PAR (read per call, default off in the library; the GLM and Qwen servers set it to 1). ROCm's dsa_topk
+# runs ONE block per row, so a decode selection of a wide row leaves 39 of 40 CUs idle (2.63 ms/token over 12 layers
+# at 459K). dsa_topk_par (dsa_topk_par.cu) cuts the same two-pass radix select into four kernels over nb blocks per
+# row and is bitwise identical to ext.dsa_topk on the same buffer; it saves 0.91 ms/token at 500K. "1" = on;
+# EXL3_TOPK_PAR_MIN_ROWS widens the row count beyond decode (kernel limit 16).
+TOPK_PAR_MIN_T = int(os.environ.get("EXL3_TOPK_PAR_MIN_T", "32768"))
+TOPK_PAR_MIN_ROWS = int(os.environ.get("EXL3_TOPK_PAR_MIN_ROWS", "1"))
+
+
+def topk_par_ok(sc, k):
+    """Whether dsa_topk_par may serve this call: few rows, a wide row, and the gfx12 kernel's own
+    input contract (fp16 (R, T) with a 128-aligned row stride, k <= 512 <= output width), so the
+    one-block kernel stays legal on the same buffer as the fallback."""
+    from ..ext import exllamav3_ext as ext
+    R, T = sc.shape
+    return (os.environ.get("EXL3_TOPK_PAR", "0") == "1" and torch.version.hip is not None and
+            hasattr(ext, "dsa_topk_par") and 1 <= R <= TOPK_PAR_MIN_ROWS <= 16 and
+            T >= TOPK_PAR_MIN_T and 1 <= k <= 512 and sc.dtype == torch.half and
+            sc.stride(1) == 1 and sc.stride(0) >= T and sc.stride(0) % 128 == 0)
+
+
+# EXL3_TOPK_SPANS (read per call, default off): few-row, wide selections (decode / verify at depth) on the span-parallel route
+# below. ROCm's dsa_topk runs ONE block per row, so R <= 16 rows of >= 32K pools use R blocks of a 40-CU GPU. 1 = spans
+TOPK_SPAN_W = 8192
+
+
+def topk_spans_ok(sc, k):
+    """Whether dsa_topk_spans may serve this call: few rows, a wide row, and a score view whose row stride is a multiple of
+    the span width (the power-of-two scoring workspaces)."""
+    R, T = sc.shape
+    return (os.environ.get("EXL3_TOPK_SPANS", "0") == "1" and torch.version.hip is not None and 1 <= R <= 16 and T >= 32768 and k <= 512
+            and sc.stride(1) == 1 and sc.stride(0) % TOPK_SPAN_W == 0 and sc.dtype == torch.half)
+
+
+def dsa_topk_spans(topk_fn, sc, out, k):
+    """Exactly topk_fn(sc, out, k, None, 0) for a few-row selection, with the row cut into spans that run in parallel.
+    sc (R, T) fp16 view of a WORKSPACE with row stride S (a multiple of TOPK_SPAN_W): the columns [T, S) are overwritten
+    with -inf, the whole rows are then read as (R * S / w, w) span rows, one launch selects each span's local top-k, and
+    merge_tiles_topk merges the (R, G * kp) candidates under the kernel's own total order (score descending, index
+    ascending; spans are disjoint and ascending, each span's output ascends) = the single pass's result.
+    out (R, kp) int32 (-1 padded)."""
+    R, T = sc.shape
+    S = sc.stride(0); w = TOPK_SPAN_W; G = S // w; kp = out.shape[1]
+    full = sc.as_strided((R, S), (S, 1))
+    full[:, T:].fill_(float("-inf"))
+    sp = full.view(R * G, w)
+    dev = sc.device
+    out_sp = torch.empty((R * G, kp), dtype = torch.int32, device = dev)
+    topk_fn(sp, out_sp, k, None, 0)
+    li = out_sp.long()
+    ok = li >= 0
+    cand_s = torch.where(ok, torch.gather(sp, 1, li.clamp(min = 0)), float("-inf")).view(R, G * kp)
+    off = (torch.arange(R * G, device = dev, dtype = torch.int32) % G * w).view(R * G, 1)
+    cand_i = torch.where(ok, out_sp + off, -1).view(R, G * kp)
+    W = -(-(G * kp) // 128) * 128
+    if W != G * kp:
+        cand_s = torch.nn.functional.pad(cand_s, (0, W - G * kp), value = float("-inf"))
+        cand_i = torch.nn.functional.pad(cand_i, (0, W - G * kp), value = -1)
+    pos = torch.empty((R, kp), dtype = torch.int32, device = dev)
+    merge_tiles_topk(topk_fn, cand_s, cand_i, pos, out, k)
 
 
 class QSAIndexer(Module):
@@ -210,6 +342,23 @@ class QSAIndexer(Module):
     # narrower slabs cost more than the extra top-k passes save
     SEL_SLAB = 1024
     SEL_TILE = int(os.environ.get("EXL3_QSA_SCORE_TILE", 8192))
+    # Scorer launch shape "block_m,block_n,num_warps,num_stages" (EXL3_QSA_SCORE_CFG, read per call; "0" = the scorer's
+    # own 64,128,8,2). Every output element is computed by the same MMA sequence whatever the tile, so the scores are
+    # bit-identical. 4 indexer heads give 4 small dots per key tile: on gfx1151, 1024-row slabs, 32,64,4,2 is x1.50 at
+    # 2K-8K pools, x1.31 at 16K, x1.33 at 32K (bitwise equal; sweep of 72 shapes); in a served Qwen load the scorer time
+    # drops x1.10-1.31 at 16K-64K prompts, logits bitwise. CUDA keeps the scorer's own default (not measured there)
+    SCORE_CFG = "32,64,4,2" if torch.version.hip else "0"
+    # ROCm has no dsa_topk_tile / dsa_topk_merge_tiles: its one-block-per-row top-k scans a row three times, and
+    # beyond ~32K pools the row no longer stays cache resident (about 10x the cost per column at 64K pools). N > 0 never
+    # lets that kernel see a row wider than N pools: a longer selection is cut into equal tiles of at most N pools (a
+    # multiple of 128), each run through the same kernel, and the candidates are merged in torch under the kernel's own
+    # total order. Rows up to N pools stay one pass. Default 32768; 0 = always one full-width pass
+    TOPK_TILE = int(os.environ.get("EXL3_QSA_TOPK_TILE", 32768))
+    # The tiled selection serves prefill chunks only: calls of at most TOPK_MIN_ROWS rows (decode, MTP verify rounds,
+    # bsz > 1 fallbacks) keep the single pass, whose result is identical. "topk" merges the tile candidates with one more
+    # pass of the same kernel over the (R, tiles * kp) candidate buffer; "torch" is the elementwise merge kept for A/B runs
+    TOPK_MIN_ROWS = int(os.environ.get("EXL3_QSA_TOPK_MIN_ROWS", 32))
+    TOPK_MERGE = os.environ.get("EXL3_QSA_TOPK_MERGE", "topk")
     # Row count up to which the plane-update workspaces come from g_tensor_cache (decode-class
     # calls: MTP verify, bsz > 1 fallbacks, where allocation latency matters); prefill chunks
     # allocate per call, the static cache being meant for small buffers only
@@ -256,7 +405,9 @@ class QSAIndexer(Module):
         k_pad = out_rows.shape[1]
         k_sel = self.block_topk
         kp = -(-k_sel // 32) * 32
-        t_tile = self.SEL_TILE
+        tiled_topk = hasattr(ext, "dsa_topk_tile") and hasattr(ext, "dsa_topk_merge_tiles")
+        torch_merge = not tiled_topk and self.TOPK_TILE > 0 and R > self.TOPK_MIN_ROWS
+        t_tile = self.TOPK_TILE // 128 * 128 if torch_merge else self.SEL_TILE
         if block_table is not None:
             t_tile = max(epp, t_tile // epp * epp)   # tiles must start on a pool page
         # Fixed score-row stride for every tile: it is a constexpr of the scoring kernel, so a
@@ -264,20 +415,35 @@ class QSAIndexer(Module):
         s_stride = -(-t_tile // 128) * 128
         s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile")
 
+        cfg = {}
+        score_cfg = os.environ.get("EXL3_QSA_SCORE_CFG", self.SCORE_CFG)
+        if score_cfg != "0":
+            bm, bn, nw, ns = (int(x) for x in score_cfg.split(","))
+            cfg = dict(block_m = bm, block_n = bn, num_warps = nw, num_stages = ns)
+
         def tile_scores(q_slab, rows, t0, t1):
             # Tile [t0, t1) of the pooled plane scored as if it started at pool 0: the row-0
             # position shifts by t0 * cr so the causal bounds shift by t0. Contiguous pools:
             # the launcher scans k_idx.shape[0] rows, so hand it exactly the visible ones
-            sc = s_backing[: rows * s_stride].view(rows, s_stride)
+            if t1 - t0 > t_tile:
+                # Full-width pass (the untiled route scores beyond one tile): the fixed tile
+                # stride cannot hold it, so score into a separate backing whose power-of-two
+                # stride also bounds the scoring kernel's constexpr recompiles by log2 of the
+                # context
+                s_full = max(128, triton.next_power_of_2(t1 - t0))
+                sc = g_tensor_cache.get_bucketed(dev, rows * s_full, torch.half, "dsa_sfull") \
+                        .view(rows, s_full)
+            else:
+                sc = s_backing[: rows * s_stride].view(rows, s_stride)
             if block_table is None:
                 return dsa_indexer_scores(
                     q_slab, self._sel_weights(rows, dev), pool_flat[t0 : t1], pos0 + r0 - t0 * cr,
-                    cr, t1 - t0, scores = sc, scale = self.scale,
+                    cr, t1 - t0, scores = sc, scale = self.scale, **cfg,
                 )
             bt = block_table[t0 // epp : -(-t1 // epp)] if t0 else block_table
             return dsa_indexer_scores(
                 q_slab, self._sel_weights(rows, dev), pool_flat, pos0 + r0 - t0 * cr, cr, t1 - t0,
-                scores = sc, block_table = bt, epp = epp, scale = self.scale,
+                scores = sc, block_table = bt, epp = epp, scale = self.scale, **cfg,
             )
 
         for r0 in range(0, R, self.SEL_SLAB):
@@ -289,9 +455,40 @@ class QSAIndexer(Module):
             q_slab = q_rows[r0 : r1]
             if T_slab <= 0:
                 pool_idx.fill_(-1)
-            elif T_slab <= t_tile:
+            elif T_slab <= t_tile or (not tiled_topk and not torch_merge):
                 sc = tile_scores(q_slab, rows, 0, T_slab)
-                ext.dsa_topk(sc, pool_idx, min(k_sel, T_slab), None, 0)
+                k_call = min(k_sel, T_slab)
+                if topk_par_ok(sc, k_call):
+                    ext.dsa_topk_par(sc, pool_idx, k_call)
+                elif topk_spans_ok(sc, k_call):
+                    dsa_topk_spans(ext.dsa_topk, sc, pool_idx, k_call)
+                else:
+                    ext.dsa_topk(sc, pool_idx, k_call, None, 0)
+            elif torch_merge and self.TOPK_MERGE == "torch":
+                cand = []
+                tile_idx = torch.empty((rows, kp), dtype = torch.int32, device = dev)
+                n_tiles = -(-T_slab // t_tile)
+                w = -(-(-(-T_slab // n_tiles)) // 128) * 128   # equal tiles, 128 aligned
+                for t0 in range(0, T_slab, w):
+                    t1 = min(t0 + w, T_slab)
+                    sc = tile_scores(q_slab, rows, t0, t1)
+                    ext.dsa_topk(sc, tile_idx, min(k_sel, t1 - t0), None, 0)
+                    cand.append(tile_candidates(sc, tile_idx, t0))
+                pool_idx[:, :k_sel] = merge_candidates(cand, k_sel)
+                pool_idx[:, k_sel:] = -1
+            elif torch_merge:
+                tile_idx = torch.empty((rows, kp), dtype = torch.int32, device = dev)
+                n_tiles = -(-T_slab // t_tile)
+                w = -(-(-(-T_slab // n_tiles)) // 128) * 128   # equal tiles, 128 aligned
+                W = -(-(n_tiles * kp) // 128) * 128
+                cand_s = torch.full((rows, W), float("-inf"), dtype = torch.half, device = dev)
+                cand_i = torch.full((rows, W), -1, dtype = torch.int32, device = dev)
+                for n, t0 in enumerate(range(0, T_slab, w)):
+                    t1 = min(t0 + w, T_slab)
+                    sc = tile_scores(q_slab, rows, t0, t1)
+                    ext.dsa_topk(sc, tile_idx, min(k_sel, t1 - t0), None, 0)
+                    gather_tile(sc, tile_idx, t0, cand_s[:, n * kp : (n + 1) * kp], cand_i[:, n * kp : (n + 1) * kp])
+                merge_tiles_topk(ext.dsa_topk, cand_s, cand_i, tile_idx, pool_idx, k_sel)
             else:
                 # Tiled: each tile's local top-k becomes candidate slot 1 next to the running set
                 # in slot 0, and the native merge reduces the pair under the single-pass kernel's
@@ -476,7 +673,25 @@ class QSAIndexer(Module):
         npr = bt.shape[1]
         page_size = layer.raw_k.shape[1]
 
-        qk = self.index_qk_proj.forward(x.contiguous(), params).view(R, (H + 1) * dk)
+        # the HC mix hands the attention site a row-padded view (hc_pad_ok); q/k/v read it as is, so the indexer
+        # projection does too instead of compacting the whole block input (same bytes into the GEMM, bit-exact).
+        # EXL3_QSA_IDX_PAD=0 (read per call) goes back to the copy
+        from .quant.exl3 import _pad_view_ok, _pad_eligible
+        if not x.is_contiguous() and os.environ.get("EXL3_QSA_IDX_PAD", "1") != "0" and _pad_view_ok(x) \
+                and _pad_eligible(self.index_qk_proj, x.shape[-1], R, params):
+            xc = x
+        else:
+            xc = x.contiguous()
+        qk = self.index_qk_proj.forward(xc, params).view(R, (H + 1) * dk)
+        if bsz == 1 and 1 < seqlen <= 8 and params.get("dflash_verify") and (VERIFY_QSA_PROJ["on"] or QSA_SHADOW["on"]):
+            qk = qk.clone()
+            p1 = dict(params, dflash_verify = False)
+            rows1 = torch.cat([self.index_qk_proj.forward(xc[:, i:i + 1], p1).reshape(1, (H + 1) * dk).clone()
+                               for i in range(seqlen)], dim = 0)
+            if QSA_SHADOW["on"]:
+                shadow_note("proj", qk, rows1)
+            if VERIFY_QSA_PROJ["on"]:
+                qk = rows1
         q = self._workspace(R, R * H * dk, torch.half, "qsa_up_q", dev) \
             .view(bsz, seqlen, H, dk)
         kraw = self._workspace(R, R * dk, torch.half, "qsa_up_k", dev) \
@@ -638,6 +853,7 @@ class QSAIndexer(Module):
         q_idx: torch.Tensor,
         block_table: torch.Tensor,
         cache_seqlens_cpu: torch.Tensor,
+        indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Sparse paged attention through the gathered-GQA kernel: per-row selection over the
@@ -646,14 +862,14 @@ class QSAIndexer(Module):
         OOMed on long prefills). Serves cached prefill chunks and every eager sparse fallback
         (bsz > 1, MTP verify). K/V for the current tokens must already be written to the cache.
         q: (bsz, seq, num_q_heads, head_dim) roped; q_idx: roped indexer queries from
-        update_planes. Returns (bsz, seq, num_q_heads, head_dim) fp16.
+        update_planes. indices: precomputed selection (bsz * seq, K_pad), else computed here.
+        Returns (bsz, seq, num_q_heads, head_dim) fp16.
         """
         from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         from ..cache.quant import CacheLayer_quant
         bsz, seq = q.shape[:2]
-        indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
-        bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
-            .reshape(bsz * seq, -1).contiguous()
+        if indices is None:
+            indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
         if isinstance(layer, CacheLayer_quant):
             # Packed pages, dequantized online by the gather kernel
             qk, sk, qv, sv, kb, vb = layer.get_qkv()
@@ -662,10 +878,59 @@ class QSAIndexer(Module):
             k_arg = layer.k.view(-1, attn.num_kv_heads, attn.head_dim)
             v_arg = layer.v.view(-1, attn.num_kv_heads, attn.head_dim)
             qc, page_size = None, layer.k.shape[1]
+        q_rows = q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous()
+        if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and qc is None and bsz == 1 and seq >= 64 and seq <= 4096 * 4
+                and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
+                and q_rows.dtype == torch.half and k_arg.dtype == torch.half and _pf_hip_ready()):
+            # one wave per (row, kv head) HIP kernel, bit-identical to the Triton pair (fp16 cache, prefill chunks only)
+            from .attention_fn.qsa_prefill_hip import qsa_prefill_hip
+            o = qsa_prefill_hip(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
+            return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+        if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and os.environ.get("EXL3_QSA_PF_DEQ", "1") == "1" and qc is not None
+                and qc[2] == 8 and qc[3] == 8 and bsz == 1 and seq >= 64 and seq <= 4096 * 4
+                and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
+                and q_rows.dtype == torch.half and _pf_hip_ready()):
+            # stage the used pages as rotated-domain fp16 (one elementwise pass), run the proven fp16 HIP kernel on q rotated by H32/sqrt(32), rotate the output back
+            from .attention_fn.qdeq_triton import qsa_prefill_q8
+            n_used = (int(cache_seqlens_cpu.max().item()) + seq + page_size - 1) // page_size
+            o = qsa_prefill_q8(q_rows, qk, sk, qv, sv, indices, attn.sm_scale, block_table[0], n_used, page_size)
+            return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+        # Built only for the Triton fallback: the HIP paths above read block_table[0], and this copy is
+        # rows x pages x 4 B (33 MB per layer per 4096-row chunk at -c 524288) written for nothing
+        bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
+            .reshape(bsz * seq, -1).contiguous()
         o = qsa_sparse_attend_rows(
-            q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
+            q_rows,
             k_arg, v_arg, indices, attn.sm_scale,
             block_table = bt_rows, page_size = page_size,
             qc = qc, n_kv_heads = attn.num_kv_heads,
         )
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+
+    def sparse_attend_verify(self, layer, attn, q, q_idx, block_table, cache_seqlens_cpu) -> torch.Tensor:
+        """sparse_attend for a verify forward: optionally row-invariant (the R = 1 call per row, as plain decode)."""
+        bsz, seq = q.shape[:2]
+        mode = VERIFY_QSA_ATTN["mode"]
+        if not (bsz == 1 and 1 < seq <= 8) or not (mode or QSA_SHADOW["on"]):
+            return self.sparse_attend(layer, attn, q, q_idx, block_table, cache_seqlens_cpu)
+        def row_idx(i):
+            return self.select_indices_paged(layer, q_idx[:, i:i + 1], block_table, cache_seqlens_cpu + i).clone()
+        def attend_rows(idx):
+            return torch.cat([self.sparse_attend(layer, attn, q[:, i:i + 1], q_idx[:, i:i + 1], block_table,
+                                                 cache_seqlens_cpu + i, indices = idx[i:i + 1]).clone()
+                              for i in range(seq)], dim = 1)
+        idx_rows = torch.cat([row_idx(i) for i in range(seq)], dim = 0)
+        idx_all = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
+        if QSA_SHADOW["on"]:
+            o_all = self.sparse_attend(layer, attn, q, q_idx, block_table, cache_seqlens_cpu, indices = idx_all)
+            shadow_note("sel", idx_all, idx_rows)
+            shadow_note("att_rowwise_vs_batched_same_idx", o_all, attend_rows(idx_all))
+            shadow_note("att_rowwise_vs_batched_row_idx", self.sparse_attend(
+                layer, attn, q, q_idx, block_table, cache_seqlens_cpu, indices = idx_rows), attend_rows(idx_rows))
+        if mode == "all":
+            return attend_rows(idx_rows)
+        if mode == "sel":     # per-row selection, one attention launch
+            return self.sparse_attend(layer, attn, q, q_idx, block_table, cache_seqlens_cpu, indices = idx_rows)
+        if mode == "att":     # one selection, per-row attention
+            return attend_rows(idx_all)
+        return self.sparse_attend(layer, attn, q, q_idx, block_table, cache_seqlens_cpu, indices = idx_all)

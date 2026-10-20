@@ -224,7 +224,7 @@ int exl3_gemm_gr
         void* gemv_kernel = nullptr;
         if (exl3_gemv_try_launch
         (
-            kernelArgs, size_m, size_k, size_n, K, cb, c_fp32,
+            kernelArgs, size_m, size_k, size_n, K, false, cb, c_fp32,
             suh_ptr && A_had_ptr && svh_ptr,
             device, stream, &gemv_kernel, false
         ))

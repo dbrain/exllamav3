@@ -10,3 +10,8 @@ pyyaml
 marisa_trie
 pydantic
 llguidance>=1.7.0
+aiohttp
+jinja2
+huggingface_hub
+setuptools>=77
+wheel

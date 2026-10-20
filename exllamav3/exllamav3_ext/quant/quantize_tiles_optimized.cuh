@@ -31,9 +31,15 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
 
     extern __shared__ uint8_t shbuf[];
     half* sh_input_tile = reinterpret_cast<half*>(shbuf);
+#if defined(USE_ROCM)
+    // K=1/2 need more than gfx1151's available LDS when costs and tile scratch are combined.
+    half* temp_costs = K <= 2 ? temp_costs_ptr + 2 * edges * tile_idx
+                              : reinterpret_cast<half*>(shbuf + L * sizeof(half) + 64 + 128);
+#else
+    half* temp_costs = reinterpret_cast<half*>(shbuf + L * sizeof(half) + 64 + 128);
+#endif
     // Retain the measured shared-memory layout, including the unused half-minimum area.
     int* sh_idx = reinterpret_cast<int*>(shbuf + L * sizeof(half) + 64);
-    half* temp_costs = reinterpret_cast<half*>(shbuf + L * sizeof(half) + 64 + 128);
     // K=1 stages the next costs in registers, then overwrites this single shared buffer.
     half* temp_costs_inc = temp_costs + (K == 1 ? 0 : edges);
     for (int i = thread; i < L; i += NT)

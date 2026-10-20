@@ -7,6 +7,140 @@ from .rmsnorm import RMSNorm
 from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
+import os
+from .quant.exl3 import PAD_MIN_ROWS as _PAD_MIN_ROWS, PAD_ELEMS as _PAD_ELEMS
+
+def _pad_pitch_for(k: int) -> int:
+    # keep in step with exllamav3_ext/pad_pitch.h pad_pitch_for
+    return k + _PAD_ELEMS if (k * 2) % 1024 == 0 else k
+
+# EXL3_NC2_HC_YPAD=1 (attention site) / EXL3_NC2_HC_YPAD_MLP=1 (MLP site), read per call: the fused mix_norm writes
+# its normed output at the GEMM row pitch when the site accepts a row-padded input (params["hc_pad_ok"], set by the transformer), so the consumers' pad_copy_in disappears.
+# Same kernels, only the store address moves: bit-exact.
+def _hc_y_out(b: int, s: int, D: int, dev, params: dict) -> torch.Tensor:
+    R = b * s
+    site = params.get("hc_pad_ok")
+    flag = "EXL3_NC2_HC_YPAD_MLP" if site == "mlp" else "EXL3_NC2_HC_YPAD"
+    if site and R >= _PAD_MIN_ROWS and os.environ.get(flag, "0") == "1" \
+            and os.environ.get("EXL3_OPROJ_PAD", "1") != "0":
+        pitch = _pad_pitch_for(D)
+        if pitch != D:
+            return torch.empty((R, pitch), dtype = torch.half, device = dev)[:, :D].view(b, s, D)
+    return torch.empty((b, s, D), dtype = torch.half, device = dev)
+
+# gfx1151: store the GatedResidual mixer weights (the only fp16 bulk in an EXL3 model, 22% of
+# decode weight bytes) as per-row int8 and dequantize in the fused kernel. ROCm only; opt out
+# with EXL3_HIP_GR_MIX_Q8=0.
+_GR_KEEP_ALL = os.environ.get("EXL3_GR_KEEP_ALL", "0") == "1"      # keep fp16 fused weights next to the int8 ones
+# optional sidecar with re-derived int8 codes (same format, same absmax scales, GPTQ-style rounding): EXL3_GR_Q8_SIDECAR=file.safetensors,
+# keys {site}.fn_q8 (M, H*D) int8 and {site}.up_q8 (H*D, rank) int8. Off (unset) = the plain absmax rounding.
+_GR_Q8_SIDECAR = os.environ.get("EXL3_GR_Q8_SIDECAR") or None
+_sidecar_cache = {}
+
+def apply_q8_sidecar(key, fn_q8, up_q8_rows, path = None):
+    """Return (fn_q8, up_q8_rows) from the sidecar for this site, or the inputs unchanged when there is none."""
+    path = path or _GR_Q8_SIDECAR
+    if not path:
+        return fn_q8, up_q8_rows
+    if path not in _sidecar_cache:
+        from safetensors import safe_open
+        _sidecar_cache[path] = safe_open(path, "pt")
+    f = _sidecar_cache[path]
+    if f"{key}.fn_q8" not in f.keys():
+        return fn_q8, up_q8_rows
+    fq = f.get_tensor(f"{key}.fn_q8").to(fn_q8.device)
+    uq = f.get_tensor(f"{key}.up_q8").to(up_q8_rows.device)
+    assert fq.dtype == torch.int8 and uq.dtype == torch.int8 and fq.shape == fn_q8.shape and uq.shape == up_q8_rows.shape, key
+    assert int(fq.min()) >= -127 and int(uq.min()) >= -127, key
+    return fq.contiguous(), uq.contiguous()
+
+# group scales for the int8 mixer weights, requantised at load from the stored fp16 weights (no pack change).
+# fn: one fp32 scale per 128 consecutive k per row; up: one per 64 consecutive ranks per output column. The kernels read
+# weight = half(code * scale) as fp32 (bit-exact twin of the fp16 kernels on dequantised half weights).
+# EXL3_GR_GS: "0" off (per-row scales, the old behaviour), "1" group scales replace the per-row ones, "2" both resident
+# (measurement harness: GatedResidual.GS_ON switches between them in one load).
+_GR_GS = os.environ.get("EXL3_GR_GS", "0")
+GS_FN, GS_UP = 128, 64
+# EXL3_GR_GS_SIDECAR=file.safetensors: optional re-derived group-int8 codes (GPTQ-style rounding on the same group scales), keys {site}.fn_g8
+# (M, H*D) int8 and {site}.up_g8 (H*D, rank) int8. Unset = plain absmax rounding.
+_GR_GS_SIDECAR = os.environ.get("EXL3_GR_GS_SIDECAR") or None
+
+GS_STATS = {"sidecar": 0, "plain": 0, "rejected": 0}     # sites by source of the group codes (printed by the Qwen server after load)
+GS_SIDECAR_MAX_MEAN_STEPS = 1.0
+
+def apply_gs_sidecar(key, fq, upx, H, Dh, rank, path = None):
+    """(fn codes (M, H*D), upx codes (H, Dh/4, rank, 4)) from the sidecar for this site, or the inputs when there is none.
+    fq / upx are the plain group-rounded codes on the same scales: a sidecar made for other weights moves the codes by far more
+    than GPTQ rounding does (mean |delta| well under one step), so a site whose mean delta exceeds one step is rejected (plain codes)."""
+    path = path or os.environ.get("EXL3_GR_GS_SIDECAR") or _GR_GS_SIDECAR     # read at load time: a wrapper may import this module before the server sets the variable
+    if not path:
+        GS_STATS["plain"] += 1
+        return fq, upx
+    # a sidecar that cannot be used (missing or unreadable file, wrong dtype or shape, codes outside +-127) never stops the load or
+    # changes the weights: the site keeps its plain group rounding and is counted as rejected
+    try:
+        if path not in _sidecar_cache:
+            from safetensors import safe_open
+            _sidecar_cache[path] = safe_open(path, "pt")
+        f = _sidecar_cache[path]
+        if f"{key}.fn_g8" not in f.keys():
+            GS_STATS["plain"] += 1
+            return fq, upx
+        f2 = f.get_tensor(f"{key}.fn_g8").to(fq.device); u2 = f.get_tensor(f"{key}.up_g8").to(fq.device)
+        if not (f2.dtype == torch.int8 and u2.dtype == torch.int8 and f2.shape == fq.shape and tuple(u2.shape) == (H * Dh, rank)):
+            raise ValueError(f"dtype or shape mismatch (fn {f2.dtype} {tuple(f2.shape)}, up {u2.dtype} {tuple(u2.shape)})")
+        if int(f2.min()) < -127 or int(u2.min()) < -127:
+            raise ValueError("code outside +-127")
+        u2 = u2.reshape(H, Dh // 4, 4, rank).permute(0, 1, 3, 2).contiguous()
+    except Exception as e:                                          # noqa: BLE001
+        print(f"hyperconnections: sidecar unusable at {key} ({type(e).__name__}: {e}), plain group rounding", flush = True)
+        GS_STATS["rejected"] += 1
+        return fq, upx
+    mf = (f2.int() - fq.int()).abs().float().mean().item(); mu = (u2.int() - upx.int()).abs().float().mean().item()
+    if mf > GS_SIDECAR_MAX_MEAN_STEPS or mu > GS_SIDECAR_MAX_MEAN_STEPS:
+        print(f"hyperconnections: sidecar codes rejected at {key} (mean step delta fn {mf:.3f} up {mu:.3f}), plain group rounding", flush = True)
+        GS_STATS["rejected"] += 1
+        return fq, upx
+    GS_STATS["sidecar"] += 1
+    return f2.contiguous(), u2
+
+def group_quant(fn32, up32, H, Dh, rank):
+    """fn32 (M, H*Dh) fp32 folded fn, up32 (H*Dh, rank) fp32 up -> (fn_codes int8 (M, H*Dh), fn_gs f32 (M*H*Dh/128), upx_codes int8 (H, Dh/4, rank, 4), up_gs f32 (H*Dh*ceil(rank/64))).
+    Scale = group absmax / 127 (floor 1e-12), code = round(w / scale) clamped to +-127. The last up group may be partial."""
+    M = fn32.shape[0]
+    g = fn32.view(M, H * Dh // GS_FN, GS_FN)
+    fs = g.abs().amax(dim = 2).clamp_min_(1e-12) / 127.0
+    fq = torch.round(g / fs[:, :, None]).clamp_(-127, 127).to(torch.int8).view(M, H * Dh).contiguous()
+    ng = (rank + GS_UP - 1) // GS_UP
+    pad = ng * GS_UP - rank
+    u = torch.nn.functional.pad(up32, (0, pad)) if pad else up32
+    ug = u.view(H * Dh, ng, GS_UP)
+    us = ug.abs().amax(dim = 2).clamp_min_(1e-12) / 127.0
+    uq = torch.round(ug / us[:, :, None]).clamp_(-127, 127).to(torch.int8).view(H * Dh, ng * GS_UP)[:, :rank]
+    upx = uq.reshape(H, Dh // 4, 4, rank).permute(0, 1, 3, 2).contiguous()
+    ups = us.view(H, Dh // 4, 4, ng).permute(0, 1, 3, 2).contiguous().view(-1)
+    return fq, fs.contiguous().view(-1), upx, ups
+
+_GR_MIX_Q8 = bool(torch.version.hip) and os.environ.get("EXL3_HIP_GR_MIX_Q8", "1") != "0"
+
+# hc mix fused with the consumer RMSNorm (hc_mix_norm: one finalize+norm launch instead of
+# finalize + rms_norm); bit-identical to mix() -> half -> norm.forward(out_dtype = half)
+_FUSE_HC_NORM = os.environ.get("EXL3_FUSE_HC_NORM", "1") != "0" and os.environ.get("EXL3_DEC_NORM", "1") != "0"
+
+_hc_mix_support_cache: dict[tuple[object, int], bool] = {}
+
+
+def _hc_mix_supported(device: torch.device) -> bool:
+    """Return whether the fused kernels' fixed 32-lane shuffle layout is valid."""
+    support_fn = getattr(ext, "hc_mix_supported", None)
+    if support_fn is None or device.type != "cuda":
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (support_fn, index)
+    if key not in _hc_mix_support_cache:
+        _hc_mix_support_cache[key] = bool(support_fn(index))
+    return _hc_mix_support_cache[key]
+
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -29,6 +163,9 @@ class ExpandStreams(Module):
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
+        rows = x.shape[0] * x.shape[1]
+        if rows > GatedResidual.MAX_FORWARD_ROWS:
+            raise ValueError(f"hyperconnection mixer: a forward of {rows} rows exceeds the kernel grid limit of {GatedResidual.MAX_FORWARD_ROWS} rows; use a prefill chunk of at most {GatedResidual.MAX_FORWARD_ROWS} rows")
         return x.float().unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()
 
     def tp_export(self, plan, producer):
@@ -118,7 +255,10 @@ class HyperConnection(Module):
         (both block consumers cast it immediately); the torch fallback keeps fp32."""
         hc = self.hc_mult
         b, s, H, D = streams.shape
-        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous():
+        if hasattr(ext, "hc_mix_num_chunks") and hasattr(ext, "hc_mix") \
+                and _hc_mix_supported(streams.device) \
+                and hc == 4 and streams.dtype == torch.float and D % 4 == 0 \
+                and streams.is_contiguous():
             R = b * s
             st = streams.view(R, H, D)
             chunks = ext.hc_mix_num_chunks(R, H * D)
@@ -137,7 +277,7 @@ class HyperConnection(Module):
             collapsed = ws(R * D, torch.half, "hc_coll").view(R, D)
             # Small R (decode): fn in fp16 -- the (M, H * D) matrix is the partials kernel's
             # dominant traffic and the kernel dots it in fp32 either way
-            if R <= 32:
+            if R <= 32 or os.environ.get("EXL3_HC_FN_HALF_PF", "0") != "0":
                 if self.fn_h is None:
                     self.fn_h = self.fn.half()
                 fn = self.fn_h
@@ -163,6 +303,131 @@ class HyperConnection(Module):
         collapsed = (pre.unsqueeze(-1) * streams).sum(dim = 2)
         return post, comb, collapsed
 
+    def mix_norm(self, streams: torch.Tensor, params: dict, norm, pending = None):
+        """mix_norm with an optional deferred residual apply of the previous site (pf_can_defer).
+        With pending, streams are updated in place either way: fused when the site pair
+        qualifies, else flushed with the plain apply followed by the normal path."""
+        if pending is not None:
+            fused = self._pf_apply_mix_norm(streams, params, norm, pending)
+            if fused is not None:
+                return fused
+            HyperConnection.flush_pending(streams, pending)
+        return self._mix_norm(streams, params, norm)
+
+    @staticmethod
+    def pf_can_defer(x: torch.Tensor, y: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
+                     params: dict) -> bool:
+        """EXL3_PF_HC_FUSE (default off, read per call): prefill rows may defer this site's
+        residual apply into the next site's mix_norm (ext.hc_pf_apply_mix_norm: the stream
+        stack is written once and re-read once instead of twice). True only when the
+        in-place ext.hc_apply could also run, so a consumer that cannot fuse flushes with
+        flush_pending(). Requires the fused kernel's single-chunk regime (R > 256)."""
+        if os.environ.get("EXL3_PF_HC_FUSE", "0") == "0" or not hasattr(ext, "hc_pf_apply_mix_norm"):
+            return False
+        if "quant_preserve" in params or "capture" in params:
+            return False
+        if post is None or comb is None:  # GatedResidual-style sites (Qwen) carry no post/comb
+            return False
+        b, s, H, D = x.shape
+        return (b * s > 256 and b * s <= 65536 and H == 4 and D % 4 == 0
+                and x.dtype == torch.float and x.is_contiguous()
+                and y.dtype in (torch.float, torch.half) and y.is_contiguous() and y.numel() == b * s * D
+                and post.dtype == torch.float and post.is_contiguous()
+                and comb.dtype == torch.float and comb.is_contiguous() and _hc_mix_supported(x.device))
+
+    @staticmethod
+    def flush_pending(x: torch.Tensor, pending) -> torch.Tensor:
+        """Run a deferred residual apply (see pf_can_defer) in place on x."""
+        px, y, post, comb = pending
+        if px is not x:
+            raise RuntimeError("EXL3_PF_HC_FUSE: deferred hc apply reached a different stream tensor")
+        b, s, H, D = x.shape
+        R = b * s
+        ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H) if comb is not None else None)
+        return x
+
+    def _pf_apply_mix_norm(self, streams: torch.Tensor, params: dict, norm, pending):
+        """Fused site-A apply + this site's mix_norm_1pass (bit-identical to the pair)."""
+        px, ya, post_a, comb_a = pending
+        if px is not streams or not hasattr(ext, "hc_pf_apply_mix_norm"):
+            return None
+        if not _FUSE_HC_NORM or not isinstance(norm, RMSNorm) or norm.span_heads or norm.groups != 1 \
+                or norm.key in params.get("export_state_norm_keys", ()):
+            return None
+        b, s, H, D = streams.shape
+        w = None if norm.unweighted else norm.weight
+        if w is not None and not (w.dtype in (torch.half, torch.bfloat16) and w.numel() == D and w.is_contiguous()):
+            return None
+        if not (self.hc_mult == 4 and H == 4 and streams.dtype == torch.float and D % 4 == 0
+                and D <= 8192 and streams.is_contiguous() and _hc_mix_supported(streams.device)):
+            return None
+        R = b * s
+        if R <= 256 or R > 65536:   # = HC_MAX_TICKETS (hc_mix.cu)
+            return None
+        if ext.hc_mix_num_chunks(R, H * D) != 1:
+            return None
+        if ya.numel() != R * D:
+            return None
+        M1 = 2 * H + H * H + 1
+        dev = streams.device
+        # Same fn choice as _mix_norm: prefill rows read the fp16 copy when enabled.
+        if R <= 32 or os.environ.get("EXL3_HC_FN_HALF_PF", "0") != "0":
+            if self.fn_h is None:
+                self.fn_h = self.fn.half()
+            fn = self.fn_h
+        else:
+            fn = self.fn
+        partials = torch.empty((R, 1, M1), dtype = torch.float, device = dev)
+        post = torch.empty((R, H), dtype = torch.float, device = dev)
+        comb = torch.empty((R, H * H), dtype = torch.float, device = dev).view(R, H, H)
+        y = _hc_y_out(b, s, D, dev, params)
+        ext.hc_pf_apply_mix_norm(streams.view(R, H, D), ya.contiguous().view(R, D),
+                                 post_a.contiguous().view(R, H), comb_a.contiguous().view(R, H, H),
+                                 fn, self.base, self.scale, self.rms_eps, self.hc_eps,
+                                 self.sinkhorn_iters, partials, post, comb, y.view(R, D), w,
+                                 norm.rms_norm_eps, norm.constant_bias, norm.constant_scale)
+        return post.view(b, s, H), comb.view(b, s, H, H), y
+
+    def _mix_norm(self, streams: torch.Tensor, params: dict, norm):
+        """mix() followed by norm.forward(collapsed.half(), out_dtype = half), fused. Returns
+        (post, comb, normed half (b, s, D)), or None when the fused kernel does not apply."""
+        if not _FUSE_HC_NORM or not hasattr(ext, "hc_mix_norm") or not isinstance(norm, RMSNorm):
+            return None
+        if norm.span_heads or norm.groups != 1 or norm.key in params.get("export_state_norm_keys", ()) \
+                or "quant_preserve" in params or "capture" in params:
+            return None
+        b, s, H, D = streams.shape
+        w = None if norm.unweighted else norm.weight
+        if w is not None and not (w.dtype in (torch.half, torch.bfloat16) and w.numel() == D and w.is_contiguous()):
+            return None
+        if not (self.hc_mult == 4 and H == 4 and streams.dtype == torch.float and D % 4 == 0 and D <= 8192
+                and streams.is_contiguous() and _hc_mix_supported(streams.device)):
+            return None
+        R = b * s
+        chunks = ext.hc_mix_num_chunks(R, H * D)
+        M1 = 2 * H + H * H + 1
+        dev = streams.device
+        def ws(numel, dtype, tag):
+            if R <= 32:
+                return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
+            return torch.empty((numel,), dtype = dtype, device = dev)
+        partials = ws(R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
+        post = ws(R * H, torch.float, "hc_post").view(R, H)
+        comb = ws(R * H * H, torch.float, "hc_comb").view(R, H, H)
+        # EXL3_HC_FN_HALF_PF=1 (default off, read per call for in-process A/B): prefill rows also
+        # read the fp16 fn copy decode uses. fp32 fn (2.4 MB) spills L2 on gfx1151; fp16 fits.
+        if R <= 32 or os.environ.get("EXL3_HC_FN_HALF_PF", "0") != "0":
+            if self.fn_h is None:
+                self.fn_h = self.fn.half()
+            fn = self.fn_h
+        else:
+            fn = self.fn
+        y = _hc_y_out(b, s, D, dev, params)
+        ext.hc_mix_norm(streams.view(R, H, D), fn, self.base, self.scale, self.rms_eps, self.hc_eps,
+                        self.sinkhorn_iters, partials, post, comb, y.view(R, D), w,
+                        norm.rms_norm_eps, norm.constant_bias, norm.constant_scale)
+        return post.view(b, s, H), comb.view(b, s, H, H), y
+
     def apply_(
         self,
         x: torch.Tensor,
@@ -177,7 +442,8 @@ class HyperConnection(Module):
         path: the capture and advance passes forward the SAME stored input states twice."""
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
-        if not converting and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
+        if hasattr(ext, "hc_apply") and not converting and _hc_mix_supported(x.device) \
+                and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
@@ -214,6 +480,23 @@ class HyperConnection(Module):
         return module
 
 
+_GR_PF_MODE = os.environ.get("EXL3_GR_PF_FUSE", "1")  # 1 = norm + gate (default), 2 = norm only, 3 = gate only, 0 = torch
+_GR_PF_FUSE = _GR_PF_MODE != "0"
+_gr_hip_mod = []
+
+
+def _gr_hip():
+    # hand-written HIP WMMA gated-residual GEMMs (modules/gr_fn/gr_mix_hip.py), opt-in with EXL3_GR_HIP=1; None on failure
+    if not _gr_hip_mod:
+        try:
+            from exllamav3.modules.gr_fn import gr_mix_hip
+            _gr_hip_mod.append(gr_mix_hip)
+        except Exception as e:
+            print(f" ! EXL3_GR_HIP unavailable: {e}")
+            _gr_hip_mod.append(None)
+    return _gr_hip_mod[0]
+
+
 class GatedResidual(Module):
     """
     Qwen4Exp-style gated residual: the low-rank, elementwise cousin of mHC. The residual is the
@@ -238,7 +521,16 @@ class GatedResidual(Module):
     {key}.input_mix_weight_up.weight and, for the site form, {key}.block_inject_weight.weight.
     """
 
-    FUSED_MAX_R = 32
+    # Rows at or below this take the fused small-R mixer (int8 weights on ROCm); 0 forces the precise GEMM path for every
+    # row count. EXL3_HC_FUSED_MAX_R overrides at import.
+    FUSED_MAX_R = int(os.environ.get("EXL3_HC_FUSED_MAX_R", "32"))
+    # hc_mix kernels launch dim3(n_chunks, R): grid.y = R is limited to 65535 by HIP/CUDA, so one forward of 65536+ rows fails at its first mix launch
+    MAX_FORWARD_ROWS = 65535
+    # small-R fused mixer weight format. None = the load-time default (int8 when use_q8, else fp16); "fp16" runs the
+    # fused fp16 kernels, "q8" the int8 ones, "q8g" the group-scaled int8 ones (needs EXL3_GR_KEEP_ALL=1 at load so that
+    # every format is resident). Class attribute so a harness can flip it between passes in one load.
+    MIX_MODE = os.environ.get("EXL3_GR_MIX_MODE") or None
+    GS_ON = True        # with EXL3_GR_GS=2 (both formats resident) False selects the per-row int8 weights
 
     def __init__(
         self,
@@ -265,6 +557,9 @@ class GatedResidual(Module):
         self.inject_h = None        # (hc_mult, hc_mult * hidden) half (site form)
         self.proj_h = None          # cat(down, inject) half, unfolded (GEMM path)
         self.fn_h = None            # cat(down, inject) * w half, folded (fused path)
+        self.use_q8 = False         # int8 fused-path weights (ROCm), see _prepare
+        self.fn_q8 = self.fn_scale = self.upx_q8 = self.up_scale = None
+        self.fn_g8 = self.fn_gs = self.upx_g8 = self.up_gs = None     # group-scaled int8 set (EXL3_GR_GS=2)
         self.rank = 0
 
     @override
@@ -302,17 +597,55 @@ class GatedResidual(Module):
             .view(M, H * Dh)
         tmp.copy_(self.proj_h)
         tmp *= self.w_h.float()
-        self.fn_h = tmp.half().contiguous()
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
-        # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
-        self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
-            .permute(0, 1, 3, 2).contiguous()
+        self.use_q8 = _GR_MIX_Q8 and hasattr(ext, "gr_mix_q8") and dev.type == "cuda"
+        if self.use_q8:
+            # Symmetric per-row int8: fn row j (the dot product's output) and up output column
+            # h*D+d both get one scale, applied once per result inside the kernel
+            sc = tmp.abs().amax(dim = 1).clamp_min_(1e-12) / 127.0
+            self.fn_q8 = torch.round(tmp / sc[:, None]).clamp_(-127, 127).to(torch.int8).contiguous()
+            self.fn_scale = sc.contiguous()
+            up32 = self.up_h.float()
+            usc = up32.abs().amax(dim = 1).clamp_min_(1e-12) / 127.0
+            upq = torch.round(up32 / usc[:, None]).clamp_(-127, 127).to(torch.int8)
+            self.fn_q8, upq = apply_q8_sidecar(self.key, self.fn_q8, upq)
+            self.upx_q8 = upq.view(H, Dh // 4, 4, self.rank).permute(0, 1, 3, 2).contiguous()
+            self.up_scale = usc.contiguous()
+            self.fn_g8 = self.fn_gs = self.upx_g8 = self.up_gs = None
+            if _GR_GS != "0" and Dh % GS_FN == 0:
+                gq = group_quant(tmp, up32, H, Dh, self.rank)
+                gfq, gupx = apply_gs_sidecar(self.key, gq[0], gq[2], H, Dh, self.rank)
+                gq = (gfq, gq[1], gupx, gq[3])
+                if _GR_GS == "2":
+                    self.fn_g8, self.fn_gs, self.upx_g8, self.up_gs = gq
+                else:
+                    self.fn_q8, self.fn_scale, self.upx_q8, self.up_scale = gq
+            if _GR_KEEP_ALL:
+                self.fn_h = tmp.half().contiguous()
+                self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank).permute(0, 1, 3, 2).contiguous()
+            else:
+                self.fn_h = None
+                self.upx_h = None
+            del up32, upq
+        else:
+            self.fn_h = tmp.half().contiguous()
+            # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
+            self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
+                .permute(0, 1, 3, 2).contiguous()
 
     @override
     def unload(self):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = self.fn_h = None
+        self.fn_q8 = self.fn_scale = self.upx_q8 = self.up_scale = None
+        self.fn_g8 = self.fn_gs = self.upx_g8 = self.up_gs = None
+
+    def q8_set(self):
+        """(fn codes, fn scales, up codes, up scales) of the active int8 format. Group scales when resident (mode 2) and GS_ON."""
+        if self.fn_g8 is not None and self.GS_ON:
+            return self.fn_g8, self.fn_gs, self.upx_g8, self.up_gs
+        return self.fn_q8, self.fn_scale, self.upx_q8, self.up_scale
 
     @override
     def get_tensors(self):
@@ -347,18 +680,25 @@ class GatedResidual(Module):
             if self.use_combine else None
         return post, mixed
 
-    def _mix(self, streams: torch.Tensor, cached: bool = True):
+    def _mix(self, streams: torch.Tensor, cached: bool = True, pad_ok: bool = False, pending = None):
         """streams (b, s, H, D) fp32 -> (post (R, H) fp32 or None, mixed (R, D) half).
         cached: small-R outputs may come from the per-device static workspaces (see below);
         callers that hold the result across another mix on the device pass False."""
         H, Dh = self.hc_mult, self.hidden_size
         R = streams.shape[0] * streams.shape[1]
+        if R > self.MAX_FORWARD_ROWS:
+            raise ValueError(f"hyperconnection mixer: a forward of {R} rows exceeds the kernel grid limit of {self.MAX_FORWARD_ROWS} rows; use a prefill chunk of at most {self.MAX_FORWARD_ROWS} rows")
         s3 = streams.reshape(R, H, Dh)
         if s3.dtype != torch.float:
             s3 = s3.float()          # MTP sample_from_state passes the half draft stack
         if not s3.is_contiguous():
             s3 = s3.contiguous()
         dev = s3.device
+        has_gr_mix = hasattr(ext, "gr_mix")
+        native_mix = has_gr_mix and _hc_mix_supported(dev)
+        if not has_gr_mix or (R <= self.FUSED_MAX_R and not native_mix):
+            post, mixed = self._mix_ref(s3.view(1, R, H, Dh))
+            return (post.view(R, H) if post is not None else None), mixed.view(R, Dh).half()
 
         if R <= self.FUSED_MAX_R:
             # Decode/MTP-class row counts (the fused path's whole domain) take bucketed
@@ -371,30 +711,113 @@ class GatedResidual(Module):
                 if cached:
                     return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
                 return torch.empty((numel,), dtype = dtype, device = dev)
-            M = self.fn_h.shape[0] + 1
+            M = self.proj_h.shape[0] + 1
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+            mode = self.MIX_MODE
+            q8 = self.use_q8 if mode is None else (mode == "q8")
+            if q8:
+                fq, fsc, uq, usc = self.q8_set()
+                ext.gr_mix_q8(s3, fq, fsc, uq, usc, self.w_h, self.rms_eps, dots, post, mixed)
+            else:
+                ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         else:
             post = torch.empty((R, H), dtype = torch.float, device = dev) \
                 if self.use_combine else None
-            normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
-            ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
-                         self.rms_eps, 0.0, 1.0, False, False, H)
+            fuse = _GR_PF_FUSE and dev.type == "cuda" and torch.version.hip is not None
+            gr_hip_ok = (R > 32 and os.environ.get("EXL3_GR_HIP", "0") == "1" and fuse and self.use_combine and H == 4
+                         and tuple(self.proj_h.shape) == (324, 10240) and tuple(self.up_h.shape) == (10240, 320)
+                         and self.proj_h.dtype == torch.half and self.up_h.dtype == torch.half
+                         and self.proj_h.is_contiguous() and self.up_h.is_contiguous())
+            # gr_g1 reads normed rows of H * Dh fp16 = 20480 B, a pitch the GEMM-style tile loads read at a fraction of
+            # the rate; with the hand kernels (gr_g1, gr_g2s) and gr_norm all taking a token pitch, normed is a (R, H*Dh + 64) buffer.
+            # Same values, bit-exact. EXL3_OPROJ_PAD=0 turns it off.
+            xp = H * Dh
+            if (gr_hip_ok and _GR_PF_MODE in ("1", "2") and R >= _PAD_MIN_ROWS and _gr_hip() is not None
+                    and os.environ.get("EXL3_OPROJ_PAD", "1") != "0"):
+                xp = _pad_pitch_for(H * Dh)
+            if xp != H * Dh:
+                nbuf = torch.empty((R, xp), dtype = torch.half, device = dev)
+                if pending is not None:
+                    # EXL3_PF_GR_FUSE: the previous site's residual apply, folded into this norm pass (padded pitch)
+                    assert pending[0] is streams and s3.data_ptr() == streams.data_ptr()
+                    from .gated_delta_net_fn.gr_pf import gr_apply_norm
+                    gr_apply_norm(s3.view(R * H, Dh), pending[1].view(R, Dh), pending[2].view(R * H), self.w_h, nbuf,
+                                  self.rms_eps, H, y_pitch = xp)
+                else:
+                    from .gated_delta_net_fn.gr_pf import gr_norm
+                    gr_norm(s3.view(R * H, Dh), self.w_h, nbuf, self.rms_eps, H, xp)
+                normed = nbuf[:, : H * Dh]
+            else:
+                normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
+                if pending is not None:
+                    assert pending[0] is streams and fuse and _GR_PF_MODE in ("1", "2") and s3.data_ptr() == streams.data_ptr()
+                    from .gated_delta_net_fn.gr_pf import gr_apply_norm
+                    gr_apply_norm(s3.view(R * H, Dh), pending[1].view(R, Dh), pending[2].view(R * H), self.w_h, normed,
+                                  self.rms_eps, H)
+                elif fuse and _GR_PF_MODE in ("1", "2"):
+                    from .gated_delta_net_fn.gr_pf import gr_norm
+                    gr_norm(s3.view(R * H, Dh), self.w_h, normed, self.rms_eps, H)
+                else:
+                    ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
+                                 self.rms_eps, 0.0, 1.0, False, False, H)
+            if gr_hip_ok:
+                gr_hip = _gr_hip()
+                if gr_hip is not None:
+                    t = torch.empty((R, self.rank), dtype = torch.half, device = dev)
+                    gr_hip.gr_g1(normed.view(R, H * Dh), self.proj_h, t, post)
+                    # the block input feeds qkv / z / q|gate; at a 5120 B row pitch their GEMMs read it ~7 % slower
+                    # than at a padded pitch. gr_g2s writes mixed at row pitch Dh + 64 when the consumer accepts a padded view
+                    # (pad_ok, set by the transformer for the attention site only). EXL3_OPROJ_PAD=0 turns it off.
+                    pitch = _pad_pitch_for(Dh) if (pad_ok and R >= _PAD_MIN_ROWS and os.environ.get("EXL3_OPROJ_PAD", "1") != "0") else Dh
+                    if pitch != Dh:
+                        mixed = torch.empty((R, pitch), dtype = torch.half, device = dev)[:, :Dh]
+                    else:
+                        mixed = torch.empty((R, Dh), dtype = torch.half, device = dev)
+                    gr_hip.gr_g2s(t, self.up_h, normed, mixed)
+                    return post, mixed
+            assert xp == H * Dh
             dm = torch.matmul(normed.view(R, H * Dh), self.proj_h.t())     # (R, rank [+ H])
             t = F.silu(dm[:, : self.rank] / H)
             if self.use_combine:
                 post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
             g = torch.matmul(t, self.up_h.t())                             # (R, H * Dh)
-            mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
-                     * normed.float().view(R, H, Dh)).mean(dim = -2).half()
+            if fuse and _GR_PF_MODE in ("1", "3") and g.dtype == torch.half and g.is_contiguous():
+                from .gated_delta_net_fn.gr_pf import gr_gate
+                mixed = torch.empty((R, Dh), dtype = torch.half, device = dev)
+                gr_gate(g, normed, mixed, H)
+            else:
+                mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
+                         * normed.float().view(R, H, Dh)).mean(dim = -2).half()
         return post, mixed
 
-    def mix(self, streams: torch.Tensor, params: dict):
+    def gr_can_defer(self, x: torch.Tensor, y: torch.Tensor, post: torch.Tensor, params: dict) -> bool:
+        """EXL3_PF_GR_FUSE (default off, read per call): the next GatedResidual site may run this site's
+        residual apply inside its norm pass (gr_pf.gr_apply_norm). Only the prefill-size Triton norm path
+        takes a pending apply; anything else flushes it with HyperConnection.flush_pending."""
+        if os.environ.get("EXL3_PF_GR_FUSE", "0") != "1" or not _GR_PF_FUSE or _GR_PF_MODE not in ("1", "2"):
+            return False
+        if "quant_preserve" in params or "capture" in params or not self.use_combine or post is None:
+            return False
+        if not hasattr(ext, "gr_mix") or not _hc_mix_supported(x.device) or torch.version.hip is None:
+            return False
+        if x.dim() != 4 or x.shape[2] != self.hc_mult or x.shape[3] != self.hidden_size:
+            return False
+        R = x.shape[0] * x.shape[1]
+        return (R > self.FUSED_MAX_R and x.dtype == torch.float and x.is_contiguous()
+                and y.dtype in (torch.half, torch.float) and y.is_contiguous() and y.numel() == R * self.hidden_size
+                and post.dtype == torch.float and post.is_contiguous() and post.numel() == R * self.hc_mult)
+
+    def mix(self, streams: torch.Tensor, params: dict, pending = None):
         """(b, s, H, D) fp32 -> (inject gates (b, s, H) fp32, None, collapsed (b, s, D) half)."""
         b, s = streams.shape[:2]
-        post, mixed = self._mix(streams)
+        if pending is not None and not (self.gr_can_defer(streams, pending[1], pending[2], params)
+                                        and pending[0] is streams):
+            HyperConnection.flush_pending(streams, pending)
+            pending = None
+        post, mixed = self._mix(streams, pending = pending, pad_ok = bool(params.get("hc_pad_ok")) and "capture" not in params
+                                and "quant_preserve" not in params and "ovr" not in params and "reconstruct" not in params)
         return post.view(b, s, self.hc_mult), None, mixed.view(b, s, self.hidden_size)
 
     def apply_(
@@ -408,12 +831,14 @@ class GatedResidual(Module):
         """Residual update for one sublayer site, in place: x <- x + post (x) y (comb unused).
         Conversion must NOT run the in-place path: the capture and advance passes forward the
         SAME stored input states twice (mHC apply_ has the same guard)."""
-        if "quant_preserve" in params or "capture" in params:
+        b, s, H, D = x.shape
+        if not hasattr(ext, "hc_apply") or "quant_preserve" in params or "capture" in params \
+                or not _hc_mix_supported(x.device) or H != 4 or D % 4 != 0 \
+                or x.dtype != torch.float or not x.is_contiguous() \
+                or y.dtype not in (torch.half, torch.float) or not y.is_contiguous() \
+                or post.dtype != torch.float or not post.is_contiguous():
             return x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
-        b, s = x.shape[:2]
         y2 = y.reshape(b * s, self.hidden_size)
-        if y2.dtype not in (torch.half, torch.float):
-            y2 = y2.half()
         ext.hc_apply(
             x.view(b * s, self.hc_mult, self.hidden_size),
             y2.contiguous(),
@@ -426,6 +851,9 @@ class GatedResidual(Module):
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         """Final-mixer form only: collapse the stream stack."""
         assert not self.use_combine, "site-form GatedResidual is consumed via mix()/apply_()"
+        pending = params.pop("hc_pending", None)
+        if pending is not None:
+            HyperConnection.flush_pending(x, pending)
         # MTP trunk tap: models without a final norm export the PRE-collapse stream stack here
         # (flattened), the analog of the RMSNorm export hook
         if self.key in params.get("export_state_norm_keys", ()):
@@ -566,10 +994,23 @@ class HyperHead(Module):
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
+        pending = params.pop("hc_pending", None)
+        if pending is not None:
+            HyperConnection.flush_pending(x, pending)
         if self.mean:
+            # MTP tap (EXL3_MTP_PRENORM_H, default OFF): the reference feeds the MTP head the
+            # mean-collapsed streams BEFORE model.norm, not the post-norm state. Keyed on the
+            # head's own norm key so it rides the same export_state_norm_keys plumbing.
+            if self.norm.key in params.get("export_state_norm_keys", ()):
+                states = params.get("export_states")
+                if states is None:
+                    states = params["export_states"] = []
+                states.append(x.mean(dim = 2).half())
             return x.mean(dim = 2)
         b, s, H, D = x.shape
-        if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
+        if hasattr(ext, "hc_mix_num_chunks") and hasattr(ext, "hc_head") \
+                and _hc_mix_supported(x.device) \
+                and H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)
             partials = g_tensor_cache.get_bucketed(

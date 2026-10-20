@@ -1,10 +1,12 @@
 from __future__ import annotations
 from typing_extensions import override
+import os as _os
 import torch
 from ..util.device_copy import to_device
+from ..ext import exllamav3_ext as ext
 from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
-from ..util.tensor import get_for_device, to2
+from ..util.tensor import get_for_device, to2, host_cuts
 from . import Module, Linear, RMSNorm
 from .layernorm import LayerNorm
 from ..model.model_tp_alloc import TPAllocation
@@ -16,6 +18,8 @@ from .attention_fn.mla_triton import (
     mla_unfold,
 )
 from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
+from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS
+from .qsa_indexer import topk_spans_ok, dsa_topk_spans
 import os
 
 # Prefill strategy: "mha" (default) up-projects past tiles from the compressed cache and attends
@@ -31,7 +35,150 @@ MAX_DECODE_QLEN = 16
 # the score transient at (256 rows, tile) regardless of context length; must be a multiple
 # of the page size (256)
 _score_tile = int(os.environ.get("EXL3_DSA_SCORE_TILE", 32768))
+_kpool_eager_rows = int(os.environ.get("EXL3_DSA_KPOOL_EAGER_ROWS", 1024))  # 0 = one shot (old path)
 assert _score_tile % 256 == 0 and _score_tile > 0
+# Query rows per indexer slab in the k-pool prefill path (one score matrix + top-k per slab). Default 256.
+_score_slab = None      # None: read EXL3_DSA_PF_SLAB (default 256) per call
+# "running" (default): per-tile running top-k merge. "defer": keep each tile's candidates and take ONE top-k at the end
+# (same candidate set, a third of the glue launches at 4 tiles; ties among equal fp16 scores may order differently).
+_merge_mode = None      # None: read EXL3_DSA_PF_MERGE per call (a harness may set "running" / "defer")
+# EXL3_DSA_PF_SORT=1: the tiled selection (context > one score tile = 131072 tokens) hands the sparse attention its pools in
+# score-descending order, the single-tile one (dsa_topk output) in ascending order. 1 sorts the tiled result ascending too
+# (-1 padding last, default): same key set per row, gathers walk memory forward. The attention sums in list order, so results
+# differ from the unsorted order at fp rounding level, not in the key set.
+_sort_tiled = None      # None: read EXL3_DSA_PF_SORT per call (a harness may set True / False)
+
+# Decode/verify has few query rows.  When enabled, score the whole visible slab in one
+# call instead of running the per-tile top-k merge below.  Prefill remains tiled.
+EXL3_DSA_DEC_NOTILE = _os.environ.get("EXL3_DSA_DEC_NOTILE", "1") == "1"
+
+# fuse the decode/verify DSA indexer torch glue (pool expand + tail
+# append, ~15 launches/layer, ~0.73 ms/round) into one Triton kernel. Default off.
+EXL3_DSA_GLUE_FUSE = _os.environ.get("EXL3_DSA_GLUE_FUSE", "0") == "1"
+
+# Prefill analogue (pfDepth2): score a whole 256-row slab over all visible entries in one call,
+# one dsa_topk, then reorder score-descending like the tiled merge; drops the per-tile torch
+# gather/cat/topk. Bounded: only when the (rows, pow2 stride) fp16 transient fits in
+# EXL3_DSA_PF_NOTILE_MB (default 256 MB = 1M-entry rows); longer rows stay tiled.
+EXL3_DSA_PF_NOTILE = _os.environ.get("EXL3_DSA_PF_NOTILE", "0") == "1"
+EXL3_DSA_PF_NOTILE_MB = int(_os.environ.get("EXL3_DSA_PF_NOTILE_MB", "256"))
+
+
+def _pf_notile_ok(rows, t):
+    return EXL3_DSA_PF_NOTILE and rows * (1 << max(t - 1, 1).bit_length()) * 2 <= EXL3_DSA_PF_NOTILE_MB << 20
+
+# Batch-1 decode: the MLA projections run through the exl3_dec GEMV kernels instead of
+# LinearEXL3.forward's own route. LinearEXL3.forward does reach exl3_dec_gemv for a single row
+# when its dec_ok holds, but that gate is mul1-only, so on a GLM-5.3-Flash pack (all mcg) every
+# projection here falls back to the generic path; this wiring decodes either codebook and folds
+# q_a_proj + kv_a_proj_with_mqa into one launch. EXL3_MLA_DEC=0 restores the plain forwards.
+EXL3_MLA_DEC = os.environ.get("EXL3_MLA_DEC", "1") != "0"
+
+# Verify batch-invariance (glm-mtp step 7): at 2..EXL3_MLA_DEC_ROWLOOP_MAX rows of an MTP verify
+# forward, run the MLA projections as one exl3_dec GEMV launch PER ROW (the exact batch-1 kernel)
+# instead of LinearEXL3.forward's M-row route (bc / hip GEMV, a different reduction), so row i of
+# an R-row verify equals the plain R = 1 decode bitwise. 0 restores the M-row route
+# Default: 4 rows with EXL3_ROW_INV=0, ROW_INV_MAX_ROWS (8) otherwise, so two jobs of three rows
+# (MTP 2) stay on the exact path; an explicit value wins.
+_ROWLOOP_ENV = os.environ.get("EXL3_MLA_DEC_ROWLOOP_MAX")
+
+
+def _rowloop_max() -> int:
+    if _ROWLOOP_ENV is not None:
+        return int(_ROWLOOP_ENV)
+    return ROW_INV_MAX_ROWS if ROW_INV["on"] else 4
+
+# Same idea for the dense MLA decode kernel: a short verify pass runs as R one-row decodes
+EXL3_MLA_ATTN_ROWLOOP = os.environ.get("EXL3_MLA_ATTN_ROWLOOP", "1") != "0"
+# Projection half (glm-mtp step 8): "gemv_r" (default) = one exl3_dec_gemv_r(_multi) launch over the R
+# rows, each row reduced exactly like the batch-1 exl3_dec_gemv (mcg included), so verify row i is
+# bit-equal to plain decode at no extra launch. "loop" = step 7's R batch-1 launches (same bits, +2.9 ms
+# per R=2 verify), "off" = LinearEXL3.forward's M-row route (rows drift at ulp level, ids flip at
+# near-ties). Both halves exact = MTP greedy ids equal plain greedy ids (step 7: 32/32 cases).
+EXL3_MLA_PROJ_R = os.environ.get("EXL3_MLA_PROJ_R", "gemv_r")
+
+# K*2 values the exl3_dec GEMV kernels are instantiated for (quant/exl3.py: _DEC_KB2)
+_DEC_KB2 = (4, 5, 6, 8, 10, 12)
+
+
+def dec_proj_ok(lin) -> bool:
+    """True when one MLA projection can run the dense exl3_dec GEMV on a one-row input.
+
+    Looser than LinearEXL3.dec_ok on the codebook (mcg decodes too, and GLM-5.3-Flash's packs are
+    entirely mcg) and on K 2.5; equally strict on shapes; stricter on the wrappers, because the
+    fused launch replaces a bare exl3 matmul: LoRA, a bias, pre/post scales, a softcap or padded
+    output columns all disqualify it.
+    """
+    from ..ext import exllamav3_ext as ext
+    inner = getattr(lin, "inner", None)
+    if inner is None or not hasattr(inner, "K"):   # LinearFP16 (test models) has no EXL3 trellis
+        return False
+    k2 = inner.K * 2
+    return (
+        EXL3_MLA_DEC and bool(torch.version.hip) and hasattr(ext, "exl3_dec_gemv") and
+        getattr(lin, "quant_type", None) == "exl3" and (inner.mul1 or inner.mcg) and
+        int(round(k2)) in _DEC_KB2 and k2 == int(round(k2)) and
+        inner.in_features % 512 == 0 and inner.out_features % 128 == 0 and
+        tuple(inner.trellis.shape[:2]) == (inner.in_features // 16, inner.out_features // 16) and
+        inner.suh is not None and inner.svh is not None and inner.bias is None and
+        not getattr(lin, "lora_a_tensors", None) and
+        getattr(lin, "pre_scale", 1.0) == 1.0 and getattr(lin, "post_scale", 1.0) == 1.0 and
+        getattr(lin, "softcap", 0.0) == 0.0 and
+        lin.out_features == lin.out_features_unpadded and
+        inner.default_out_dtype in (torch.half, torch.float)
+    )
+
+
+def dec_proj_shapes(lins) -> bool:
+    """True when lins can share one exl3_dec_gemv_multi launch (same input width, K and codebook)."""
+    return (
+        len(lins) >= 1 and all(
+            l.inner.in_features == lins[0].inner.in_features and
+            int(round(l.inner.K * 2)) == int(round(lins[0].inner.K * 2)) and
+            bool(l.inner.mcg) == bool(lins[0].inner.mcg)
+            for l in lins
+        )
+    )
+
+
+_GEMV_R_MCG = []
+
+def dec_gemv_r_mcg() -> bool:
+    """True when this build's exl3_dec_gemv_r takes the mcg codebook (glm-mtp step 8). Cached."""
+    if not _GEMV_R_MCG:
+        from ..ext import exllamav3_ext as ext
+        _GEMV_R_MCG.append("mcg" in (getattr(getattr(ext, "exl3_dec_gemv_r", None), "__doc__", "") or ""))
+    return _GEMV_R_MCG[0]
+
+
+def dec_proj_multi(lins, x, rows = 1):
+    """One exl3_dec_gemv_multi launch for lins over the one-row input x: (1, out_features) each.
+    rows > 1: one exl3_dec_gemv_r_multi launch over x as (rows, in_features), row r bit-equal to
+    the one-row launch on x[r]."""
+    from .quant.exl3 import dec_workspace
+    from ..ext import exllamav3_ext as ext
+    scratch, counters = dec_workspace(x.device)
+    outs = [torch.empty((rows, l.inner.out_features), dtype = l.inner.default_out_dtype,
+                        device = x.device) for l in lins]
+    fn = ext.exl3_dec_gemv_r_multi if rows > 1 else ext.exl3_dec_gemv_multi
+    fn(x.reshape(rows, lins[0].inner.in_features).contiguous(),
+       [l.inner.trellis for l in lins], [l.inner.suh for l in lins], [l.inner.svh for l in lins],
+       outs, scratch, counters, [float(l.inner.K) for l in lins], bool(lins[0].inner.mcg))
+    return outs
+
+
+def dec_proj_single(lin, x, rows = 1):
+    """One exl3_dec_gemv launch for one projection over the one-row input x (rows > 1:
+    exl3_dec_gemv_r over (rows, in_features), row r bit-equal to the one-row launch)."""
+    from .quant.exl3 import dec_workspace
+    from ..ext import exllamav3_ext as ext
+    inner = lin.inner
+    y = torch.empty((rows, inner.out_features), dtype = inner.default_out_dtype, device = x.device)
+    scratch, counters = dec_workspace(x.device)
+    fn = ext.exl3_dec_gemv_r if rows > 1 else ext.exl3_dec_gemv
+    fn(x.reshape(rows, inner.in_features).contiguous(), inner.trellis, inner.suh,
+       inner.svh, y, scratch, counters, float(inner.K), bool(inner.mcg))
+    return y
 
 
 
@@ -48,6 +195,18 @@ def _host_seqlens(params: dict, cache_seqlens: torch.Tensor) -> list:
             host = cache_seqlens.cpu().tolist()
         params["_mla_host_seqlens"] = host
     return host
+
+def _check_block_table(block_table: torch.Tensor, host_seqlens: list, seqlen: int):
+    """A block table shorter than the context makes the paged writes (latent, indexer keys) and
+    the indexer/attention reads index past its end: garbage page ids, then an HSA hardware
+    exception / hipErrorLaunchFailure reported later at an unrelated call (moeA4). Host-only
+    check, no device sync, no numeric effect."""
+    from ..constants import PAGE_SIZE
+    need = -(-(max(host_seqlens) + seqlen) // PAGE_SIZE)
+    assert block_table.shape[-1] >= need, \
+        f"block_table has {block_table.shape[-1]} pages, context of " \
+        f"{max(host_seqlens) + seqlen} tokens needs {need}"
+
 
 class MLAttention(Module):
     """
@@ -252,6 +411,8 @@ class MLAttention(Module):
         self.tp_cache_lookup = {}
         self.has_split_cache = False
         self.dispatch_cache = {}
+        # Batch-1 fused GEMV wiring (see dec_proj_ok)
+        self.dec_gemv = EXL3_MLA_DEC and bool(torch.version.hip)
 
         # kv_b_proj, stored ONLY in the flattened (kv_lora_rank, H * dim) form: the prefill
         # up-projection GEMMs consume it directly, and the decode absorb/unfold run as Triton
@@ -377,6 +538,7 @@ class MLAttention(Module):
         self.w_uv_flat = None
         self.idx_kpool_ape = None
         self.idx_kpool_gate = None
+        self._idx_kpool_gate_t = None
         self._scratch = {}
         self.dispatch_cache = {}
 
@@ -397,17 +559,113 @@ class MLAttention(Module):
                 x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
             case _:
                 raise ValueError(f"Unknown attn_mode: {attn_mode}")
+        if x is None:
+            return None                          # EXL3_PF_SKIP: kv_only, see _attend
+        # EXL3_NC2_ATTN_F16 (default off): the block asked for fp16 y (pfe_y_half) and o_proj returned it; keep it
+        # instead of the fp32 widen to self.out_dtype (the residual apply / ablit project_widen widen in-kernel)
+        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+            return x
         return to2(x, out_dtype, self.out_dtype)
 
 
-    def project_q(self, x: torch.Tensor, params: dict, return_resid: bool = False):
+    def project_q(self, x: torch.Tensor, params: dict, return_resid: bool = False, fused: dict | None = None):
         if self.q_a_proj is None:
-            q = self.q_proj.forward(x, params)
+            q = self._dec_proj(self.q_proj, x, params, fused)
             return (q, None) if return_resid else q
-        q_resid = self.q_a_proj.forward(x, params)
+        q_resid = self._dec_proj(self.q_a_proj, x, params, fused)
         q_resid = self.q_a_layernorm.forward(q_resid, params, out_dtype = torch.half)
-        q = self.q_b_proj.forward(q_resid, params)
+        q = self._dec_proj(self.q_b_proj, q_resid, params)
         return (q, q_resid) if return_resid else q
+
+
+    def _dec_proj(self, lin, x: torch.Tensor, params: dict, fused: dict | None = None) -> torch.Tensor:
+        """One MLA projection at batch-1 decode: the fused exl3_dec GEMV when it qualifies, else
+        lin.forward. `fused` carries outputs already produced by the shared launch
+        (_dec_proj_pair), so a projection computed there is not recomputed."""
+        if fused:
+            y = fused.get(id(lin))
+            if y is not None:
+                return y
+        if (
+            self.dec_gemv and x.dtype == torch.half and x.numel() == lin.in_features and
+            "capture" not in params and "ovr" not in params and dec_proj_ok(lin)
+        ):
+            return to2(dec_proj_single(lin, x), None, lin.out_dtype)
+        rows = self._dec_rowloop_rows(x, lin.in_features, params)
+        if rows and dec_proj_ok(lin):
+            if self._proj_gemv_r():
+                y = dec_proj_single(lin, x, rows)
+            else:
+                x2 = x.reshape(rows, lin.in_features)
+                y = torch.cat([dec_proj_single(lin, x2[r : r + 1]) for r in range(rows)], dim = 0)
+            return to2(y.view(x.shape[:-1] + (lin.out_features,)), None, lin.out_dtype)
+        if lin is self.o_proj and params.get("pfe_y_half") and self._nc2_oproj_f16(lin, x, params):
+            return lin.forward(x, params, torch.half)
+        return lin.forward(x, params)
+
+
+    def _nc2_oproj_f16(self, m, x: torch.Tensor, params: dict) -> bool:
+        """EXL3_NC2_MLA_OPROJ_F16: the block's residual apply reads fp16 y (params["pfe_y_half"]), so o_proj may return
+        its fp16 GEMM output instead of the fp32 widen of it (same predicate as Attention.project_o): bit-exact."""
+        if os.environ.get("EXL3_NC2_MLA_OPROJ_F16", "0") != "1" or "capture" in params or "quant_preserve" in params:
+            return False
+        from .quant import exl3 as _exl3
+        rows = x.numel() // x.shape[-1]
+        return bool(
+            _exl3._f32_via_f16 and rows > max(_exl3.AUTO_RECONSTRUCT_THRESHOLD, _exl3._f32_via_f16_min_rows - 1)
+            and type(m.inner).__name__ == "LinearEXL3" and m.inner.bias is None
+            and not self.config.infer_params.no_reconstruct and not params.get("reconstruct")
+            and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0
+            and m.softcap == 0.0 and m.out_features == m.out_features_unpadded
+        )
+
+
+    @staticmethod
+    def _proj_gemv_r() -> bool:
+        return EXL3_MLA_PROJ_R == "gemv_r" and dec_gemv_r_mcg()
+
+
+    def _dec_rowloop_rows(self, x: torch.Tensor, in_features: int, params: dict) -> int:
+        """Row count when an R-row verify projection should run the batch-1 exl3_dec arithmetic per
+        row (one gemv_r launch or R batch-1 launches, bit-identical to plain decode, see
+        EXL3_MLA_PROJ_R / EXL3_MLA_DEC_ROWLOOP_MAX), else 0."""
+        if not (EXL3_MLA_PROJ_R in ("gemv_r", "loop") and self.dec_gemv and x.dtype == torch.half and params.get("dflash_verify") and
+                "capture" not in params and "ovr" not in params):
+            return 0
+        rows = x.numel() // in_features
+        if 1 < rows <= _rowloop_max() and rows * in_features == x.numel():
+            return rows
+        return 0
+
+
+    def _dec_proj_pair(self, x: torch.Tensor, params: dict) -> dict:
+        """q_a_proj and kv_a_proj_with_mqa in ONE exl3_dec_gemv_multi launch: at batch 1 both read
+        x and (on GLM) share the trellis bitrate, which is what LinearEXL3's own route pays two
+        launches for. Returns {id(lin): output}, empty when the pair cannot share a launch."""
+        if self.q_a_proj is None:
+            return {}
+        rows = self._dec_rowloop_rows(x, self.q_a_proj.in_features, params)
+        if (
+            not rows and (not self.dec_gemv or x.dtype != torch.half or
+            "capture" in params or "ovr" in params or x.numel() != self.q_a_proj.in_features)
+        ):
+            return {}
+        lins = (self.q_a_proj, self.kv_a_proj_with_mqa)
+        if not all(dec_proj_ok(l) for l in lins) or not dec_proj_shapes(lins):
+            return {}
+        if rows:
+            # Verify rows: the batch-1 fused launch's arithmetic per row, bitwise equal to plain decode
+            if self._proj_gemv_r():
+                cat = dec_proj_multi(lins, x, rows)
+            else:
+                x2 = x.reshape(rows, self.q_a_proj.in_features)
+                per = [dec_proj_multi(lins, x2[r : r + 1]) for r in range(rows)]
+                cat = [torch.cat([p[i] for p in per], dim = 0) for i in range(len(lins))]
+            return {id(l): to2(cat[i].view(x.shape[:-1] + (l.out_features,)),
+                               None, l.out_dtype) for i, l in enumerate(lins)}
+        outs = dec_proj_multi(lins, x)
+        return {id(l): to2(o, None, l.out_dtype) for l, o in zip(lins, outs)}
 
 
     def _indexer_rope_(self, x4, position, positions, position_ids, inv_freq):
@@ -446,7 +704,17 @@ class MLAttention(Module):
         if self.index_kpool:
             # Pack the per-token pool-gate scores next to the key: pooled keys are rebuilt
             # from this plane (a pool's members' gate scores feed the in-pool softmax)
-            gate = torch.nn.functional.linear(x.to(torch.half), self.idx_kpool_gate)
+            xh = x.to(torch.half)
+            if xh.numel() <= 8 * xh.shape[-1] and torch.version.hip and \
+                    _os.environ.get("EXL3_HIP_F16_SMALL_M_HGEMM", "1") != "0":
+                # decode: multi-CU skinny GEMV (ext.hgemm) instead of a 1-workgroup hipBLAS tile
+                gt = getattr(self, "_idx_kpool_gate_t", None)
+                if gt is None or gt.device != xh.device:
+                    gt = self._idx_kpool_gate_t = self.idx_kpool_gate.T.contiguous()
+                gate = torch.empty(xh.shape[:-1] + (gt.shape[1],), dtype = torch.half, device = xh.device)
+                ext.hgemm(xh.reshape(-1, xh.shape[-1]), gt, gate.view(-1, gt.shape[1]))
+            else:
+                gate = torch.nn.functional.linear(xh, self.idx_kpool_gate)
             k = torch.cat((k, gate), dim = -1)
         return k
 
@@ -462,7 +730,7 @@ class MLAttention(Module):
         from ..ext import exllamav3_ext as ext
 
         H_i, D_i = self.index_n_heads, self.index_head_dim
-        q_idx = self.idx_wq_b.forward(q_resid, params).view(bsz, seqlen, H_i, D_i).contiguous()
+        q_idx = self._dec_proj(self.idx_wq_b, q_resid, params).view(bsz, seqlen, H_i, D_i).contiguous()
         self._indexer_rope_(q_idx, position, positions, position_ids, inv_freq)
         # Raw head weights; the scoring kernel folds in the D_i**-0.5 and H_i**-0.5 scales and
         # runs the relu-weighted reduction in fp32, matching the reference
@@ -520,6 +788,19 @@ class MLAttention(Module):
                     ext.dsa_topk(sc, out_slab, k_sel, None, 0)
                     continue
 
+                if (EXL3_DSA_DEC_NOTILE and seqlen <= 8) or _pf_notile_ok(rows, t_slab):
+                    # Decode/verify (and prefill under EXL3_DSA_PF_NOTILE): one full-slab score transient and one dsa_topk call.
+                    # No backing: dsa_indexer_scores rounds the row stride (a kernel constexpr)
+                    # up to a power of two. A (rows, t_slab) backing failed its stride % 8 assert
+                    # and would recompile the scorer on every new visible length
+                    sc = tile_scores(0, t_slab)
+                    ext.dsa_topk(sc, out_slab, k_sel, None, 0)
+                    # Score-descending order, as the tiled merge emits (see _indexer_topk_kpool)
+                    sel = out_slab[:, :k_sel]
+                    _, o = sc.gather(1, sel.long()).topk(k_sel, dim = 1)
+                    out_slab[:, :k_sel] = sel.gather(1, o)
+                    continue
+
                 # Tiled path: fixed-size score/index backings, running (score, index) top-k
                 # candidate set merged tile by tile
                 i_backing = g_tensor_cache.get(dev, (slab * k_pad,), torch.int32, "dsa_itile")
@@ -543,6 +824,43 @@ class MLAttention(Module):
                 out_slab[:, :k_sel] = torch.where(
                     run_scr > -float("inf"), run_idx, run_idx.new_full((), -1))
         return indices
+
+
+    def warm_indexer_strides(self, cache, max_seq):
+        """
+        Compile, ahead of the first long request, the indexer-scoring kernels at every score-row
+        stride a decode/verify call can use beyond one tile. Decode (<= 8 rows) scores the whole
+        visible slab in one call once it outgrows the score tile, and that call rounds the row
+        stride up to a power of two, a kernel constexpr: the first decode at a new power of two
+        (131072 tokens for a 4-token pool, 262144, ...) paid a Triton compile (0.4-4 s, twice: the
+        few-row kernel and the query-tiled one a lookup round with > 4 rows takes) inside the
+        user's first round. Pure compile: the dummy scores are discarded, no model state is touched.
+        Returns the number of strides warmed.
+        """
+        if self.indexer_mode != "full":
+            return 0
+        from .attention_fn.dsa_triton import dsa_indexer_scores
+        layer = cache.layers[self.layer_idx, 0]
+        P = self.index_kpool or 1
+        plane = layer.get_pool() if self.index_kpool else layer.get_idx()
+        epp = plane.shape[1]
+        H_i, D_i = self.index_n_heads, self.index_head_dim
+        t_tile = max(epp, _score_tile // epp * epp)
+        max_entries = max_seq // P
+        dev = plane.device
+        flat = plane.view(-1, D_i)
+        n = 0
+        stride = 1 << (t_tile).bit_length()     # smallest power of two above one tile
+        while stride // 2 < max_entries:
+            bt = torch.zeros(stride // epp + 1, dtype = torch.int32, device = dev)
+            for R in (1, 5):
+                q = torch.zeros((R, H_i, D_i), dtype = torch.half, device = dev)
+                w = torch.zeros((R, H_i), dtype = torch.half, device = dev)
+                dsa_indexer_scores(q, w, flat, 0, P, stride, block_table = bt, epp = epp)
+            n += 1
+            stride *= 2
+        torch.cuda.synchronize(dev)
+        return n
 
 
     def _update_pool_plane(self, idx_layer, block_table, host_seqlens, seqlen):
@@ -572,8 +890,10 @@ class MLAttention(Module):
             keys, gates = members[..., :D_i], members[..., D_i:]
             probs = torch.softmax(gates + ape.unsqueeze(0), dim = 1)
             pool_keys = (probs * keys).sum(dim = 1).to(torch.half)
+            # torch.full, not torch.tensor(device=): a pageable H2D copy blocks the host until
+            # the GPU queue drains (one full-queue stall per completed pool per DSA layer)
             idx_layer.update_pool_direct(
-                torch.tensor([first_pool], dtype = torch.int32, device = plane.device),
+                torch.full((1,), first_pool, dtype = torch.int32, device = plane.device),
                 bt.unsqueeze(0) if bt.dim() == 1 else bt,
                 pool_keys.unsqueeze(0),
             )
@@ -596,7 +916,7 @@ class MLAttention(Module):
         from ..util.tensor import g_tensor_cache
 
         H_i, D_i, P = self.index_n_heads, self.index_head_dim, self.index_kpool
-        q_idx = self.idx_wq_b.forward(q_resid, params).view(bsz, seqlen, H_i, D_i).contiguous()
+        q_idx = self._dec_proj(self.idx_wq_b, q_resid, params).view(bsz, seqlen, H_i, D_i).contiguous()
         w = self.idx_weights.forward(x, params)
 
         t_max = max(host_seqlens) + seqlen
@@ -625,11 +945,14 @@ class MLAttention(Module):
             # exactly the visible-complete-pool count
             wf = w  # raw head weights, scales folded in-kernel
             epp = pool_plane.shape[1]
-            slab = 256
-            t_tile = max(epp, _score_tile // epp * epp)
+            slab = _score_slab or int(os.environ.get("EXL3_DSA_PF_SLAB", "256"))
+            t_tile = max(epp, int(os.environ.get("EXL3_DSA_SCORE_TILE", _score_tile)) // epp * epp)
+            merge_defer = (_merge_mode or os.environ.get("EXL3_DSA_PF_MERGE", "running")) == "defer"
+            sort_tiled = _sort_tiled if _sort_tiled is not None else os.environ.get("EXL3_DSA_PF_SORT", "1") == "1"
             for b in range(bsz):
                 pools_b = (host_seqlens[b] + seqlen) // P
                 base_cols = 0
+                fused_tail = False
                 for r0 in range(0, seqlen, slab):
                     r1 = min(r0 + slab, seqlen)
                     rows = r1 - r0
@@ -662,10 +985,24 @@ class MLAttention(Module):
                         pool_idx = torch.empty((rows, kp_sel), dtype = torch.int32, device = dev)
                         ext.dsa_topk(sc, pool_idx, k_sel, None, 0)
                         pool_idx = pool_idx[:, :k_sel]
+                    elif (EXL3_DSA_DEC_NOTILE and seqlen <= 8) or _pf_notile_ok(rows, pools_slab):
+                        sc = tile_scores(0, pools_slab)   # pow2 stride, see _indexer_topk
+                        pool_idx = torch.empty((rows, kp_sel), dtype = torch.int32, device = dev)
+                        if topk_spans_ok(sc, k_sel):
+                            dsa_topk_spans(ext.dsa_topk, sc, pool_idx, k_sel)
+                        else:
+                            ext.dsa_topk(sc, pool_idx, k_sel, None, 0)
+                        pool_idx = pool_idx[:, :k_sel]
+                        # Same score-descending order as the tiled merge's final topk: the sparse
+                        # attention accumulates in index order, so order is not free
+                        _, o = sc.gather(1, pool_idx.long()).topk(k_sel, dim = 1)
+                        pool_idx = pool_idx.gather(1, o)
                     else:
                         i_backing = g_tensor_cache.get(dev, (slab * kp_sel,), torch.int32, "dsa_itile")
+                        defer = merge_defer
                         run_scr = torch.full((rows, k_sel), -float("inf"), dtype = torch.half, device = dev)
                         run_idx = torch.full((rows, k_sel), -1, dtype = torch.int32, device = dev)
+                        cands_s, cands_i = ([run_scr], [run_idx]) if defer else (None, None)
                         for t0 in range(0, pools_slab, t_tile):
                             t1 = min(t0 + t_tile, pools_slab)
                             sc = tile_scores(t0, t1, s_backing[: rows * s_stride].view(rows, s_stride))
@@ -676,22 +1013,42 @@ class MLAttention(Module):
                             t_scr = sc.gather(1, ti.clamp_min(0).long())
                             t_scr = t_scr.masked_fill(ti < 0, -float("inf"))
                             t_idx = torch.where(ti >= 0, ti + t0, ti)
+                            if defer:
+                                cands_s.append(t_scr)
+                                cands_i.append(t_idx)
+                                continue
                             cand_scr = torch.cat((run_scr, t_scr), dim = 1)
                             cand_idx = torch.cat((run_idx, t_idx), dim = 1)
                             run_scr, sel = cand_scr.topk(k_sel, dim = 1)
                             run_idx = cand_idx.gather(1, sel)
+                        if defer:
+                            run_scr, sel = torch.cat(cands_s, dim = 1).topk(k_sel, dim = 1)
+                            run_idx = torch.cat(cands_i, dim = 1).gather(1, sel)
                         pool_idx = torch.where(
                             run_scr > -float("inf"), run_idx, run_idx.new_full((), -1))
+                        if sort_tiled:
+                            big = torch.iinfo(torch.int32).max
+                            pool_idx = torch.where(pool_idx < 0, pool_idx.new_full((), big), pool_idx).sort(dim = 1).values
+                            pool_idx = torch.where(pool_idx == big, pool_idx.new_full((), -1), pool_idx)
 
-                    # Expand pools to raw token indices
-                    exp = (pool_idx.unsqueeze(-1) * P +
-                           torch.arange(P, dtype = torch.int32, device = dev)).flatten(1)
-                    exp = torch.where(
-                        pool_idx.unsqueeze(-1).expand(-1, -1, P).flatten(1) >= 0,
-                        exp, exp.new_full((), -1))
-                    out_slab[:, : exp.shape[1]] = exp
-                    base_cols = max(base_cols, exp.shape[1])
-                append_tail(b, base_cols)
+                    # Expand pools to raw token indices (one kernel when set;
+                    # single-slab only so the tail offset is this slab's expand width)
+                    if EXL3_DSA_GLUE_FUSE and seqlen <= 256:
+                        from .attention_fn.dsa_triton import dsa_glue_expand
+                        base_cols = max(base_cols, dsa_glue_expand(
+                            pool_idx, out_slab, P, host_seqlens[b] + r0,
+                            bool(self.index_kpool_tail and P > 1)))
+                        fused_tail = True
+                    else:
+                        exp = (pool_idx.unsqueeze(-1) * P +
+                               torch.arange(P, dtype = torch.int32, device = dev)).flatten(1)
+                        exp = torch.where(
+                            pool_idx.unsqueeze(-1).expand(-1, -1, P).flatten(1) >= 0,
+                            exp, exp.new_full((), -1))
+                        out_slab[:, : exp.shape[1]] = exp
+                        base_cols = max(base_cols, exp.shape[1])
+                if not fused_tail:
+                    append_tail(b, base_cols)
             return indices
 
         # Cache-less eager path (parity/compare): pools built from the packed chunk rows
@@ -708,16 +1065,25 @@ class MLAttention(Module):
                 probs = torch.softmax(gg + self.idx_kpool_ape.unsqueeze(0), dim = 1)
                 pool_keys = (probs * gk).sum(dim = 1)
 
-                sc = torch.einsum("shd,pd->shp", q_idx[b].float(), pool_keys)
-                sc = F.relu(sc * (D_i ** -0.5))
-                sc = torch.einsum("sh,shp->sp", w[b].float() * (H_i ** -0.5), sc)
-
                 q_pos = host_seqlens[b] + torch.arange(seqlen, device = x.device)
                 pool_end = torch.arange(n_pools, device = x.device) * P + (P - 1)
-                sc = sc.masked_fill(pool_end.unsqueeze(0) > q_pos.unsqueeze(1), -float("inf"))
-
                 select_k = min(self.index_topk // P, n_pools)
-                top_sc, top_pool = sc.topk(select_k, dim = -1)
+                qf, wb = q_idx[b], w[b]
+                # Query-chunked: the [rows, H_i, n_pools] fp32 score cube is 8 GiB per copy at 16K tokens.
+                # Rows are independent, so every chunk computes the same per-row values.
+                step = _kpool_eager_rows if _kpool_eager_rows > 0 else seqlen
+                top_sc_l, top_pool_l = [], []
+                for r0 in range(0, seqlen, step):
+                    r1 = min(r0 + step, seqlen)
+                    sc = torch.einsum("shd,pd->shp", qf[r0:r1].float(), pool_keys)
+                    sc = F.relu(sc * (D_i ** -0.5))
+                    sc = torch.einsum("sh,shp->sp", wb[r0:r1].float() * (H_i ** -0.5), sc)
+                    sc = sc.masked_fill(pool_end.unsqueeze(0) > q_pos[r0:r1].unsqueeze(1), -float("inf"))
+                    ts, tp = sc.topk(select_k, dim = -1)
+                    del sc
+                    top_sc_l.append(ts); top_pool_l.append(tp)
+                top_sc = top_sc_l[0] if len(top_sc_l) == 1 else torch.cat(top_sc_l)
+                top_pool = top_pool_l[0] if len(top_pool_l) == 1 else torch.cat(top_pool_l)
                 exp = (top_pool.unsqueeze(-1) * P +
                        torch.arange(P, device = x.device)).view(seqlen, -1)
                 exp = torch.where(
@@ -740,6 +1106,61 @@ class MLAttention(Module):
             pos = (position + torch.arange(seqlen, device = device, dtype = torch.float)).expand(bsz, seqlen)
         scale = 1.0 + self.l4_beta * torch.log1p(torch.floor(pos / self.l4_original))
         return scale.to(torch.half).reshape(bsz * seqlen, 1, 1)
+
+
+    def _attend_pre(self, x, bsz, seqlen, params, position, positions, position_ids, inv_freq,
+                    use_mha = False, absorb_row0 = 0):
+        """Context-length-independent head of _attend: q/kv projections, norms, rope and W_UK
+        absorption. Returns (q, q_resid, q_pe, ckv, k_pe, q_lat, q_pe_hm); q_lat/q_pe_hm are None
+        on the MHA path. Graph-capturable when rope and the l4 scale are off (no position use)."""
+        from .attention_fn.mla_triton import _dbg_sync
+        H = self.num_q_heads
+        R = bsz * seqlen
+        q_lat = q_pe_hm = None
+        # Queries
+        _dbg_sync("attend-entry (upstream modules)", x.device)
+        # Batch-1 decode: q_a_proj and kv_a_proj_with_mqa in one exl3_dec_gemv_multi launch (the
+        # fused path is a no-op above one row, so this is computed unconditionally)
+        fused = self._dec_proj_pair(x, params)
+        q, q_resid = self.project_q(x, params, return_resid = True, fused = fused)
+        q = q.view(R, H, self.qk_head_dim)
+        if self.l4_beta:
+            # Whole query (nope + pe), before the split so the absorbed and MHA paths both
+            # inherit it; a per-token scalar commutes with the rotation
+            q *= self._l4_scale(bsz, seqlen, position, positions, position_ids, x.device)
+        _dbg_sync("project_q", x.device)
+        q_nope = q[:, :, :self.qk_nope_head_dim]
+        q_pe = q[:, :, self.qk_nope_head_dim:].reshape(bsz, seqlen, H, self.qk_rope_head_dim)
+
+        # Latent K/V. The normalized latent is what gets cached, matching the reference order
+        # (kv_a_layernorm is applied before kv_b_proj would be)
+        ckv_kpe = self._dec_proj(self.kv_a_proj_with_mqa, x, params, fused)
+        _dbg_sync("kv_a_proj", x.device)
+        ckv = self.kv_a_layernorm.forward(
+            ckv_kpe[..., :self.kv_lora_rank].contiguous(), params, out_dtype = torch.half
+        )
+        k_pe = ckv_kpe[..., self.kv_lora_rank:].reshape(bsz, seqlen, 1, self.qk_rope_head_dim).contiguous()
+        _dbg_sync("kv_a_layernorm+slice", x.device)
+
+        if self.rope is not None:
+            q_pe, k_pe = self.rope.apply(
+                q_pe, k_pe, position, positions, position_ids, True,
+                None, None, self.norm_eps, 0.0, inv_freq,
+            )
+            _dbg_sync("rope", x.device)
+
+        if not use_mha:
+            # Absorb W_UK into the queries, per head, straight from the flat layout. This runs as
+            # a Triton kernel rather than a cuBLAS batched GEMM: the strided-batched fp16 form
+            # made cuBLAS pick an SM120 nvjet TMA kernel that intermittently MMU-faults (caught
+            # with cuda-gdb after presenting as flaky illegal-memory-access crashes whose
+            # incidence tracked allocation layout), and the kernel reads any strides for free
+            # absorb_row0 > 0 (dense-head split, see _attend): rows below it take the MHA path
+            # and never read q_lat, so only the sparse tail rows are absorbed
+            r0 = absorb_row0
+            q_lat = mla_absorb(q.view(R, H, self.qk_head_dim)[r0:], self.w_uk_flat, H, self.qk_nope_head_dim)
+            q_pe_hm = q_pe.reshape(R, H, self.qk_rope_head_dim)[r0:].permute(1, 0, 2).contiguous()
+        return q, q_resid, q_pe, ckv, k_pe, q_lat, q_pe_hm
 
 
     def _attend(self, x, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, cache_seqlens,
@@ -768,44 +1189,26 @@ class MLAttention(Module):
         else:
             sparse = False
 
-        # Queries
-        _dbg_sync("attend-entry (upstream modules)", x.device)
-        q, q_resid = self.project_q(x, params, return_resid = True)
-        q = q.view(R, H, self.qk_head_dim)
-        if self.l4_beta:
-            # Whole query (nope + pe), before the split so the absorbed and MHA paths both
-            # inherit it; a per-token scalar commutes with the rotation
-            q *= self._l4_scale(bsz, seqlen, position, positions, position_ids, x.device)
-        _dbg_sync("project_q", x.device)
-        q_nope = q[:, :, :self.qk_nope_head_dim]
-        q_pe = q[:, :, self.qk_nope_head_dim:].reshape(bsz, seqlen, H, self.qk_rope_head_dim)
-
-        # Latent K/V. The normalized latent is what gets cached, matching the reference order
-        # (kv_a_layernorm is applied before kv_b_proj would be)
-        ckv_kpe = self.kv_a_proj_with_mqa.forward(x, params)
-        _dbg_sync("kv_a_proj", x.device)
-        ckv = self.kv_a_layernorm.forward(
-            ckv_kpe[..., :self.kv_lora_rank].contiguous(), params, out_dtype = torch.half
-        )
-        k_pe = ckv_kpe[..., self.kv_lora_rank:].reshape(bsz, seqlen, 1, self.qk_rope_head_dim).contiguous()
-        _dbg_sync("kv_a_layernorm+slice", x.device)
-
-        if self.rope is not None:
-            q_pe, k_pe = self.rope.apply(
-                q_pe, k_pe, position, positions, position_ids, True,
-                None, None, self.norm_eps, 0.0, inv_freq,
-            )
-            _dbg_sync("rope", x.device)
-
         use_mha = seqlen > MAX_DECODE_QLEN and _prefill_mode == "mha" and causal and not sparse
-        if not use_mha:
-            # Absorb W_UK into the queries, per head, straight from the flat layout. This runs as
-            # a Triton kernel rather than a cuBLAS batched GEMM: the strided-batched fp16 form
-            # made cuBLAS pick an SM120 nvjet TMA kernel that intermittently MMU-faults (caught
-            # with cuda-gdb after presenting as flaky illegal-memory-access crashes whose
-            # incidence tracked allocation layout), and the kernel reads any strides for free
-            q_lat = mla_absorb(q.view(R, H, self.qk_head_dim), self.w_uk_flat, H, self.qk_nope_head_dim)
-            q_pe_hm = q_pe.reshape(R, H, self.qk_rope_head_dim).permute(1, 0, 2).contiguous()
+        # EXL3_BIG_TAIL_DENSE=1: a sparse prefill chunk that starts below index_topk (the big first
+        # chunk of EXL3_PREFILL_BIG_TAIL) splits at the first row whose causal span exceeds the
+        # budget. Rows [0, head) see <= index_topk keys, where top-k selects everything, so they
+        # take the dense MHA path exactly as the 2048-row policy's first chunk does; rows
+        # [head, seqlen) keep DSA with the chunk's full indexer selection
+        head = 0
+        if sparse and bsz == 1 and seqlen > MAX_DECODE_QLEN and _prefill_mode == "mha" and \
+                "_mla_pre" not in params and not params.get("_mla_defer_post") and \
+                os.environ.get("EXL3_BIG_TAIL_DENSE", "0") == "1":
+            head = self.index_topk - int(host_seqlens[0])
+            if not (MAX_DECODE_QLEN < head < seqlen):
+                head = 0
+        # Piecewise block graph (block_graph.py) runs the projections as a captured segment and
+        # hands their outputs in; otherwise compute them here
+        pre = params.pop("_mla_pre", None)
+        if pre is None or use_mha:
+            pre = self._attend_pre(x, bsz, seqlen, params, position, positions, position_ids,
+                                   inv_freq, use_mha, absorb_row0 = head)
+        q, q_resid, q_pe, ckv, k_pe, q_lat, q_pe_hm = pre
 
         append(ckv, k_pe)
 
@@ -819,6 +1222,14 @@ class MLAttention(Module):
                 idx_layer.update_idx_direct(cache_seqlens, block_table, k_idx, seqlen)
                 if self.index_kpool:
                     self._update_pool_plane(idx_layer, block_table, host_seqlens, seqlen)
+
+        # EXL3_PF_SKIP: kv_only -- the caller wants the K/V rows just appended (and the indexer
+        # key/pool planes written above) and nothing else. The MTP draft's prompt prefill is the
+        # one such caller: the next draft step only attends over this cache, and prefill_ls
+        # discards the block's own output anyway. Returning None here skips the indexer top-k,
+        # the attention, o_proj and, in TransformerBlock, the whole MoE half.
+        if params.get("kv_only"):
+            return None
 
         if sparse:
             if self.indexer_mode == "full":
@@ -843,9 +1254,13 @@ class MLAttention(Module):
                 assert indices is not None, \
                     "shared-indexer DSA layer found no top-k selection in params"
                 indices = to_device(indices, x.device)
+            if head:
+                return self._attend_split(q, q_pe, q_lat, head, seqlen, params, ckv_cache,
+                                          kpe_cache, block_table, host_seqlens, indices, qc)
             return self._attend_sparse(
                 q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, indices, qc,
                 pool_len = max(host_seqlens) + seqlen,
+                pool_lens = [int(h) + seqlen for h in host_seqlens],
             )
 
         if use_mha:
@@ -864,10 +1279,47 @@ class MLAttention(Module):
                 qc = qc,
             )
             o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-            return self.o_proj.forward(o, params)
+            return self._dec_proj(self.o_proj, o, params)
 
         kernel = mla_attn_triton_decode if seqlen <= MAX_DECODE_QLEN else mla_attn_triton_prefill
         extra = {}
+        if (1 < bsz * seqlen <= _rowloop_max() and EXL3_MLA_ATTN_ROWLOOP and
+                (bsz == 1 or ROW_INV["on"]) and causal and params.get("dflash_verify")):
+            # Verify rows as one-row decodes (row r of job b sees its cache + r + 1 keys): the q_len = 2+
+            # tile layout (block_h 8 x block_m 2, other split count) rounds row 0 differently from the
+            # plain q_len = 1 decode; this keeps every row bitwise equal to plain decode. With several
+            # jobs each row also gets its own job's cache length and its own block table width: the
+            # split layout follows the table width (max over the batch otherwise), see _row_table
+            o_lat = torch.empty_like(q_lat)
+            for b in range(bsz):
+                if bsz == 1:
+                    bt_b, cs_b = block_table, cache_seqlens
+                else:
+                    bt_b = self._row_table(params, block_table, b, _host_seqlens(params, cache_seqlens), seqlen)
+                    cs_b = cache_seqlens[b : b + 1]
+                for r in range(seqlen):
+                    kw = {}
+                    if host_cuts():
+                        # The kernel allocates its own out per row otherwise (one at::empty per
+                        # row per layer per round). Same shape, same dtype, fully overwritten by
+                        # the split/combine kernel pair, so a persistent per-layer buffer is
+                        # indistinguishable from the fresh one.
+                        from ..util.tensor import g_tensor_cache
+                        shape = (q_lat.shape[0], 1, q_lat.shape[-1])
+                        kw["out"] = g_tensor_cache.get(
+                            q_lat.device, shape, q_lat.dtype, f"mla_row_out_{self.layer_idx}")
+                    i = b * seqlen + r
+                    o_r = kernel(
+                        q_lat[:, i : i + 1].contiguous(), q_pe_hm[:, i : i + 1].contiguous(),
+                        ckv_cache, kpe_cache, bt_b, cs_b,
+                        bsz = 1, q_len = 1, causal = causal, softmax_scale = self.sm_scale,
+                        pre_appended_len = r + 1, qc = qc,
+                        **kw,
+                    )
+                    o_lat[:, i : i + 1].copy_(o_r)
+            if params.get("_mla_defer_post"):
+                return o_lat
+            return self.attend_post(o_lat, bsz, seqlen, params)
         o_lat = kernel(
             q_lat, q_pe_hm, ckv_cache, kpe_cache, block_table, cache_seqlens,
             bsz = bsz, q_len = seqlen,
@@ -887,15 +1339,99 @@ class MLAttention(Module):
                     f"MLA debug: non-finite attention output, layer {self.layer_idx}, "
                     f"{bad}/{o_lat.numel()} elements, bsz={bsz} seqlen={seqlen} dev={o_lat.device}")
 
-        # Unfold W_UV per head from the flat layout; the kernel emits token-major output, so it
-        # feeds o_proj without a permute
+        if params.get("_mla_defer_post"):
+            return o_lat
+        return self.attend_post(o_lat, bsz, seqlen, params)
+
+
+    @staticmethod
+    def _row_table(params, block_table, b, host_seqlens, seqlen):
+        """Block table of job b alone, as a contiguous (1, w) tensor, once per forward and shared by
+        the layers. w is the width the job's own solo forward would have (the generator puts it in
+        params["dflash_table_pages"]): the MLA decode kernel derives its KV split from the table width,
+        so a row next to a longer neighbour would sum in different groups than alone."""
+        tabs = params.setdefault("_mla_row_tabs", {})
+        key = (b, block_table.data_ptr())
+        t = tabs.get(key)
+        if t is None:
+            pages = params.get("dflash_table_pages")
+            w = block_table.shape[1] if pages is None else min(int(pages[b]), block_table.shape[1])
+            t = block_table[b : b + 1, :w].contiguous()
+            # the narrower table must still cover the job's context: the kernel indexes it by page
+            _check_block_table(t, [host_seqlens[b]], seqlen)
+            tabs[key] = t
+        return t
+
+
+    def attend_post(self, o_lat, bsz, seqlen, params):
+        """Unfold W_UV per head from the flat layout (the kernel emits token-major output, so it
+        feeds o_proj without a permute), then o_proj. Context-length independent; the piecewise
+        block graph captures it with the MLP half."""
+        k = self.num_q_heads * self.v_head_dim
+        pitch = self._nc2_o_pitch(o_lat.shape[1], params)
+        if pitch:
+            buf = torch.empty((o_lat.shape[1], pitch), dtype = torch.half, device = o_lat.device)[:, :k]
+            mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim, out = buf)
+            return self._dec_proj(self.o_proj, buf.view(bsz, seqlen, k), params)
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
-        o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        o = o.reshape(bsz, seqlen, k)
+        return self._dec_proj(self.o_proj, o, params)
+
+    def _nc2_o_pitch(self, rows: int, params: dict) -> int:
+        """EXL3_NC2_MLA_OPAD (default off): row pitch for the o_proj input so the unfold writes it padded and o_proj
+        skips its pad_copy_in (same values, bit-exact). 0 = dense."""
+        if os.environ.get("EXL3_NC2_MLA_OPAD", "0") != "1" or self.o_proj is None:
+            return 0
+        from .quant.exl3 import row_pad_pitch
+        return row_pad_pitch(self.o_proj, self.num_q_heads * self.v_head_dim, rows, params)
+
+
+    def _attend_split(self, q, q_pe, q_lat, head, seqlen, params, ckv_cache, kpe_cache,
+                      block_table, host_seqlens, indices, qc):
+        """Batch-1 chunk split at `head` (see _attend): dense MHA prefill for rows [0, head)
+        against the first host_seqlens[0] + head keys, DSA for the rest (q_lat already holds
+        only the tail rows). The two halves meet before one o_proj."""
+        from .attention_fn.dsa_triton import dsa_attn
+        H = self.num_q_heads
+        D_r = self.qk_rope_head_dim
+        R = seqlen
+        tail = seqlen - head
+        q = q.view(R, H, self.qk_head_dim)
+        q_pe = q_pe.reshape(R, H, D_r)
+        qh = q[:head]
+        qh[:, :, self.qk_nope_head_dim:] = q_pe[:head]
+        pitch = self._nc2_o_pitch(R, params)
+        if pitch:
+            o2 = torch.empty((R, pitch), dtype = torch.half, device = q.device)[:, :H * self.v_head_dim]
+            o = o2.view(R, H, self.v_head_dim)
+        else:
+            o = torch.empty((R, H, self.v_head_dim), dtype = torch.half, device = q.device)
+        o[:head] = mla_attn_triton_prefill_mha(
+            qh,
+            self.w_uk_flat, self.w_uv_flat,
+            ckv_cache, kpe_cache, block_table, host_seqlens,
+            1, head, self.v_head_dim, self.qk_nope_head_dim, self.sm_scale,
+            pre_appended_len = head,
+            qc = qc,
+        )
+        o_lat = dsa_attn(
+            q_lat, ckv_cache, kpe_cache, block_table,
+            indices = indices[head:], k_len = indices.shape[1],
+            scale = self.sm_scale, page_size = ckv_cache.shape[1],
+            q_pe = q_pe[head:], out_latent = True,
+            qc = qc,
+            pool_len = int(host_seqlens[0]) + seqlen,
+        )
+        if pitch:
+            mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim, out = o2[head:])
+            return self._dec_proj(self.o_proj, o2.view(1, seqlen, H * self.v_head_dim), params)
+        o[head:] = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim).view(tail, H, self.v_head_dim)
+        o = o.view(1, seqlen, H * self.v_head_dim)
+        return self._dec_proj(self.o_proj, o, params)
 
 
     def _attend_sparse(self, q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache,
-                       block_table, indices, qc, pool_len = 0):
+                       block_table, indices, qc, pool_len = 0, pool_lens = None):
         """Gathered attention over the top-k selected latent rows (V3.2-on-MLA form of
         dsa_attn: no window, no sinks, V is the latent). The chunk's own rows are already in
         the paged pool (fp16 or packed-quantized; the packed form is dequantized online by the
@@ -910,22 +1446,39 @@ class MLAttention(Module):
         R = bsz * seqlen
         D_r = self.qk_rope_head_dim
 
-        # A single-row block table is shared by every query row inside dsa_attn (stride-0
-        # lookup), so bsz 1 never materializes the (R, pages) expansion which would other-
-        # wise be the one sparse-path transient that grows with context (pages)
-        bt = block_table if bsz == 1 or seqlen == 1 \
-            else block_table.repeat_interleave(seqlen, dim = 0)
-        o_lat = dsa_attn(
-            q_lat, ckv_cache, kpe_cache, bt,
-            indices = indices, k_len = indices.shape[1],
-            scale = self.sm_scale, page_size = ckv_cache.shape[1],
-            q_pe = q_pe.reshape(R, H, D_r), out_latent = True,
-            qc = qc,   # packed latent pages read online (scales, bits), or staged for prefill
-            pool_len = pool_len,   # entries the selection can reference (context, not pool)
-        )
-        o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
-        o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        if bsz > 1 and seqlen <= MAX_DECODE_QLEN and ROW_INV["on"] and os.environ.get("EXL3_DSA_ATTN_ROWLOOP", "1") != "0":
+            # Row invariance (issue 28; EXL3_DSA_ATTN_ROWLOOP=0 = the batched call): the gathered-attention launcher picks its kernel and split layout from the row
+            # count (R <= 4 the dt kernel, R <= 8 the split kernel with another tile, more rows one pass), so the same
+            # job rounds differently next to another job than alone. One call per job, exactly the solo call.
+            outs = []
+            for b in range(bsz):
+                r0, r1 = b * seqlen, (b + 1) * seqlen
+                outs.append(dsa_attn(
+                    q_lat[:, r0:r1].contiguous(), ckv_cache, kpe_cache, block_table[b : b + 1],
+                    indices = indices[r0:r1], k_len = indices.shape[1],
+                    scale = self.sm_scale, page_size = ckv_cache.shape[1],
+                    q_pe = q_pe.reshape(R, H, D_r)[r0:r1], out_latent = True,
+                    qc = qc,
+                    pool_len = pool_lens[b] if pool_lens is not None else pool_len,
+                ))
+            o_lat = torch.cat(outs, dim = 1)
+        else:
+            # A single-row block table is shared by every query row inside dsa_attn (stride-0
+            # lookup), so bsz 1 never materializes the (R, pages) expansion which would other-
+            # wise be the one sparse-path transient that grows with context (pages)
+            bt = block_table if bsz == 1 or seqlen == 1 \
+                else block_table.repeat_interleave(seqlen, dim = 0)
+            o_lat = dsa_attn(
+                q_lat, ckv_cache, kpe_cache, bt,
+                indices = indices, k_len = indices.shape[1],
+                scale = self.sm_scale, page_size = ckv_cache.shape[1],
+                q_pe = q_pe.reshape(R, H, D_r), out_latent = True,
+                qc = qc,   # packed latent pages read online (scales, bits), or staged for prefill
+                pool_len = pool_len,   # entries the selection can reference (context, not pool)
+            )
+        if params.get("_mla_defer_post"):
+            return o_lat
+        return self.attend_post(o_lat, bsz, seqlen, params)
 
 
     def decode_flash_attn(
@@ -951,7 +1504,9 @@ class MLAttention(Module):
         # including per-step declines (missing shared selection)
         if (
             seqlen <= MAX_DECODE_QLEN and bsz <= _bc_max_bsz and
-            params.get("causal", True) and params.get("inv_freq") is None
+            params.get("causal", True) and params.get("inv_freq") is None and
+            # piecewise block graph (block_graph.py) wants the latent output, not o_proj's
+            not params.get("_mla_defer_post")
         ):
             y = self.bc_mla_step(x, params, layer, block_table, cache_seqlens)
             if y is not None:
@@ -971,6 +1526,7 @@ class MLAttention(Module):
         # layers via the params dict; free when the generator passes host cache_seqlens
         if seqlen > MAX_DECODE_QLEN or self.indexer_mode is not None:
             host_seqlens = _host_seqlens(params, cache_seqlens)
+            _check_block_table(block_table, host_seqlens, seqlen)
         else:
             host_seqlens = None
 

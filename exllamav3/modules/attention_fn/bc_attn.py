@@ -126,7 +126,7 @@ class BCAttn:
         self.num_kv_heads = module.num_kv_heads
         self.hidden_size = module.hidden_size
         self.sm_scale = module.sm_scale
-        self.window_size = module.sliding_window
+        self.window_size = module.window_arg() if hasattr(module, "window_arg") else module.sliding_window
         self.softcap = module.logit_softcapping
 
         self.quant = k_bits > 0
@@ -504,7 +504,9 @@ class BCAttn:
             # Quantized K/V: the gather reads the packed pages through the shared QC
             # loaders (scales + H32 appended to the runtime args, same as the dense slots)
             ct = "*i32" if self.quant else "*fp16"
-            k_sp_split = _compile_kernel(dev, _qsa_sparse_split_kernel,
+            from .qsa_triton import QSA_PIPE, QSA_PIPE_NW, _qsa_sparse_split_pipe_kernel
+            use_pipe = QSA_PIPE and self.k_bits == 0 and self.v_bits == 0 and block_n == 32
+            k_sp_split = _compile_kernel(dev, _qsa_sparse_split_pipe_kernel if use_pipe else _qsa_sparse_split_kernel,
                 {"q": "*fp16", "k_cache": ct, "v_cache": ct, "block_table": "*i32",
                  "indices": "*i32", "partial_o": "*fp32", "partial_ml": "*fp32",
                  "k_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
@@ -516,7 +518,7 @@ class BCAttn:
                      page_size = PAGE_SIZE, head_dim = self.head_dim, K_pad = k_pad,
                      scale = float(self.sm_scale), BLOCK_H = block_h, BLOCK_N = block_n,
                      PAGED = 1, QCK = self.k_bits, QCV = self.v_bits),
-                4, 2)
+                QSA_PIPE_NW if use_pipe else 4, 2)
 
             k_sp_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel,
                 {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
@@ -637,6 +639,9 @@ def _module_eligible(m):
             (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None) or
             BCAttn._fp16_gate_weight(m.g_proj) is not None) and
         (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
+        # Asymmetric V head dim (MiMo-V2): the captured block feeds the attention output
+        # straight into o_proj, with no place to trim the padded V lanes
+        getattr(m, "v_head_dim", m.head_dim) == m.head_dim and
         # TP shards are eligible: the shard owns its split cache layers directly (the opaque cache
         # handle is resolved before bc_attn_step) and the output all-reduce runs after the captured
         # block returns. Span-heads norms stay declined (cross-rank norm inside the block)
@@ -711,6 +716,18 @@ def build_bc_attn(module, layer):
             layer.raw_k.device == torch.device(m.device)
         ))
     ):
+        if _bc_trace:
+            print(" -- BC-attn why2:", dict(en=bc_attn_enable, qsa=bool(_qsa_module_eligible(m)),
+                  q=getattr(m.q_proj, "quant_type", None), qbc=getattr(getattr(m.q_proj, "inner", None), "bc", None) is not None,
+                  o=getattr(m.o_proj, "quant_type", None), obc=getattr(getattr(m.o_proj, "inner", None), "bc", None) is not None,
+                  k=getattr(m.k_proj, "quant_type", None), kbc=getattr(getattr(m.k_proj, "inner", None), "bc", None) is not None,
+                  mkv=m.multi_kv is not None, vd=getattr(m, "v_head_dim", None), hd=m.head_dim,
+                  gate=(m.headwise_gate, m.full_gate, getattr(m, "interleaved_gate", False)),
+                  qn=type(m.q_norm).__name__, kn=type(getattr(m, "k_norm", None)).__name__, vn=type(m.v_norm).__name__))
+            print(f" -- BC-attn why: module_eligible={bool(_module_eligible(m))} layer={type(layer).__name__}"
+                  f" compand={getattr(layer, 'compand_a', None)} qk_dev={getattr(getattr(layer, 'qk', None), 'device', None)}"
+                  f" k_dev={getattr(getattr(layer, 'k', None), 'device', None)} m_dev={m.device}"
+                  f" raw_k_dev={getattr(getattr(layer, 'raw_k', None), 'device', None)}")
         _trace_build(m, None, "attn")
         return None
     if isinstance(layer, CacheLayer_quant):

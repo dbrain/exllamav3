@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import weakref
 
@@ -184,8 +185,8 @@ class Glm5NextMTPModel(Model):
     def attach_to(self, target):
         """
         Bind to target model: borrow embed_tokens / lm_head and tell the target to export its
-        hidden state. hnorm consumes the trunk's POST-final-norm state (mean-collapsed hc
-        streams through model.norm)
+        hidden state. hnorm consumes the trunk's mean-collapsed hc streams; which point of that
+        path is tapped (before or after model.norm) follows EXL3_MTP_PRENORM_H, default OFF.
         """
         self.input_layer.attached_model = weakref.ref(target)
         self.attached_model = weakref.ref(target)
@@ -206,9 +207,62 @@ class Glm5NextMTPModel(Model):
         target_norm = target.modules[target.logit_layer_idx - 1]
         assert isinstance(target_norm, RMSNorm), \
             "Expected target final RMSNorm immediately before lm_head"
+
+        # EXL3_MTP_PRENORM_H (default OFF): the reference formula (llama.cpp
+        # build_glm5next_mtp, glm5next.cpp:841-883) feeds hnorm the mean-collapsed hc streams
+        # from BEFORE model.norm -- t_h_nextn is assigned pre-output_norm. exl3 by default taps
+        # the post-norm state, i.e. hnorm sees an already-normalised input. When the flag is on,
+        # tap the HyperHead (mean collapse) instead: its internal norm key
+        # f"{hc_head}.norm" rides the same export_state_norm_keys plumbing.
+        tap_key = target_norm.key
+        if os.getenv("EXL3_MTP_PRENORM_H", "0") == "1":
+            from exllamav3.modules.hyperconnections import HyperHead
+            for m in target.modules[target.logit_layer_idx::-1]:
+                if isinstance(m, HyperHead) and m.mean:
+                    tap_key = m.norm.key
+                    break
+            else:
+                raise RuntimeError("EXL3_MTP_PRENORM_H=1 but no mean HyperHead before lm_head")
+
         self.draft_verifier_params = {
-            "export_state_norm_keys": {target_norm.key},
+            "export_state_norm_keys": {tap_key},
         }
+        self.load_eh_proj_sidecar()
+
+
+    def load_eh_proj_sidecar(self, path: str | None = None):
+        """
+        EXL3_MTP_EH_FP16=<safetensors> (default OFF): replace the quantized eh_proj with the
+        unquantized weight from a sidecar file (key "<prefix>.layers.<n>.eh_proj.weight",
+        [out, in] = [H, 2H], bf16/fp16, e.g. from the HF checkpoint via
+        tools/glm/mtp_eh_sidecar.py). td205 stores eh_proj at mtp_bits = 2; on real MTP inputs
+        its output has cos ~0.78 vs the bf16 weight, which costs ~0.1 of draft acceptance.
+       The fp16 weight is 64 MiB, read once per draft forward.
+        """
+        path = path if path is not None else os.getenv("EXL3_MTP_EH_FP16", "")
+        if not path or path == "0":
+            return False
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"EXL3_MTP_EH_FP16={path}: sidecar missing (tools/glm/mtp_eh_sidecar.py)")
+        from safetensors import safe_open
+        from ..modules.quant.fp16 import LinearFP16
+        fc = self.input_layer.fc
+        assert fc.inner is not None, "EXL3_MTP_EH_FP16: load the MTP model before attach_to"
+        with safe_open(path, "pt") as f:
+            keys = [k for k in f.keys() if k.endswith("eh_proj.weight")]
+            assert len(keys) == 1, f"EXL3_MTP_EH_FP16: expected one eh_proj.weight in {path}, got {keys}"
+            w = f.get_tensor(keys[0])
+        assert tuple(w.shape) == (fc.out_features, fc.in_features), \
+            f"EXL3_MTP_EH_FP16: eh_proj shape {tuple(w.shape)} != {(fc.out_features, fc.in_features)}"
+        w = w.to(fc.device).half().t().contiguous()
+        fc.inner = LinearFP16(
+            fc.in_features, fc.out_features, w, None,
+            fc.in_features, fc.out_features, 0, 0,
+            out_dtype = fc.out_dtype, key = fc.key,
+        )
+        fc.quant_type = "fp16"
+        return True
 
 
     def default_load_shape_dtype(self, chunk_size):
@@ -227,7 +281,20 @@ class Glm5NextMTPModel(Model):
         ll = self.attached_model().logit_layer_idx
         lm = self.attached_model().modules[ll]
         logits = lm.prepare_for_device(state, params)
+        # EXL3_DRAFT2S: two-stage draft head (modules/draft2s.py) for 1-row draft steps (not for sampled jobs: they need the full law); conf = the exact argmax logit
+        lead = logits.shape[:-1]
+        if lead.numel() == 1 and os.environ.get("EXL3_DRAFT2S") and not params.get("export_draft_logits"):
+            from ..modules import draft2s
+            d2s = draft2s.head_for(lm, self.attached_model().config.vocab_size)
+            if d2s is not None:
+                ids, p, conf = d2s(logits)
+                params["draft_p"] = p.clone()
+                if params.get("export_draft_conf"):
+                    params["draft_conf"] = conf.clone().view(lead)
+                return ids.clone().view(lead)
         logits = lm.forward(logits, params)
+        if params.get("export_draft_logits"):
+            params["draft_logits"] = logits   # spec_sample: the drafter's law for sampled jobs
         if params.get("export_draft_conf"):
             # Per-position confidence for the generator's draft truncation: the argmax logit
             # value, over the unpadded vocabulary

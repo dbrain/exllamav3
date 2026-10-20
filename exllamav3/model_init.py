@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 from . import Model, Config, Cache, Tokenizer
@@ -321,6 +322,19 @@ def init(
     else:
         split = [float(alloc) for alloc in args.gpu_split.split(",")]
 
+    # Unified-memory escape hatch (NVIDIA GB10 / DGX Spark). Both autosplit and use_per_device
+    # go through Model._load_autosplit, whose per-module headroom check is
+    #     reusable = torch.cuda.mem_get_info().free + reserved - allocated
+    # and on unified memory mem_get_info() reports MemFree, not MemAvailable -- so a growing
+    # page cache makes an 87 GiB model that comfortably fits look unloadable. Setting
+    # EXL3_LOAD_DEVICE=cuda:0 takes Model._load_single, which does no budget arithmetic.
+    single_device = os.environ.get("EXL3_LOAD_DEVICE", "").strip() or None
+    if single_device and not args.tensor_parallel:
+        printp(not quiet, f" -- EXL3_LOAD_DEVICE={single_device}: single-device load, no autosplit")
+        split = None
+    else:
+        single_device = None
+
     # Parallelism options
     tp_options = {
         "moe_tensor_split": args.tp_moe_tensor_split
@@ -345,7 +359,7 @@ def init(
     if draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
-            use_per_device = split,
+            **({"device": single_device} if single_device else {"use_per_device": split}),
             progressbar = progress,
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,
@@ -357,7 +371,7 @@ def init(
     # Load model
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
-        use_per_device = split,
+        **({"device": single_device} if single_device else {"use_per_device": split}),
         tensor_p = args.tensor_parallel,
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,

@@ -39,6 +39,25 @@ class DraftConfidenceCalibrator:
         self.cached_threshold = None
 
 
+    def load_prior(self, path: str, weight: float = 200.0):
+        """
+        Seed the bins from a labelled table recorded offline for this drafter (json written by
+        dump()). Counts are rescaled to `weight` total labels so online data takes over within a
+        few hundred rounds. With a prior the burn-in is already satisfied.
+        """
+        import json
+        with open(path) as f:
+            d = json.load(f)
+        assert abs(d["bin_width"] - self.bin_width) < 1e-9
+        tot = sum(v[0] for v in d["bins"].values())
+        k = weight / max(tot, 1.0)
+        self.bins = {int(i): [v[0] * k, v[1] * k] for i, v in d["bins"].items()}
+        self.total = weight
+        self.cached_threshold = None
+
+    def dump(self) -> dict:
+        return {"bin_width": self.bin_width, "bins": {str(i): v for i, v in sorted(self.bins.items())}}
+
     def add_label(self, score: float, accepted: bool):
         idx = math.floor(score / self.bin_width)
         b = self.bins.get(idx)

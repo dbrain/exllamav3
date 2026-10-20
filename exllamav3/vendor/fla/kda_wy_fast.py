@@ -6,6 +6,8 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -126,6 +128,29 @@ def recompute_w_u_fwd_kda_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), mask=m_tk)
 
 
+def _jit_of(kern):
+    """The bare JITFunction under @heuristics/@autotune wrappers."""
+    while not isinstance(kern, triton.runtime.jit.JITFunction):
+        kern = kern.fn
+    return kern
+
+
+def kda_tune_cfg():
+    """EXL3_KDA_TUNE (read per call): fixed launch configs for the KDA intra kernels instead
+    of the vendored autotune (whose cached pick on gfx1151 is num_warps 2: 256 VGPRs and
+    500-800 spills on both kernels). "0" = autotune (vendor behaviour), "1" = default
+    (32, 4, 4, 1): inter_solve at 4 warps (faster, not bit-exact vs the autotuned 2 warps: PPL
+    +0.005 %, gated in mla-prefill step 3; "32:2:4:1" = old, bit-exact with logs-r28),
+    recompute_w_u at 4 warps (400 spills instead of 807, 8.0 -> 6.2 ms, bit-exact),
+    "IS_BK:IS_NW:WU_NW:WU_NS" = sweep. Returns None for autotune."""
+    f = os.environ.get("EXL3_KDA_TUNE", "1")
+    if f == "0":
+        return None
+    if ":" in f:
+        return tuple(int(x) for x in f.split(":"))
+    return (32, 4, 4, 1)
+
+
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -150,6 +175,15 @@ def recompute_w_u_fwd(
     u = torch.empty_like(v)
     qg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype) if q is not None else None
     kg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype)
+    cfg = kda_tune_cfg()
+    if cfg is not None:
+        _jit_of(recompute_w_u_fwd_kda_kernel)[(NT, B*HV)](
+            q, k, qg, kg, v, beta, w, u, A, gk, cu_seqlens, chunk_indices, T,
+            H=H, HV=HV, K=K, V=V, BT=BT, BK=BK, BV=BV,
+            STORE_QG=qg is not None, STORE_KG=kg is not None, IS_VARLEN=cu_seqlens is not None,
+            num_warps=cfg[2], num_stages=cfg[3],
+        )
+        return w, u, qg, kg
     recompute_w_u_fwd_kda_kernel[(NT, B*HV)](
         q=q,
         k=k,

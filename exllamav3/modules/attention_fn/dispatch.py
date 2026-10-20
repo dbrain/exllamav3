@@ -97,6 +97,7 @@ def attn_dispatch(
     sinks: torch.Tensor | None = None,
     dispatch_cache: dict | None = None,
     max_kv_len: int | None = None,
+    v_dim: int | None = None,
 ):
     """
     Select and run the first compatible attention implementation for the supplied tensors.
@@ -128,7 +129,9 @@ def attn_dispatch(
             q_cache = layer.get_qkv()
             k_cache, v_cache = None, None
         else:
-            k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, window_size if window_size is not None else -1)
+            # Only the left bound governs how much of the paged cache has to be fetched
+            _wl = window_size[0] if isinstance(window_size, tuple) else window_size
+            k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, _wl if _wl is not None else -1)
     else:
         k_cache, v_cache = None, None
 
@@ -152,6 +155,7 @@ def attn_dispatch(
         q_cache,
         sinks,
         max_kv_len = max_kv_len,
+        v_dim = v_dim,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache

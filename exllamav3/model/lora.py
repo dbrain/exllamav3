@@ -176,6 +176,13 @@ class LoRA:
                 target.lora_b_tensors[self] = tensor
 
             self.target_modules[module_key] = target
+            ancestor_key = module_key
+            while "." in ancestor_key:
+                ancestor_key = ancestor_key.rsplit(".", 1)[0]
+                ancestor = model.modules_dict.get(ancestor_key)
+                invalidate = getattr(ancestor, "invalidate_hip_grouped_for_lora", None)
+                if invalidate is not None:
+                    invalidate(target)
             loaded += 1
 
         print(

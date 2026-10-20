@@ -438,7 +438,7 @@ class SafetensorsCollection:
             new_tensor_files = [directory]
         else:
             st_pattern = os.path.join(directory, "*.safetensors")
-            new_tensor_files = glob.glob(st_pattern)
+            new_tensor_files = sorted(glob.glob(st_pattern))   # deterministic: a later file overrides (zz-ablit-* overlays)
         self.tensor_files += new_tensor_files
 
         overrides = 0
@@ -876,6 +876,43 @@ class SafetensorsCollection:
             ext.stloader_close_file(h)
             self.handles[filename] = None
 
+    def drop_page_cache(self, verbose: bool = False) -> int:
+        """
+        posix_fadvise(POSIX_FADV_DONTNEED) every shard this collection knows about, dropping
+        their clean pages from the OS page cache. Returns the number of bytes advised.
+
+        This matters on unified-memory hosts (NVIDIA GB10 / DGX Spark): `stloader` reads the
+        shards with buffered pread, so right after loading an 87 GiB model the *same* 87 GiB
+        is also resident as clean page cache -- in the *same* physical pool the weights now
+        occupy. `torch.cuda.mem_get_info()` reports MemFree, not MemAvailable, so nothing in
+        the process can see the squeeze; the driver eventually returns NV_ERR_NO_MEMORY and
+        the box has to be power-cycled. The pages are reclaimable in principle, but reclaim
+        does not keep up with a large CUDA allocation, so drop them explicitly.
+
+        No-op on platforms without posix_fadvise (Windows), and harmless anywhere else: these
+        are read-only weight files, so nothing is dirty and nothing is lost but re-read cost.
+        """
+        if not hasattr(os, "posix_fadvise"):
+            return 0
+        total = 0
+        for filename in self.tensor_files:
+            try:
+                fd = os.open(filename, os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                total += os.fstat(fd).st_size
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
+        if verbose:
+            print(f" -- Dropped page cache for {len(self.tensor_files)} files "
+                  f"({total / 1024 ** 3:.1f} GiB)")
+        return total
+
+
     def close(self):
         assert self.new_tensors is None
         if self.first_open_time is not None:
@@ -1198,6 +1235,11 @@ class VariantSafetensorsCollection(SafetensorsCollection):
     def close(self):
         for stc in [s for _, _, s in self.stcs] + [self.main]:
             stc.close()
+
+
+    def drop_page_cache(self, verbose: bool = False) -> int:
+        return sum(stc.drop_page_cache(verbose) for stc in
+                   [s for _, _, s in self.stcs] + [self.main])
 
 
     def max_key_len(self):

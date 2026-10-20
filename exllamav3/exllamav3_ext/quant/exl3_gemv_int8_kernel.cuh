@@ -4,18 +4,37 @@
 // comp_units/exl3_gemv_int8_inst_*.cu; the host code in exl3_gemv_int8.cu includes this header only
 // for the launch-geometry constants and __host__ __device__ helpers
 
+#if defined(USE_ROCM)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+#include <hip/hip_cooperative_groups.h>
+#else
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
-#include <cstdio>
 #include <cooperative_groups.h>
+#endif
+#include <cstdio>
 #include "../util.h"
-#include "../util.cuh"
-#include "../ptx.cuh"
+#include "../util.cuh"   // ROCm: pulls in compat.cuh -> compat_rocm.cuh (shfl_*_sync, FSHF_IMM, BFE16_IMM)
+#if !defined(USE_ROCM)
+#include "../ptx.cuh"    // CUDA-only PTX helpers (cp.async, bfe/shf asm)
+#endif
 #include "exl3_dq.cuh"
 #include "hadamard_inner.cuh"
 
 namespace cg_gemv = cooperative_groups;
+
+#if defined(USE_ROCM)
+// HIP only provides __ldcg for half/half2. The sq epilogue reads per-slice partials written by
+// OTHER workgroups after a counter handshake; a relaxed agent-scope atomic load is the HIP
+// equivalent of the L1-bypassing (.cg) load (RDNA's per-CU L0/L1 is not coherent across CUs).
+__device__ __forceinline__ int __ldcg(const int* p)
+{
+    return __hip_atomic_load(const_cast<int*>(p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+#endif
 
 // Fused int8-activation GEMV for mul1 (cb 2) tensors, single cooperative launch.
 //
@@ -59,9 +78,16 @@ namespace cg_gemv = cooperative_groups;
 
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 {
+#if defined(USE_ROCM)
+    // v_dot4_i32_iu8: mixed-sign 4x int8 dot with int32 accumulate. Builtin signature is
+    // (a_signed, a, b_signed, b, c, clamp); dp4a.u32.s32 is (unsigned a) . (signed b). Verified on
+    // gfx1151: sudot4(false, 0xFF010203, true, 0xFE0102FF, 0) == -508
+    return __builtin_amdgcn_sudot4(false, a, true, b, c, false);
+#else
     int d;
     asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
     return d;
+#endif
 }
 
 // i0/i2 land in [0, 2*words); a compare+subtract replaces the modulo (words is not a power of two for
@@ -672,6 +698,11 @@ __device__ __forceinline__ void gemv_int8_unit_smem
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
     uint32_t* sb = sh_b + warp * (D * pairwords);
 
+    int c2 = 2 * (lane & 3);
+    int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
+    int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
+
+#if !defined(USE_ROCM)
     auto stage_row = [&] (int kb)
     {
         if (kb < nrows && lane < chunks)
@@ -680,10 +711,6 @@ __device__ __forceinline__ void gemv_int8_unit_smem
     };
     #pragma unroll
     for (int r = 0; r < D - 1; ++r) stage_row(r);
-
-    int c2 = 2 * (lane & 3);
-    int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
-    int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
 
     for (int kb = 0; kb < nrows; ++kb)
     {
@@ -697,6 +724,35 @@ __device__ __forceinline__ void gemv_int8_unit_smem
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
+#else
+    // RDNA has no async global->LDS copy in this form; stage through registers instead. Same ring
+    // layout (D rows of pairwords per warp) so gemv_int8_pair_row is untouched. Row kb+D-1 is
+    // loaded into a register at the top of iteration kb and written to its ring slot at the top of
+    // iteration kb+1 (a full iteration of compute hides the load latency); that slot was last read
+    // in iteration kb-1, ordered by the wave barrier. Lane-private register, wave-uniform control.
+    #pragma unroll
+    for (int r = 0; r < D - 1; ++r)
+        if (r < nrows && lane < chunks)
+            *(uint4*) (sb + r * pairwords + lane * 4) = *(const uint4*) (bp + (size_t) r * row_stride + lane * 4);
+    uint4 pre = make_uint4(0, 0, 0, 0);
+
+    for (int kb = 0; kb < nrows; ++kb)
+    {
+        // Orders the previous iteration's smem reads before the ring-slot overwrite below, and
+        // makes the prologue/previous stores visible to every lane
+        __syncwarp();
+        if (kb > 0 && kb + D - 2 < nrows && lane < chunks)
+            *(uint4*) (sb + ((kb + D - 2) % D) * pairwords + lane * 4) = pre;
+        if (kb + D - 1 < nrows && lane < chunks)
+            pre = *(const uint4*) (bp + (size_t) (kb + D - 1) * row_stride + lane * 4);
+        __syncwarp();
+
+        const uint32_t* blockA = sb + (kb % D) * pairwords;
+        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+            sh_as + (kb << 4), slice_stride, c2, lane << 3,
+            ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+    }
+#endif
     gemv_int8_pair_tail<M, residual, atomic>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
 }
 
@@ -950,7 +1006,14 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
 // x2 residual), within ~80 KB so the stage region and epilogue staging still fit under the opt-in max
 __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
 {
+#if defined(USE_ROCM)
+    // RDNA workgroups get 64 KB of LDS with no opt-in beyond it; a 44 KB budget for the row halfs +
+    // splats leaves room for the K = 7 stage ring (14 KB), the epilogue staging and the static
+    // __shared__ scalars
+    int cap = (44 * 1024) / (32 + 64 * M * (residual ? 2 : 1));
+#else
     int cap = (80 * 1024) / (32 + 64 * M * (residual ? 2 : 1));
+#endif
     cap &= ~7;
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
@@ -1032,6 +1095,10 @@ void exl3_gemv_int8_sq_kernel
         __syncthreads();
         if (sh_last)
         {
+#if defined(USE_ROCM)
+            // Acquire side of the counter handshake (the partials were written by other CUs)
+            __threadfence();
+#endif
             gemv_int8_epilogue_group_sq<M, c_fp32, residual>(partials, qsums, pstride, ksplit, size_m,
                                                              C, svh, sh_tmp, nb256, size_n);
             if (t == 0) counters[nb256] = 0;

@@ -1,6 +1,8 @@
+import os
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from ..constants import PAGE_SIZE
-from ..util.memory import malloc_trim
+from ..util.memory import malloc_trim, set_host_mmap_threshold
 
 # Checkpoint stashes are MB-scale host allocations with LRU (i.e. interleaved) lifetimes —
 # exactly the churn glibc retains after free (issue #277). Return memory to the OS once
@@ -28,9 +30,16 @@ class RecurrentCache(OrderedDict):
         self.max_size = max_size
         self.current_size = 0
         self.model = model
+        # This cache is what churns MB-scale host blocks (see util.memory.set_host_mmap_threshold
+        # for why glibc strands them), so fix the allocator policy before the first stash.
+        self.mmap_threshold = set_host_mmap_threshold()
 
         # Optionally set by the Generator; enables stranded-first eviction and staleness metrics
         self.pagetable = None
+        # EXL3_NC2_ASYNC_STASH: stashes whose D2H is still in flight (see settle)
+        self._pending = []
+        self._pin_pool = {}  # (shape, dtype) -> pinned host tensors free for reuse
+        self._worker = None
         self.metrics = {
             "stash_evictions": 0,           # checkpoints dropped by LRU pressure
             "stash_evictions_stranded": 0,  # of those, checkpoints that were already unrestorable
@@ -39,24 +48,81 @@ class RecurrentCache(OrderedDict):
         }
 
 
+    def _finish(self, st: dict):
+        """Worker thread: wait for the stash's D2H event, replace the pinned copies by pageable clones (the cache
+        never retains pinned memory), return the pinned buffers to the pool."""
+        st.pop("_ev").synchronize()
+        for k, v in st.items():
+            if isinstance(v, tuple) and v and all(hasattr(t, "is_pinned") and t.is_pinned() for t in v):
+                st[k] = tuple(t.clone() for t in v)
+                for t in v:
+                    self._pin_pool.setdefault((tuple(t.shape), t.dtype), []).append(t)
+
+    def settle(self):
+        """
+        EXL3_NC2_ASYNC_STASH: wait until every pending asynchronous stash is finished (_finish). Called before any
+        reader sees an entry; normally a no-op since the worker ran during the next chunk.
+        """
+        pend = self._pending
+        if not pend:
+            return
+        self._pending = []
+        for f in pend:
+            f.result()
+
+    def async_stash_ok(self, state) -> bool:
+        return os.environ.get("EXL3_NC2_ASYNC_STASH", "0") == "1" and not self.model.loaded_tp and \
+            getattr(state, "supports_async_stash", False)
+
+    def stash_async(self, state) -> dict:
+        """Stash state without a host sync; the copies are pending until settle()."""
+        self.settle()
+        stashed_state = state.stash(async_ = True, pin_pool = self._pin_pool)
+        if "_ev" in stashed_state:
+            if self._worker is None:
+                self._worker = ThreadPoolExecutor(1, thread_name_prefix = "rc-stash")
+            self._pending.append(self._worker.submit(self._finish, stashed_state))
+        return stashed_state
+
+    def get(self, key, default = None):
+        self.settle()
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self.settle()
+        return super().__getitem__(key)
+
+    def items(self):
+        self.settle()
+        return super().items()
+
+    def values(self):
+        self.settle()
+        return super().values()
+
     def get_stashed(self, key, default = None):
         """
         Fetch state from cache and move it to the end of the queue
         """
+        self.settle()
         if key in self:
             self.move_to_end(key)
             return self[key]
         return default
 
 
-    def put(self, key, state):
+    def put(self, key, state, stashed = None):
         """
-        Add state to cache
+        Add state to cache. stashed: an already stashed state (same format as state.stash()), e.g. a mid-chunk
+        checkpoint; state is ignored then
         """
         if key in self:
             self.move_to_end(key)
         else:
-            stashed_state = state.stash()
+            if stashed is None and self.async_stash_ok(state):
+                stashed_state = self.stash_async(state)
+            else:
+                stashed_state = state.stash() if stashed is None else stashed
             state_size = stashed_state["checkpoint_size"]
             while self.update_total_size() + state_size > self.max_size:
                 assert self.current_size >= 0, "Not enough space in cache for single state"
@@ -91,6 +157,17 @@ class RecurrentCache(OrderedDict):
             self.update_total_size()
 
 
+    def drop(self, key) -> None:
+        """Remove one checkpoint (rolling-checkpoint cleanup)."""
+        popped = self.pop(key, None)
+        if popped is None:
+            return
+        note_freed(popped["checkpoint_size"])
+        if self.model.loaded_tp:
+            self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
+        self.update_total_size()
+
+
     def prune_stranded(self) -> int:
         """
         Drop all checkpoints whose anchor page chain has been broken by KV eviction. A stranded checkpoint can
@@ -115,7 +192,7 @@ class RecurrentCache(OrderedDict):
     def update_total_size(self):
         seen = set()
         total = 0
-        for v in self.values():
+        for v in OrderedDict.values(self):  # sizes only: must not settle in-flight stashes
             if id(v) in seen:
                 continue
             seen.add(id(v))

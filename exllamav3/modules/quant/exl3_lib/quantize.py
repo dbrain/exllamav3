@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 import os
+import time
 from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
 from ....util.memory import free_mem, list_gpu_tensors
@@ -17,6 +18,59 @@ codebook_scale = 1.24371088
 
 codebook_mcg_mult = 0xCBAC1FED
 codebook_mul1_mult = 0x83DCD12D
+
+_QUANT_PROFILE = os.environ.get("EXL3_QUANT_PROFILE") == "1"
+_PROFILE_CONTEXT = threading.local()
+
+# Same-device worker threads (EXL3_QUANT_THREADS, convert_model.quantize_linears_parallel): a worker
+# sets _WORKER.stream and runs all its quantization work on that one stream. get_quant_stream then
+# returns it, the tile scratch is per thread, and device-wide syncs become syncs of the worker's own
+# stream, so workers overlap on the GPU. Per-tensor numerics are unchanged (same kernels, same order,
+# per-call seeded generator), so the output is bit-identical to one worker.
+_WORKER = threading.local()
+
+
+def worker_stream():
+    return getattr(_WORKER, "stream", None)
+
+
+def set_worker_stream(stream):
+    _WORKER.stream = stream
+    if stream is None:
+        _WORKER.__dict__.pop("temp_buffers", None)
+
+
+def sync_device(device):
+    s = worker_stream()
+    if s is not None:
+        s.synchronize()
+    else:
+        torch.cuda.synchronize(device)
+
+
+def _profile_start(device):
+    if not _QUANT_PROFILE:
+        return None
+    sync_device(device)
+    return time.perf_counter()
+
+
+def _profile_emit(stage, elapsed, **fields):
+    if not _QUANT_PROFILE:
+        return
+    group = getattr(_PROFILE_CONTEXT, "group", None)
+    if group:
+        fields = {"group": group, **fields}
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f" -- QUANT_PROFILE stage={stage} seconds={elapsed:.6f} {details}", flush=True)
+
+
+def _profile_end(stage, started, device, **fields):
+    if started is None:
+        return
+    sync_device(device)
+    _profile_emit(stage, time.perf_counter() - started, **fields)
+
 
 @lru_cache
 def tensor_core_perm(device):
@@ -49,8 +103,25 @@ def tensor_core_perm_i(device):
     return torch.argsort(tensor_core_perm(device))
 
 
-@lru_cache
 def get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
+    if worker_stream() is None:
+        return _get_temp_buffers(device, K, tile_len, cb)
+    cache = _WORKER.__dict__.setdefault("temp_buffers", {})
+    key = (str(device), K, tile_len, cb)
+    if key not in cache:
+        cache[key] = _get_temp_buffers_uncached(device, K, tile_len, cb)
+    return cache[key]
+
+
+@lru_cache
+def _get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
+    return _get_temp_buffers_uncached(device, K, tile_len, cb)
+
+
+get_temp_buffers.cache_clear = _get_temp_buffers.cache_clear   # convert_model clears it per module
+
+
+def _get_temp_buffers_uncached(device, K: int, tile_len: int = 256, cb: int = 0):
     index = torch.device(device).index if not isinstance(device, int) else device
     if index is None:
         index = torch.cuda.current_device()
@@ -60,7 +131,11 @@ def get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
     optimized, wave = ext.quantize_tiles_scratch(index, K, cb == 1, cb == 2, tile_len)
     if optimized:
         history_cols = (65536 >> K) // (8 if K == 1 else 1)
-        temp_costs = torch.empty((1,), dtype = torch.half, device = device)
+        if torch.version.hip and K <= 2:
+            # The ROCm optimized K=1/2 kernels stage cost arrays in global scratch to fit gfx1151 LDS.
+            temp_costs = torch.empty((wave, 2, 65536 >> K), dtype = torch.half, device = device)
+        else:
+            temp_costs = torch.empty((1,), dtype = torch.half, device = device)
         temp_edges = torch.empty((wave, tile_len, history_cols), dtype = torch.uint8, device = device)
         return temp_costs, temp_edges
 
@@ -97,6 +172,7 @@ def quantize_tiles(tiles, quant_args: dict):
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
     temp_costs, temp_edges = get_temp_buffers(tiles.device, K, tiles.shape[1], cb)
+    profile_start = _profile_start(tiles.device)
     ext.quantize_tiles(
         tiles,
         quantized_tiles,
@@ -107,11 +183,19 @@ def quantize_tiles(tiles, quant_args: dict):
         mcg,
         mul1,
     )
+    _profile_end("quantize_tiles", profile_start, tiles.device, K=K, codebook=cb, tiles=tiles.shape[0])
     return quantized_tiles, quantized_idx
 
 
-@lru_cache
 def get_quant_stream(device):
+    s = worker_stream()
+    if s is not None and s.device == torch.device(device):
+        return s
+    return _get_quant_stream(device)
+
+
+@lru_cache
+def _get_quant_stream(device):
     return torch.cuda.Stream(device = device)
 
 
@@ -282,6 +366,7 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
                 mul1 = "mul1" in quant_args
                 temp_costs, temp_edges = get_temp_buffers(device, K, 256, 2 if mul1 else 1 if mcg else 0)
 
+                profile_start = _profile_start(device)
                 ext.quantize_tiles(
                     dev_tiles,
                     dev_q_tiles,
@@ -292,6 +377,7 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
                     mcg,
                     mul1
                 )
+                _profile_end("quantize_tiles", profile_start, device, K=K, codebook=2 if mul1 else 1 if mcg else 0, tiles=dev_tiles.shape[0])
 
                 # Async copy back to pinned memory
                 pin_split_q_tiles[i].copy_(dev_q_tiles, non_blocking = True)
@@ -345,7 +431,7 @@ def quantize_tiles_multigpu_sync(tiles, quant_args: dict):
             q_idx_per_device.append(dev_q_idx)
 
     for device in devices:
-        torch.cuda.synchronize(device)
+        sync_device(device)
 
     q_tiles_per_device = [x.to(devices[0]) for x in q_tiles_per_device]
     q_idx_per_device = [x.to(devices[0]) for x in q_idx_per_device]
@@ -425,6 +511,30 @@ def save_failed_cholesky(H: torch.Tensor, quant_args: dict, debug_info: dict | N
         print(f" !! Failed to save Hessian debug dump: {e}")
 
 
+# torch.linalg.cholesky / inv on ROCm (hipSOLVER/hipBLAS) are not safe while another worker thread runs work on a
+# different stream of the same device (EXL3_QUANT_THREADS > 1): they fail spuriously on perfectly good Hessians
+# ("not positive definite", which the damping loop then "repairs" by distorting H) and can also return silently
+# wrong factors (~1e-2 relative error) that report success. Locking the call does not help, the interference comes
+# from the other thread's unrelated kernels. So worker threads factorize on the CPU (fp32, ms for k = 2048);
+# a single worker keeps the original GPU path (bit-identical), plus a CPU retry if the GPU reports a failure.
+def _cholesky_checked(H: torch.Tensor):
+    if H.device.type == "cpu":
+        return torch.linalg.cholesky(H)
+    if worker_stream() is not None:
+        return torch.linalg.cholesky(H.cpu()).to(H.device)  # raises _LinAlgError only if truly not PD
+    L, info = torch.linalg.cholesky_ex(H)
+    if info.item() != 0:
+        print(" !! GPU Cholesky reported failure, retrying on CPU before adding damping")
+        L = torch.linalg.cholesky(H.cpu()).to(H.device)
+    return L
+
+
+def _inv_checked(A: torch.Tensor):
+    if A.device.type != "cpu" and worker_stream() is not None:
+        return torch.linalg.inv(A.cpu()).to(A.device)
+    return torch.linalg.inv(A)
+
+
 def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_info: dict | None = None):
 
     n, _ = H.shape
@@ -437,7 +547,7 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_in
     retry_cpu = False
     while True:
         try:
-            L = torch.linalg.cholesky(H)
+            L = _cholesky_checked(H)
             # H is not needed after this, move to CPU. Then overwrite H's GPU storage with L, since we can't otherwise
             # free up that VRAM as the tensor is referenced by the parent frame
             H_cpu = H.cpu()
@@ -485,7 +595,7 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_in
     # D = DL @ DL.transpose(1, 2)
 
     # Invert each diagonal block
-    DL = torch.linalg.inv(DL)
+    DL = _inv_checked(DL)
 
     # Multiply each block's column with its inverse
     L = L.view(n, m, b)
@@ -532,7 +642,7 @@ def ldlq(
 
     devices = quant_args["devices"]
     for device in devices:
-        torch.cuda.synchronize(device)
+        sync_device(device)
     main_stream = get_quant_stream(devices[0])
     with torch.cuda.stream(main_stream):
 
@@ -616,7 +726,7 @@ def ldlq(
             prod_cache.addmm_(b_L.T, b_err, alpha = 1.0, beta = 1.0)
 
         for device in devices:
-            torch.cuda.synchronize(device)
+            sync_device(device)
 
     return weight_q, encoded
 
@@ -653,7 +763,7 @@ def fallback_quant(
 
     devices = quant_args["devices"]
     for device in devices:
-        torch.cuda.synchronize(device)
+        sync_device(device)
     main_stream = get_quant_stream(devices[0])
     with torch.cuda.stream(main_stream):
 
@@ -732,7 +842,7 @@ def fallback_quant(
                 encoded[i // 16 : j // 16] = b_encoded.to(buffer_device)
 
         for device in devices:
-            torch.cuda.synchronize(device)
+            sync_device(device)
 
         mse = (mse_sum / weight.numel()).item()
 
@@ -741,16 +851,17 @@ def fallback_quant(
 
 def block_trace(A, B, block_size = 1024):
     """
-    Compute trace(A.T @ B @ A) in column blocks of B to bound the temporary
+    Compute trace(A.T @ B @ A).
+
+    Brief 10b: one GEMM (B @ A) + one reduction + ONE host sync. The previous
+    implementation ran an einsum per 1024-column slice of B with a .item() sync after
+    each slice, which serialized the metrics stage at ~452 s/layer (32% of quantize).
+    Summation order differs from the blocked einsum, so the diagnostic proxy_err moves
+    within fp32 rounding; quantized tensors are not produced from this value.
+    block_size is kept for call-site compatibility and is unused.
     """
-    total = 0.0
-    for j_start in range(0, B.shape[1], block_size):
-        j_end = min(j_start + block_size, B.shape[1])
-        B_block = B[:, j_start:j_end]
-        A_j_block = A[j_start:j_end, :]
-        partial = torch.einsum("ik,ij,jk->", A, B_block, A_j_block)
-        total += partial.item()
-    return total
+    C = B @ A
+    return (A * C).sum().item()
 
 
 def ldlq_batched(
@@ -777,7 +888,7 @@ def ldlq_batched(
     """
     devices = quant_args["devices"]
     for device in devices:
-        torch.cuda.synchronize(device)
+        sync_device(device)
     main_stream = get_quant_stream(devices[0])
     with torch.cuda.stream(main_stream):
 
@@ -839,14 +950,20 @@ def ldlq_batched(
             prod_cache.baddbmm_(Ls[:, i:j].transpose(1, 2), b_err)
 
         for device in devices:
-            torch.cuda.synchronize(device)
+            sync_device(device)
 
     return weight_q, encoded
 
 
 finalize_capture_H_mutex = threading.Lock()
 
-def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
+def _randn_signs(k, device, gen):
+    device = torch.device(device)
+    g = gen if gen is not None and gen.device == device else None
+    return (torch.randn(k, device = device, generator = g).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
+
+
+def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool, gen: torch.Generator | None = None):
     with finalize_capture_H_mutex:
 
         if H_data["H"].is_meta:
@@ -857,7 +974,7 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
 
             H = H_data["H"]
             k = H.shape[0]
-            su = (torch.randn(k, device = H_data["device"]).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
+            su = _randn_signs(k, H_data["device"], gen)
             H_data["su"] = su
 
             return True, None, None, su, None
@@ -873,6 +990,10 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
 
         # Mean of samples summed up during forward pass
         # Switch to uncalibrated fallback if no input activations or diagonal is too small (few activations)
+        # Deferred capture (flush_capture_H) accumulates the finite-row count on the device;
+        # resolve it once here (finalize already syncs in this block).
+        if H_data.get("count_dev") is not None:
+            H_data["count"] = int(H_data["count_dev"].item())
         count = H_data["count"]
         if count == 0:
             q_fallback = True
@@ -906,7 +1027,7 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
 
         # Random sign flips for input channel, fixed for the first linear layer to quantize with this H
         k = H.shape[0]
-        su = (torch.randn(k, device = H.device).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
+        su = _randn_signs(k, H.device, gen)
         H_data["su"] = su
 
         # Input had
@@ -929,7 +1050,10 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
             dr = torch.arange(k)
             L[dr, dr] = 0
 
-        H_data["L"] = L
+        # Store L on the CPU here, inside the mutex: only this caller keeps the device tensor, so a
+        # concurrent worker sharing this H (gate/up of every expert in 'all' mode) takes its own
+        # device copy of the CPU L and never reads memory allocated on another worker's stream
+        H_data["L"] = L.cpu() if L is not None else None
 
         # H is no longer needed except to compute proxy error so move to CPU
         H = H.cpu()
@@ -948,7 +1072,9 @@ def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
     assert encoded.dtype == torch.int16
     packed_shape = (shape[0], shape[1], 256 * K // 16)
     packed = torch.zeros(packed_shape, dtype = torch.int16, device = encoded.device)
+    profile_start = _profile_start(encoded.device)
     ext.pack_trellis(packed, encoded.contiguous(), K)
+    _profile_end("packing", profile_start, encoded.device, K=K, tiles=shape[0] * shape[1])
     # unpacked = torch.zeros_like(encoded)
     # ext.unpack_trellis(unpacked, packed, K)
     # assert torch.equal(unpacked, encoded)
@@ -1068,7 +1194,7 @@ def g_scale_gss(
 ):
     devices = quant_args["devices"]
     for device in devices:
-        torch.cuda.synchronize(device)
+        sync_device(device)
 
     main_stream = get_quant_stream(devices[0])
     # TODO: Figure out why Torch always initializes cuda:0 when exiting this CM, even when it's not used
@@ -1083,7 +1209,7 @@ def g_scale_gss(
             print(f"     - scale search: min = {best_scale:.6f}, mse: {best_mse.item():.6f}")
 
     for device in devices:
-        torch.cuda.synchronize(device)
+        sync_device(device)
 
     return best_scale, best_mse
 
@@ -1302,17 +1428,25 @@ def quantize_exl3(
         assert weight.dtype == torch.float
         tiles_k = weight.shape[0] // 16
 
-        if "seed" in quant_args:
-            torch.manual_seed(quant_args["seed"])
-
         devices = quant_args["devices"]
         device = torch.device(devices[0])
+
+        gen = None
+        if "seed" in quant_args:
+            torch.manual_seed(quant_args["seed"])
+            # Private generator, same seed and offset as the global one just seeded: identical draws,
+            # but safe when several worker threads quantize at once
+            gen = torch.Generator(device = device)
+            gen.manual_seed(quant_args["seed"])
+        _p = _profile_start(device)
         if weight.device != device:
             weight = weight.to(device)
+        _profile_end("q_device_cast", _p, device, K=quant_args["K"])
         k, n = weight.shape
 
         # Get H, LDL decomp. and input/output sign flips
-        q_fallback, H, L, su, H_diag = finalize_capture_H(H_data, quant_args, verbose)
+        _p = _profile_start(device)
+        q_fallback, H, L, su, H_diag = finalize_capture_H(H_data, quant_args, verbose, gen)
         if H is not None and H.is_cuda:
             H = H.to(device)
         if L is not None and L.is_cuda:
@@ -1321,15 +1455,17 @@ def quantize_exl3(
             su = su.to(device)
         if H_diag is not None and H_diag.is_cuda:
             H_diag = H_diag.to(device)
-        sv = (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+        sv = (torch.randn(n, device = device, generator = gen).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
 
         # Move stored L to CPU (if not already), move working L to device
         if H_data["L"] is not None:
             H_data["L"] = H_data["L"].cpu()
         if L is not None:
             L = L.to(device)
+        _profile_end("q_finalize", _p, device, K=quant_args["K"], fallback=q_fallback)
 
         if verbose:
+            _p = _profile_start(device)
             weight_copy = weight.cpu()
         weight_r = weight
         del weight
@@ -1337,8 +1473,10 @@ def quantize_exl3(
         if verbose:
             rms = block_rms_n(weight_r, dim = 0)
             print(f"     - input tensor rms: {rms:.6f}")
+            _profile_end("q_verbose_prep", _p, device, K=quant_args["K"])
 
         # Regularization
+        _p = _profile_start(device)
         apply_out_scales, weight_r, g_scale, su, sv = regularize(
             weight_r,
             su,
@@ -1356,6 +1494,7 @@ def quantize_exl3(
         if verbose:
             rms = weight_r.square().mean().sqrt()
             print(f"     - regularized rms:  {rms:.6f}")
+        _profile_end("q_regularize", _p, device, K=quant_args["K"])
 
         progress_text = None if not progress_str else progress_str.replace("<step>", "Quantizing")
         pb.update(0)
@@ -1368,14 +1507,19 @@ def quantize_exl3(
 
         # Quantize
         if not q_fallback:
+            _p = _profile_start(device)
             weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)  #zxc
+            _profile_end("q_ldlq", _p, device, K=quant_args["K"], shape=tuple(weight_r.shape))
             del L
         else:
+            _p = _profile_start(device)
             weight_q, encoded_q, mse_err = fallback_quant(weight_r, device, quant_args, pb)  # zxc
+            _profile_end("q_fallback", _p, device, K=quant_args["K"], shape=tuple(weight_r.shape))
 
         pb.update(tiles_k)
 
         # Metrics
+        _p = _profile_start(device)
         if not q_fallback:
             try:
                 E = weight_r - weight_q  # may run on CPU
@@ -1398,10 +1542,12 @@ def quantize_exl3(
                 proxy_err = -1.0
         else:
             proxy_err = mse_err
+        _profile_end("q_metrics", _p, device, K=quant_args["K"])
 
         # free_mem()
 
         if return_weight_q or verbose:
+            _p = _profile_start(device)
             weight_q = weight_q.to(device)
             weight_q = preapply_had_l(weight_q, had_k)
             weight_q *= su
@@ -1412,11 +1558,14 @@ def quantize_exl3(
                 weight = weight_copy.to(device)
                 nmse = block_nmse(weight_q, weight)
                 print(f"     - quant nmse: {nmse:.6f}")
+            _profile_end("q_verbose_post", _p, device, K=quant_args["K"])
 
         # Compile packed tensor
+        _p = _profile_start(device)
         suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
         svh = sv.flatten().contiguous().to(dtype = torch.half, copy = True)
         trellis = pack_trellis(encoded_q.to(device), quant_args)
+        _profile_end("q_pack_out", _p, device, K=quant_args["K"])
 
         out_tensors = {
             # "scale": weight_scale.to(dtype = torch.float, copy = True),
@@ -1478,6 +1627,7 @@ class _WeightStager:
         self.copy_stream = torch.cuda.Stream(device = device)
         self.slot = 0
         self.pending = {}
+        self.profile_copy_events = {}
 
     def prefetch(self, t: int, w: torch.Tensor):
         if t in self.pending:
@@ -1491,11 +1641,21 @@ class _WeightStager:
         # The buffer's previous async upload must have drained before the host memcpy refills it
         reuse_ev.synchronize()
         pin = buf[:nbytes].view(w.dtype).view(w.shape)
+        cpu_copy_start = time.perf_counter() if _QUANT_PROFILE else None
         pin.copy_(w)
+        if cpu_copy_start is not None:
+            _profile_emit("cpu_to_pinned", time.perf_counter() - cpu_copy_start, bytes=nbytes)
         with torch.cuda.stream(self.copy_stream):
             # dev_w MUST be allocated on the copy stream.
             dev_w = torch.empty(w.shape, dtype = w.dtype, device = self.device)
+            if _QUANT_PROFILE:
+                h2d_start = torch.cuda.Event(enable_timing = True)
+                h2d_start.record(self.copy_stream)
             dev_w.copy_(pin, non_blocking = True)
+            if _QUANT_PROFILE:
+                h2d_end = torch.cuda.Event(enable_timing = True)
+                h2d_end.record(self.copy_stream)
+                self.profile_copy_events[t] = (h2d_start, h2d_end, nbytes)
             reuse_ev.record(self.copy_stream)
         ev = torch.cuda.Event()
         ev.record(self.copy_stream)
@@ -1509,6 +1669,11 @@ class _WeightStager:
             # The block belongs to the copy stream's pool; mark its use on the consuming stream
             # so its eventual free isn't recycled under a later async upload
             dev_w.record_stream(torch.cuda.current_stream(self.device))
+        copy_events = self.profile_copy_events.pop(t, None)
+        if copy_events is not None:
+            h2d_start, h2d_end, nbytes = copy_events
+            h2d_end.synchronize()
+            _profile_emit("h2d_copy", h2d_start.elapsed_time(h2d_end) / 1000, bytes=nbytes)
         return dev_w.float() if dev_w.dtype != torch.float else dev_w
 
 
@@ -1542,6 +1707,8 @@ def quantize_exl3_batch(
     qa0 = quant_args_list[0]
     devices = qa0["devices"]
     device = torch.device(devices[0])
+    if _QUANT_PROFILE:
+        _PROFILE_CONTEXT.group = progress_str or f"K{qa0['K']}-group-of-{n_t}"
     shared_H = all(hd is H_datas[0] for hd in H_datas)
     assert shared_H or all(w.shape == weights[0].shape for w in weights)
     assert all(w.shape[0] == weights[0].shape[0] for w in weights)
@@ -1562,7 +1729,9 @@ def quantize_exl3_batch(
             qa = quant_args_list[t]
             if "seed" in qa:
                 torch.manual_seed(qa["seed"])
+            profile_start = _profile_start(device)
             q_fallback, H, L, su, H_diag = finalize_capture_H(H_datas[t], qa, verbose)
+            _profile_end("hessian_finalize", profile_start, device, K=qa["K"], tensor=t)
             if q_fallback:
                 finalized.append(None)
             else:
@@ -1574,6 +1743,8 @@ def quantize_exl3_batch(
                 results[t] = quantize_exl3(weights[t].float(), H_datas[t], quant_args_list[t], False, None, verbose)[1:]
 
         if not batch_idx:
+            if _QUANT_PROFILE:
+                _PROFILE_CONTEXT.group = None
             return results
 
         # Regularize each tensor with the scale search deferred, then search all scales in one
@@ -1587,7 +1758,9 @@ def quantize_exl3_batch(
             if "seed" in qa:
                 torch.manual_seed(qa["seed"])
             H, L, su, H_diag = finalized[t]
+            copy_profile_start = _profile_start(device)
             weight = stager.get(t, weights[t])
+            _profile_end("device_cast", copy_profile_start, device, K=qa["K"], bytes=weights[t].numel() * weights[t].element_size())
             if bi + 1 < len(batch_idx):
                 stager.prefetch(batch_idx[bi + 1], weights[batch_idx[bi + 1]])
             if su.is_cuda:
@@ -1595,13 +1768,17 @@ def quantize_exl3_batch(
             if H_diag is not None and H_diag.is_cuda:
                 H_diag = H_diag.to(device)
             sv = (torch.randn(weight.shape[1], device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+            profile_start = _profile_start(device)
             apply_out_scales, weight_r, _, su, sv = regularize(
                 weight, su, sv, qa, verbose, H_diag, None, skip_g_scale = True)
+            _profile_end("regularization", profile_start, device, K=qa["K"], tensor=t, shape=tuple(weight.shape))
             regs[t] = [weight_r, su, sv, apply_out_scales]
             weights[t] = None
 
         samples = [sample_scale_tiles(regs[t][0]) for t in batch_idx]
+        profile_start = _profile_start(device)
         scales = g_scale_search_batch(samples, qa0)
+        _profile_end("global_scale_search", profile_start, device, K=qa0["K"], tensors=len(batch_idx))
         del samples
         g_scales = {}
         for t, (g_scale, _) in zip(batch_idx, scales):
@@ -1628,7 +1805,9 @@ def quantize_exl3_batch(
             weight_r_cat = torch.cat([regs[t][0] for t in batch_idx], dim = 1)
             for t in batch_idx:
                 regs[t][0] = None
+            profile_start = _profile_start(device)
             weight_q_cat, encoded_cat = ldlq(weight_r_cat, L, qa0, pb)
+            _profile_end("ldlq_shared_group", profile_start, device, K=qa0["K"], tensors=len(batch_idx), includes_tiles=True)
             L = None   # device copy stays cached in H_data for the layer's remaining groups
             weight_rs = list(torch.split(weight_r_cat, widths, dim = 1))
             weight_qs = list(torch.split(weight_q_cat, widths, dim = 1))
@@ -1638,7 +1817,9 @@ def quantize_exl3_batch(
             weight_r_stack = torch.stack([regs[t][0] for t in batch_idx])
             for t in batch_idx:
                 regs[t][0] = None
+            profile_start = _profile_start(device)
             weight_q_stack, encoded_stack = ldlq_batched(weight_r_stack, Ls, qa0, pb)
+            _profile_end("ldlq_individual_group", profile_start, device, K=qa0["K"], tensors=len(batch_idx), includes_tiles=True)
             del Ls
             weight_rs = list(weight_r_stack.unbind(0))
             weight_qs = list(weight_q_stack.unbind(0))
@@ -1647,6 +1828,7 @@ def quantize_exl3_batch(
         pb.update(tiles_k)
 
         # Per-tensor metrics and packing
+        _p = _profile_start(device)
         Hd = None
         for bi, t in enumerate(batch_idx):
             qa = quant_args_list[t]
@@ -1696,5 +1878,8 @@ def quantize_exl3_batch(
                 "q_fallback": False,
             })
             results[t] = (proxy_err, out_tensors)
+        _profile_end("q_group_metrics_pack", _p, device, K=qa0["K"], tensors=len(batch_idx))
 
+    if _QUANT_PROFILE:
+        _PROFILE_CONTEXT.group = None
     return results

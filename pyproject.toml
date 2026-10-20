@@ -28,6 +28,10 @@ dependencies = [
     "marisa_trie",
     "pydantic",
     "llguidance>=1.7.0",
+    # Required by tools/{glm,mimo,qwen}/serve.py (already in
+    # requirements.txt, was missing here so the Nix venv lacked them).
+    "aiohttp",
+    "jinja2",
     "triton-windows; platform_system == 'Windows'",
 ]
 
@@ -69,6 +73,27 @@ cu130 = [
 cu132 = [
     "torch>=2.6.0",
 ]
+# ROCm install from the lock (AMD multi-arch index, see install.md).
+# The CUDA extras above stay for Nvidia users; the AMD pins live in the
+# rocm extra (plus the flake selection) only. Pinned to the verified set
+# (doc/install.md); bump the whole set deliberately, then re-verify
+# `nix build .#exllamav3`.
+rocm = [
+    "torch[device-gfx1151]==2.14.0+rocm10.1.0a20260822",
+    "rocm[devel,device-gfx1151]==10.1.0a20260822",
+    # Full ROCm stack pinned explicitly: uv only honors index sources
+    # for direct requirements (transitive lookups fall back to PyPI,
+    # where these builds cannot exist), so every AMD package is listed
+    # even when also pulled transitively (same pins, by construction).
+    "triton==3.8.0+git675c5987.rocm10.1.0a20260822",
+    "rocm-sdk-core==10.1.0a20260822",
+    "rocm-sdk-libraries==10.1.0a20260822",
+    "rocm-sdk-devel==10.1.0a20260822",
+    "rocm-sdk-device-gfx1151==10.1.0a20260822",
+    "rocm-bootstrap==0.1.0",
+    "amd-torch-device-gfx1151==2.14.0+rocm10.1.0a20260822",
+    "amd-torch-device-gfx115x==2.14.0+rocm10.1.0a20260822",
+]
 
 [tool.setuptools]
 package-dir = { "" = "." }
@@ -83,6 +108,12 @@ exllamav3 = [
     "util/hadamard_data/*",
     "conversion/standard_cal_data/*.utf8",
     "exllamav3_ext/**/*",
+    "**/*.hip",
+    # CPU bounds-proof markers (e.g. attention_fn/qsa_proof/*.ok):
+    # require_proof() reads them next to the installed module; without
+    # them every install falls back to the Triton pair (same class of
+    # bug as the missing .hip kernels).
+    "**/*.ok",
 ]
 
 [tool.setuptools.dynamic]
@@ -90,6 +121,10 @@ version = { attr = "exllamav3.version.__version__" }
 
 [tool.uv]
 package = true
+# AMD's nightly index versions everything pre-release (10.1.0a...); the
+# rocm extra cannot resolve without this. Plain `uv lock` (no --upgrade)
+# keeps existing pins, so this only affects newly-resolved requirements.
+prerelease = "allow"
 conflicts = [
     [
         { extra = "cu124" },
@@ -98,6 +133,7 @@ conflicts = [
         { extra = "cu129" },
         { extra = "cu130" },
         { extra = "cu132" },
+        { extra = "rocm" },
     ],
 ]
 
@@ -109,6 +145,38 @@ torch = [
     { index = "pytorch-cu129", extra = "cu129" },
     { index = "pytorch-cu130", extra = "cu130" },
     { index = "pytorch-cu132", extra = "cu132" },
+    { index = "rocm", extra = "rocm" },
+]
+# Everything below only exists on AMD's index. The index is explicit,
+# so each needs its own entry to be consulted. triton is scoped to the
+# rocm extra: it exists on PyPI too, and the CUDA branches must keep
+# resolving it from there.
+triton = [
+    { index = "rocm", extra = "rocm" },
+]
+rocm = [
+    { index = "rocm" },
+]
+rocm-bootstrap = [
+    { index = "rocm" },
+]
+rocm-sdk-core = [
+    { index = "rocm" },
+]
+rocm-sdk-libraries = [
+    { index = "rocm" },
+]
+rocm-sdk-devel = [
+    { index = "rocm" },
+]
+rocm-sdk-device-gfx1151 = [
+    { index = "rocm" },
+]
+amd-torch-device-gfx1151 = [
+    { index = "rocm" },
+]
+amd-torch-device-gfx115x = [
+    { index = "rocm" },
 ]
 
 
@@ -141,3 +209,14 @@ explicit = true
 name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"
 explicit = true
+
+[[tool.uv.index]]
+name = "rocm"
+url = "https://rocm.nightlies.amd.com/whl-multi-arch/"
+explicit = true
+# NOTE: this index serves bare links with no hashes, so `uv lock` cannot
+# record any. The cp312/linux artifacts used by Nix carry hand-backfilled
+# `hash = "sha256:..."` entries in uv.lock (converted from verified pins
+# via `nix hash convert --hash-algo sha256 --from nix32 --to base16`).
+# If a future re-lock drops them, Nix evaluation fails loudly asking for
+# a sha256 (`uv lock --check` does NOT verify hashes) — re-add them.

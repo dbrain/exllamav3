@@ -1,0 +1,38 @@
+name: Nix
+run-name: Nix flake check + fmt
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nix:
+    name: flake check and fmt gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - name: Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      # Full evaluation + pre-commit hooks + CPU test subset. The engine
+      # wheel builds pure-python here (EXLLAMA_NOCOMPILE, seconds); the
+      # ROCm extension .so is reused from the cache and recompiles only
+      # when native sources change (setup.py, exllamav3_ext/, arch_list):
+      # PRs without native changes finish in minutes, see doc/nix.md.
+      - name: nix flake check
+        run: nix flake check --print-build-logs
+
+      # nix fmt doubles as the clean-tree gate: the formatter exits non-zero
+      # when hooks fail OR rewrite files, so this fails the job on both.
+      - name: nix fmt (clean-tree gate)
+        run: nix fmt

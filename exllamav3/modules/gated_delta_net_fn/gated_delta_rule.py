@@ -1,3 +1,4 @@
+import os
 import torch
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
@@ -101,18 +102,29 @@ def gated_delta_rule_fn(
     v_head_dim: int,
     params: dict = None,
     channelwise_g: bool = False,
+    g_cumsum: bool = False,
+    recurrent_base: torch.Tensor = None,
 ):
+    # g_cumsum: g already holds fla's chunk-local cumsum (EXL3_KDA_G_FUSED); only valid on the chunk path
     if params is None:
         params = {}
 
-    bsz, seqlen, _ = mixed_qkv.shape
+    # EXL3_PF_GLUE: the conv wrote q | k | v as contiguous planes (3, bsz, seq, dim); no split copies
+    planar = mixed_qkv.dim() == 4
+    if planar:
+        bsz, seqlen = mixed_qkv.shape[1], mixed_qkv.shape[2]
+    else:
+        bsz, seqlen, _ = mixed_qkv.shape
 
     # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
     # channelwise CUDA recurrent kernel (in-kernel q/k l2norm, history-capable) otherwise
     if channelwise_g:
         if seqlen >= num_v_heads and not history:
             from ...vendor.fla import chunk_kda
-            q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+            if planar:
+                q, k, v = mixed_qkv.unbind(0)
+            else:
+                q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
             q = q.view(bsz, seqlen, -1, k_head_dim)
             k = k.view(bsz, seqlen, -1, k_head_dim)
             v = v.view(bsz, seqlen, -1, v_head_dim)
@@ -130,12 +142,18 @@ def gated_delta_rule_fn(
                     initial_state = state,
                     output_final_state = save_state,
                     use_qk_l2norm_in_kernel = True,
+                    g_cumsum = g_cumsum,
+                    ckpt = params.get("kda_ckpt") if bsz == 1 else None,
                 )
                 if save_state and state is not None:
                     state.copy_(new_state)
                 core_attn_out.append(core_attn)
+            if planar and len(core_attn_out) == 1:
+                return core_attn_out[0].to(torch.bfloat16)  # bsz 1: skip the one-tensor cat copy
             return torch.cat(core_attn_out, dim = 0).to(torch.bfloat16)
 
+        assert not g_cumsum, "g_cumsum is only valid on the KDA chunk path"
+        assert not planar, "planar qkv is only produced for the KDA chunk path"
         core_attn_out = torch.empty(
             (bsz, seqlen, num_v_heads, v_head_dim),
             dtype = torch.bfloat16,
@@ -159,12 +177,16 @@ def gated_delta_rule_fn(
             v_head_dim,
             recurrent_slots,
             history,
+            recurrent_base,
         )
         return core_attn_out
 
+    assert not g_cumsum, "g_cumsum is only valid on the KDA chunk path"
     # Chunked rule
     if seqlen >= num_v_heads and not history:
-        from ...vendor.fla import chunk_gated_delta_rule
+        from ...vendor.fla import chunk_gated_delta_rule, chunk_gated_delta_rule_pf
+        # EXL3_GDN_PF (default 1): strided q / k / v straight from the conv output, no contiguous copies, no single-tensor cat (bit-equal)
+        pf = os.environ.get("EXL3_GDN_PF", "1") == "1"
 
         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
         q = q.view(bsz, seqlen, -1, k_head_dim)
@@ -178,19 +200,25 @@ def gated_delta_rule_fn(
         core_attn_out = []
         for i, s in enumerate(recurrent_slots_cpu.tolist()):
             state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
-            core_attn, new_state = chunk_gated_delta_rule(
-                q[i:i + 1], k[i:i + 1], v[i:i + 1],
-                g = g[i:i + 1],
-                beta = beta[i:i + 1],
-                initial_state = state,
-                output_final_state = save_state,
-                use_qk_l2norm_in_kernel = True,
-            )
+            if pf:
+                core_attn, new_state = chunk_gated_delta_rule_pf(
+                    q[i:i + 1], k[i:i + 1], v[i:i + 1], g = g[i:i + 1], beta = beta[i:i + 1],
+                    initial_state = state, output_final_state = save_state,
+                    ckpt = params.get("kda_ckpt") if bsz == 1 else None)
+            else:
+                core_attn, new_state = chunk_gated_delta_rule(
+                    q[i:i + 1], k[i:i + 1], v[i:i + 1],
+                    g = g[i:i + 1],
+                    beta = beta[i:i + 1],
+                    initial_state = state,
+                    output_final_state = save_state,
+                    use_qk_l2norm_in_kernel = True,
+                )
             if save_state and state is not None:
                 state.copy_(new_state)
             core_attn_out.append(core_attn)
 
-        core_attn_out = torch.cat(core_attn_out, dim = 0)
+        core_attn_out = core_attn_out[0] if pf and len(core_attn_out) == 1 else torch.cat(core_attn_out, dim = 0)
 
     # Fused recurrent rule
     else:
@@ -219,6 +247,7 @@ def gated_delta_rule_fn(
             v_head_dim,
             recurrent_slots,
             history,
+            recurrent_base,
         )
 
     return core_attn_out

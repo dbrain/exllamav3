@@ -1090,6 +1090,7 @@ def paged_attn_triton_decode(
     n_kv_heads_override: int | None = None,
     num_warps: int = 4,
     num_stages: int = 2,
+    split_batch: int | None = None,     # batch size the split count is derived from (default: bsz)
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
@@ -1172,7 +1173,8 @@ def paged_attn_triton_decode(
         if dev not in _decode_sm_count:
             _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
         target = 2 * _decode_sm_count[dev]
-        num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 4 * block_n), 128))
+        programs_split = programs if split_batch is None else programs // bsz * split_batch
+        num_splits = max(1, min(target // programs_split, triton.cdiv(max_k_len, 4 * block_n), 128))
     split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
 
     if num_splits > 1:
@@ -1210,6 +1212,48 @@ def paged_attn_triton_decode(
                 num_warps=4, num_stages=1,
             )
     return out
+
+
+_rows_arange = {}
+
+
+def paged_attn_triton_decode_rows(
+    q: torch.Tensor,                # [1, R, n_q_heads, head_dim]
+    k: torch.Tensor,                # [1, R, n_kv_heads, head_dim]
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,      # [1, pages]
+    cache_seqlens: torch.Tensor,    # [1]
+    **kw,
+) -> torch.Tensor:
+    """R rows of a verify block in ONE attention launch (plus one append launch), bitwise equal to R
+    batch-1 paged_attn_triton_decode calls with cache_seqlens + i. Row i becomes batch entry i of a
+    q_len 1 call with its own seqlen (cache_seqlens + i), sharing the sequence's pages. The split count
+    is the one a batch-1 call would pick (split_batch = 1), so every row sees the same tiling and the
+    same reduction order. All rows' K/V are appended first (the batch-1 loop appends row i before
+    attending, and row i never reads past cache_seqlens + i + 1, so the extra rows are masked)."""
+    _, R, n_q_heads, head_dim = q.shape
+    n_kv_heads = k.shape[2]
+    dev = q.device
+    ar = _rows_arange.get((dev, R))
+    if ar is None:
+        ar = _rows_arange[(dev, R)] = torch.arange(R, dtype = torch.int32, device = dev)
+    seqs = cache_seqlens.to(torch.int32) + ar
+    bt = block_table.expand(R, -1).contiguous()
+    num_pages_per_seq = bt.shape[1]
+    update_block_d = triton.next_power_of_2(head_dim)
+    with torch.cuda.device(dev):
+        _paged_kv_update_kernel[(R, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
+            k.reshape(R, 1, n_kv_heads, head_dim), v.reshape(R, 1, n_kv_heads, head_dim), k_cache, v_cache, bt, seqs,
+            num_pages_per_seq, 1, n_kv_heads, k_cache.shape[1], head_dim, update_block_d,
+            num_warps = 2, num_stages = 3,
+        )
+    o = paged_attn_triton_decode(
+        q.reshape(R, 1, n_q_heads, head_dim), None, None, k_cache, v_cache, bt, seqs,
+        pre_appended_len = 1, split_batch = 1, **kw,
+    )
+    return o.view(1, R, n_q_heads, head_dim)
 
 
 def fn_triton_paged_attn_decode(args: AttnArgs) -> torch.Tensor | None:
@@ -1266,6 +1310,8 @@ def _paged_attn_prefill_inner(
     MASKED: tl.constexpr,
     SRC_NEW: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    VD_PAD: tl.constexpr,      # V tile width (power of two >= V_DIM)
+    V_DIM: tl.constexpr,       # V lanes actually used (MiMo: 128 of the 192-wide padded V)
 ):
     """One pass over kv tiles [n_start, n_end). With MASKED = False the tiles are known to be
     fully inside the causal/window region for every row and all bounds/mask logic is skipped.
@@ -1274,6 +1320,8 @@ def _paged_attn_prefill_inner(
     HD_PAD > head_dim zero-pads the head width (masked loads, fp16 sources only need it)."""
     offs_d = tl.arange(0, HD_PAD)
     d_mask = offs_d < head_dim
+    offs_v = tl.arange(0, VD_PAD)
+    v_mask = offs_v < V_DIM
     for n0 in range(n_start, n_end, BLOCK_N):
         offs_n = n0 + offs_n_base
         page = offs_n // page_size
@@ -1346,12 +1394,12 @@ def _paged_attn_prefill_inner(
         l = l * alpha + tl.sum(p, axis = 1)
 
         if SRC_NEW:
-            v_ptrs = v_cache + ((offs_n[:, None] * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
-            if HD_PAD > head_dim:
+            v_ptrs = v_cache + ((offs_n[:, None] * n_kv_heads + kv_head) * head_dim + offs_v[None, :])
+            if VD_PAD > V_DIM:
                 if MASKED:
-                    v_tile = tl.load(v_ptrs, mask = (offs_n[:, None] < n_end) & d_mask[None, :], other = 0.0)
+                    v_tile = tl.load(v_ptrs, mask = (offs_n[:, None] < n_end) & v_mask[None, :], other = 0.0)
                 else:
-                    v_tile = tl.load(v_ptrs, mask = d_mask[None, :], other = 0.0)
+                    v_tile = tl.load(v_ptrs, mask = v_mask[None, :], other = 0.0)
             elif MASKED:
                 v_tile = tl.load(v_ptrs, mask = offs_n[:, None] < n_end, other = 0.0)
             else:
@@ -1363,12 +1411,12 @@ def _paged_attn_prefill_inner(
             else:
                 v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n >= 0, QCV, n_kv_heads, head_dim, HD_PAD)
         else:
-            v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
-            if HD_PAD > head_dim:
+            v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_v[None, :])
+            if VD_PAD > V_DIM:
                 if MASKED:
-                    v_tile = tl.load(v_ptrs, mask = (offs_n[:, None] < n_end) & d_mask[None, :], other = 0.0)
+                    v_tile = tl.load(v_ptrs, mask = (offs_n[:, None] < n_end) & v_mask[None, :], other = 0.0)
                 else:
-                    v_tile = tl.load(v_ptrs, mask = d_mask[None, :], other = 0.0)
+                    v_tile = tl.load(v_ptrs, mask = v_mask[None, :], other = 0.0)
             elif MASKED:
                 v_tile = tl.load(v_ptrs, mask = offs_n[:, None] < n_end, other = 0.0)
             else:
@@ -1408,6 +1456,8 @@ def _paged_attn_prefill_kernel(
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     HD_PAD: tl.constexpr,      # power of two >= head_dim: tile width, zero-padded columns
+    VD_PAD: tl.constexpr,      # V / output tile width: power of two >= V_DIM
+    V_DIM: tl.constexpr,       # output lanes written per head (<= head_dim; the rest is not written)
     scale: tl.constexpr,
     CAUSAL: tl.constexpr,
     WINDOW_LEFT,         # runtime: span-dependent for non-causal (VLM) spans
@@ -1454,7 +1504,9 @@ def _paged_attn_prefill_kernel(
 
     m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_M,), 0.0, tl.float32)
-    acc = tl.zeros((BLOCK_M, HD_PAD), tl.float32)
+    acc = tl.zeros((BLOCK_M, VD_PAD), tl.float32)
+    offs_v = tl.arange(0, VD_PAD)
+    v_mask = offs_v < V_DIM
     offs_n_base = tl.arange(0, BLOCK_N)
     block_table_b = block_table + batch * num_pages_per_seq
 
@@ -1498,13 +1550,13 @@ def _paged_attn_prefill_kernel(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(s_hi, past), q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, False, BLOCK_N,
+            True, False, BLOCK_N, VD_PAD, V_DIM,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(s_lo, past), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, True, BLOCK_N,
+            True, True, BLOCK_N, VD_PAD, V_DIM,
         )
     elif NEW_KV == 2:
         # Cache known empty: same structure as the cache path, reading the contiguous source
@@ -1514,20 +1566,20 @@ def _paged_attn_prefill_kernel(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
                 n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-                False, True, BLOCK_N,
+                False, True, BLOCK_N, VD_PAD, V_DIM,
             )
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
                 n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-                True, True, BLOCK_N,
+                True, True, BLOCK_N, VD_PAD, V_DIM,
             )
         else:
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
                 n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-                True, True, BLOCK_N,
+                True, True, BLOCK_N, VD_PAD, V_DIM,
             )
     elif CAUSAL and not HAS_WINDOW_LEFT and not HAS_WINDOW_RIGHT:
         n_full = tl.maximum(((q_abs_min + 1) // BLOCK_N) * BLOCK_N, 0)
@@ -1535,20 +1587,20 @@ def _paged_attn_prefill_kernel(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            False, False, BLOCK_N,
+            False, False, BLOCK_N, VD_PAD, V_DIM,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, False, BLOCK_N,
+            True, False, BLOCK_N, VD_PAD, V_DIM,
         )
     else:
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, False, BLOCK_N,
+            True, False, BLOCK_N, VD_PAD, V_DIM,
         )
 
     if IS_SPLIT:
@@ -1557,8 +1609,8 @@ def _paged_attn_prefill_kernel(
             pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits + split).to(tl.int64)
         else:
             pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits + split
-        po_base = pid_lin * BLOCK_M * HD_PAD
-        tl.store(partial_o + po_base + tl.arange(0, BLOCK_M)[:, None] * HD_PAD + offs_d[None, :], acc)
+        po_base = pid_lin * BLOCK_M * VD_PAD
+        tl.store(partial_o + po_base + tl.arange(0, BLOCK_M)[:, None] * VD_PAD + offs_v[None, :], acc)
         ml_base = pid_lin * BLOCK_M * 2
         tl.store(partial_ml + ml_base + tl.arange(0, BLOCK_M) * 2, m)
         tl.store(partial_ml + ml_base + tl.arange(0, BLOCK_M) * 2 + 1, l)
@@ -1573,8 +1625,8 @@ def _paged_attn_prefill_kernel(
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
         if QCV > 0:
             out_tile = _rot_h32(out_tile, h32, BLOCK_M, HD_PAD)
-        out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
-        tl.store(out_ptrs, out_tile, mask = valid_row[:, None] & d_mask[None, :])
+        out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_v[None, :])
+        tl.store(out_ptrs, out_tile, mask = valid_row[:, None] & v_mask[None, :])
 
 
 @triton.jit
@@ -1590,9 +1642,10 @@ def _paged_attn_prefill_combine_kernel(
     q_len,               # runtime: only masks and address math
     n_q_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    HD_PAD: tl.constexpr,
+    HD_PAD: tl.constexpr,      # partial / output tile width (the prefill kernel's VD_PAD)
     WIDE_INDEX: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    V_DIM: tl.constexpr,       # output lanes written per head
 ):
     pid_m = tl.program_id(0)
     bh = tl.program_id(1)
@@ -1601,7 +1654,7 @@ def _paged_attn_prefill_combine_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HD_PAD)
-    d_mask = offs_d < head_dim
+    d_mask = offs_d < V_DIM
     rows = tl.arange(0, BLOCK_M)
     # same int32 overflow considerations as the prefill kernel: partial and out offsets widen
     if WIDE_INDEX:
@@ -1649,6 +1702,9 @@ def _paged_attn_prefill_combine_kernel(
 # rule, and 4090/5090 disagree per point). Measure both once per kernel family -- the key is
 # all launch constants, so this settles after one prefill per family -- and cache the winner.
 # EXL3_QC_PREFILL_NS=1/2 forces a stage count for A/B testing (read once at import)
+# EXL3_ATTN_PREFILL_CFG="block_m,block_n,num_warps,num_stages" overrides the prefill tile pick (A/B,
+# read per call). EXL3_ATTN_VDIM=0 restores the full-width V product.
+
 _qc_prefill_ns_cache = {}
 _qc_prefill_ns_env = int(os.environ.get("EXL3_QC_PREFILL_NS", "0") or "0")
 
@@ -1698,6 +1754,7 @@ def paged_attn_triton_prefill(
     n_kv_heads_override: int | None = None,
     k_new: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
+    v_dim: int | None = None,
 ) -> torch.Tensor:
     """Prefill (large q_len) attention over the paged cache.
 
@@ -1748,6 +1805,13 @@ def paged_attn_triton_prefill(
     if qc is not None and head_dim % 32 != 0:
         raise ValueError("quantized caches need head_dim to be a multiple of 32")
     hd_pad = triton.next_power_of_2(head_dim)   # tile width; non-power-of-two dims are zero-padded
+    # V narrower than Q/K (MiMo: 128 of 192, zero-padded in the cache): the PV product and the
+    # output only cover the first v_dim lanes; the output's remaining lanes are not written
+    # (callers trim them). Quantized caches keep the full width (their V decode is head-wide)
+    if v_dim is None or qc is not None or os.environ.get("EXL3_ATTN_VDIM", "1") == "0":
+        v_dim = head_dim
+    assert 0 < v_dim <= head_dim
+    vd_pad = triton.next_power_of_2(v_dim)
 
     kv_append_len = pre_appended_len
     if k is not None or v is not None:
@@ -1822,9 +1886,15 @@ def paged_attn_triton_prefill(
     if hd_pad <= 128:
         cfg = (128, 32, 8, 2) if blackwell else (128, 64, 8, 2)
     elif hd_pad <= 256:
-        cfg = (64, 32, 8, 2)
+        # gfx1151, MiMo geometry (qk 192 -> 256 tile, 16 q heads per kv head), 2048-row chunk:
+        # (128, 32, 8, 2) runs 3-4x faster than (64, 32, 8, 2) at every past length measured
+        # (tools/prefill/attn_bench.py: 62.7 vs 194 ms at 14k past with v_dim 128)
+        cfg = (128, 32, 8, 2) if torch.version.hip else (64, 32, 8, 2)
     else:
         cfg = (32, 16, 4, 2)
+    _cfg_env = os.environ.get("EXL3_ATTN_PREFILL_CFG")
+    if _cfg_env:
+        cfg = tuple(int(x) for x in _cfg_env.split(","))
     num_stages_forced = num_stages is not None
     block_m = block_m or cfg[0]
     block_n = block_n or cfg[1]
@@ -1867,11 +1937,11 @@ def paged_attn_triton_prefill(
             # partial buffer is enormous (64k q_len x 32 heads: ~2 GB per split). The gain there
             # is negligible by construction, so bound the buffer rather than trust the penalty
             max_partial_bytes = 128 * 1024 * 1024
-            max_splits = max(1, max_partial_bytes // (programs * block_m * hd_pad * 4))
+            max_splits = max(1, max_partial_bytes // (programs * block_m * vd_pad * 4))
             num_splits = min(num_splits, max_splits)
 
     if num_splits > 1:
-        partial_o = torch.empty(programs * num_splits * block_m * hd_pad, dtype = torch.float32, device = q.device)
+        partial_o = torch.empty(programs * num_splits * block_m * vd_pad, dtype = torch.float32, device = q.device)
         partial_ml = torch.empty(programs * num_splits * block_m * 2, dtype = torch.float32, device = q.device)
     else:
         partial_o = q   # unused
@@ -1900,7 +1970,7 @@ def paged_attn_triton_prefill(
                 k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
                 num_splits, num_splits > 1, new_kv_mode, qck, qcv,
                 q_len, kv_append_len, n_q_heads, n_kv_heads,
-                num_pages_per_seq, page_size, head_dim, hd_pad, float(softmax_scale),
+                num_pages_per_seq, page_size, head_dim, hd_pad, vd_pad, v_dim, float(softmax_scale),
                 bool(causal), int(window_left), int(window_right),
                 window_left >= 0, window_right >= 0, float(softcap or 0.0),
                 has_sinks, wide_index, block_m, block_n,
@@ -1925,7 +1995,7 @@ def paged_attn_triton_prefill(
         if num_splits > 1:
             _paged_attn_prefill_combine_kernel[(q_blocks, bsz * n_q_heads)](
                 partial_o, partial_ml, out, h32, sinks,
-                num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, hd_pad, wide_index, block_m,
+                num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, vd_pad, wide_index, block_m, v_dim,
                 num_warps=8, num_stages=1,
             )
     return out
@@ -1954,6 +2024,7 @@ def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
         sinks = args.sinks,
         k_new = args.k,
         v_new = args.v,
+        v_dim = args.v_dim,
     )
 
 
@@ -1985,6 +2056,7 @@ def fn_triton_paged_attn_prefill(args: AttnArgs) -> torch.Tensor | None:
         window_size=args.get_window_size(),
         softcap=args.softcap,
         sinks=args.sinks,
+        v_dim=args.v_dim,
     )
 
 

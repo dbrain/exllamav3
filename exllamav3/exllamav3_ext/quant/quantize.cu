@@ -13,6 +13,7 @@
 #include "codebook.cuh"
 #include "exl3_devctx.cuh"
 #include <cmath>
+#include <string>
 
 #define H_INF __ushort_as_half(0x7c00)
 
@@ -103,34 +104,116 @@ bool quantize_tiles_use_optimized(int major, int minor, int K, int cb)
     return false;
 }
 
+#if defined(USE_ROCM)
+#include "quantize_tiles_rdna.cuh"
+
+template <int K, int cb, int NT>
+static fp_quantize_tiles_kernel qt_rdna_nt() { return quantize_tiles_rdna_kernel<K, cb, 256, NT>; }
+
+// Grouped gfx11 kernel instances (L = 256). Block sizes per K: the default first, alternatives
+// selectable with EXL3_QT_RDNA_NT for tuning
+template <int cb>
+static fp_quantize_tiles_kernel qt_rdna_instance(int K, int nt)
+{
+    if (K == 2) return nt == 512 ? qt_rdna_nt<2, cb, 512>() : qt_rdna_nt<2, cb, 1024>();
+    if (K == 3) return nt == 256 ? qt_rdna_nt<3, cb, 256>() : nt == 512 ? qt_rdna_nt<3, cb, 512>() : qt_rdna_nt<3, cb, 1024>();
+    return qt_rdna_nt<4, cb, 256>();
+}
+
+static int qt_rdna_shmem_for(int K)
+{
+    return K == 2 ? qt_rdna_shmem<2, 256>() : K == 3 ? qt_rdna_shmem<3, 256>() : qt_rdna_shmem<4, 256>();
+}
+
+static int64_t qt_rdna_history_for(int K)
+{
+    return K == 2 ? qt_rdna_history_bytes<2, 256>() : K == 3 ? qt_rdna_history_bytes<3, 256>() : qt_rdna_history_bytes<4, 256>();
+}
+#endif
+
+enum { QT_BASE = 0, QT_OPTIMIZED = 1, QT_RDNA = 2 };
+
+// Kernel family for (K, codebook, L). EXL3_QT_KERNEL=base/opt/rdna forces one for testing (rdna
+// falls back to base where it has no instance); EXL3_QT_OPTIMIZED=1/0 keeps its old meaning.
+// On ROCm the grouped kernel is the default for K = 2..3, the dense specialization for K = 4..5.
+// All are measured bit-identical to the base kernel on gfx1151. K = 4 routes to dense because the
+// grouped kernel only matches base there while dense is ~2.5-3x base (measured for K = 2..3
+// and K = 5 as well).
+static int quantize_tiles_mode(int major, int minor, int K, int cb, int L)
+{
+    if (const char* env = std::getenv("EXL3_QT_KERNEL"))
+    {
+        std::string v(env);
+        if (v == "opt") return QT_OPTIMIZED;
+        if (v == "base") return QT_BASE;
+#if defined(USE_ROCM)
+        if (v == "rdna") return (L == 256 && K >= 2 && K <= 4) ? QT_RDNA : QT_BASE;
+#endif
+    }
+    if (std::getenv("EXL3_QT_OPTIMIZED"))
+        return quantize_tiles_use_optimized(major, minor, K, cb) ? QT_OPTIMIZED : QT_BASE;
+#if defined(USE_ROCM)
+    if (L == 256 && K >= 2 && K <= 3) return QT_RDNA;
+    if (K == 4 || K == 5) return QT_OPTIMIZED;
+    return QT_BASE;
+#else
+    return quantize_tiles_use_optimized(major, minor, K, cb) ? QT_OPTIMIZED : QT_BASE;
+#endif
+}
+
 // Kernel and launch geometry for one (K, codebook, L) on the current device: which implementation,
 // its block size (read back from the compiled kernel, so a PTX-JIT'd instance launches with the
 // size it was built for), dynamic shared memory and the resident blocks per SM
 struct QtLaunch
 {
-    bool optimized;
+    int mode;
     fp_quantize_tiles_kernel kernel;
     int num_threads;
     int shmem;
     int blocks_per_sm;
+    int64_t history_bytes;
 };
 
 static QtLaunch qt_launch(int device, int K, int cb, int L)
 {
     const auto* props = at::cuda::getDeviceProperties(device);
-    const bool optimized = quantize_tiles_use_optimized(props->major, props->minor, K, cb);
+    const int mode = quantize_tiles_mode(props->major, props->minor, K, cb, L);
+    const bool optimized = mode == QT_OPTIMIZED;
     const int edges = 65536 >> K;
-    const int cost_arrays = optimized && K == 1 ? 1 : (K >= 2 ? 2 : 0);
-    const int shmem = cost_arrays * edges * sizeof(half) + L * sizeof(half) + 64 + 128;
-    const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
-    const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
-    auto kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
-    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    int shmem;
+    fp_quantize_tiles_kernel kernel;
+    int64_t history_bytes;
+#if defined(USE_ROCM)
+    if (mode == QT_RDNA)
+    {
+        const char* nt_env = std::getenv("EXL3_QT_RDNA_NT");
+        const int nt = nt_env ? std::atoi(nt_env) : 0;
+        kernel = cb == 0 ? qt_rdna_instance<0>(K, nt) : cb == 1 ? qt_rdna_instance<1>(K, nt) : qt_rdna_instance<2>(K, nt);
+        shmem = qt_rdna_shmem_for(K);
+        history_bytes = qt_rdna_history_for(K);
+    }
+    else
+#endif
+    {
+#if defined(USE_ROCM)
+        // gfx1151's 64 KiB LDS cannot hold K=1/2 trellis costs plus the input tile and traceback scratch.
+        // Both HIP kernels use the caller-provided global cost buffers at those K values.
+        const int cost_arrays = K >= 3 ? 2 : 0;
+#else
+        const int cost_arrays = optimized && K == 1 ? 1 : (K >= 2 ? 2 : 0);
+#endif
+        shmem = cost_arrays * edges * sizeof(half) + L * sizeof(half) + 64 + 128;
+        const auto& instances = optimized ? quantize_tiles_optimized_instances : quantize_tiles_kernel_instances;
+        const auto& instances_l160 = optimized ? quantize_tiles_optimized_instances_l160 : quantize_tiles_kernel_instances_l160;
+        kernel = L == 256 ? instances[K - 1 + 8 * cb] : instances_l160[K - 1];
+        history_bytes = optimized ? (int64_t) L * edges / (K == 1 ? 8 : 1) : (int64_t) L * edges * 2;
+    }
+    cuda_check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
     cudaFuncAttributes attr;
-    cuda_check(cudaFuncGetAttributes(&attr, kernel));
+    cuda_check(cudaFuncGetAttributes(&attr, reinterpret_cast<const void*>(kernel)));
     int blocks_per_sm;
     cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, attr.maxThreadsPerBlock, shmem));
-    return {optimized, kernel, attr.maxThreadsPerBlock, shmem, blocks_per_sm};
+    return {mode, kernel, attr.maxThreadsPerBlock, shmem, blocks_per_sm, history_bytes};
 }
 
 // For the Python scratch allocation: whether the dense specialization runs for this configuration
@@ -141,7 +224,7 @@ std::tuple<bool, int64_t> quantize_tiles_scratch(int device, int K, bool mcg, bo
     TORCH_CHECK(K >= 1 && K <= 8, "quantize_tiles_scratch: K must be 1..8");
     TORCH_CHECK(L == 256 || (L == 160 && mul1), "quantize_tiles_scratch: length 160 requires the mul1 codebook");
     auto launch = qt_launch(device, K, mul1 ? 2 : mcg ? 1 : 0, L);
-    return {launch.optimized, (int64_t) launch.blocks_per_sm * DevCtx::instance().get_num_sms(device)};
+    return {launch.mode != QT_BASE, (int64_t) launch.blocks_per_sm * DevCtx::instance().get_num_sms(device)};
 }
 
 
@@ -188,20 +271,20 @@ void quantize_tiles
     if (mul1) cb = 2;
     TORCH_CHECK(L == 256 || cb == 2, "quantize_tiles length 160 requires the mul1 codebook");
     const auto launch = qt_launch(device, K, cb, L);
-    const bool optimized = launch.optimized;
+    const bool optimized = launch.mode == QT_OPTIMIZED;
+    const bool byte_layout = launch.mode != QT_BASE;
     const auto kernel = launch.kernel;
     const int num_threads = launch.num_threads;
     const int shmem = launch.shmem;
     const int blocks_per_sm = launch.blocks_per_sm;
     int64_t scratch_tiles;
-    if (optimized)
+    if (byte_layout)
     {
         TORCH_CHECK(temp_edges.scalar_type() == at::kByte || temp_edges.scalar_type() == at::kShort,
                     "quantize_tiles optimized history must be byte or short storage");
-        TORCH_CHECK(reinterpret_cast<uintptr_t>(temp_edges.data_ptr()) % (K == 1 ? 4 : 2) == 0,
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(temp_edges.data_ptr()) % 8 == 0,
                     "quantize_tiles history has insufficient alignment");
-        const int history_bytes = L * edges / (K == 1 ? 8 : 1);
-        scratch_tiles = temp_edges.numel() * temp_edges.element_size() / history_bytes;
+        scratch_tiles = temp_edges.numel() * temp_edges.element_size() / launch.history_bytes;
     }
     else
     {

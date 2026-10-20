@@ -6,7 +6,8 @@ from ..ext import exllamav3_ext as ext
 
 # Kernel-fused issue/collect for decode-size split jobs (EXL3_MOE_SPLIT_FUSED=0 restores the
 # cudaMemcpyAsync path for A/B testing)
-_split_fused = os.environ.get("EXL3_MOE_SPLIT_FUSED", "1") != "0"
+import torch as _torch
+_split_fused = os.environ.get("EXL3_MOE_SPLIT_FUSED", "1") != "0" and not _torch.version.hip
 
 # EXL3_SPLIT_PROF=1: CUDA-event brackets around the fused issue enqueue and the collect
 # wait+readback, reported as stream-time percentiles every ~2048 brackets. The collect
@@ -100,6 +101,8 @@ class BlockSparseMLP_CPU:
         skips its GPU load entirely on True."""
         ip = self.config.infer_params
         comp = getattr(ip, "moe_cpu_component", "text")
+        if comp != "text":
+            return False
         budget = getattr(ip, "moe_cpu_offload", 0) if comp == "text" \
             else getattr(ip, "draft_moe_cpu_offload", 0)
         if budget:
@@ -476,7 +479,8 @@ class BlockSparseMLP_CPU:
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
         self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
-            and not self.tid2eid_key
+            and not self.tid2eid_key \
+            and not _torch.version.hip
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         if stats_path and self._split_dynamic:
             # Static placement from a stats file only applies with dynamic swapping disabled

@@ -9,6 +9,18 @@ from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+import os
+import time as _time
+
+# EXL3_QUANT_PROFILE=1: host-wall accumulator for capture_H, printed per module by
+# convert_model (stage=capture_split). Wall time includes any device-sync stall that
+# happens inside the call; the counters themselves add no syncs or allocations.
+_CAP_PROFILE = os.environ.get("EXL3_QUANT_PROFILE") == "1"
+CAP_STAT = {"wall": 0.0, "calls": 0}
+FLUSH_STAT = {"wall": 0.0, "calls": 0}
+# EXL3_CAPTURE_LEGACY=1 restores the pre-batch path (per-call host sync on the finiteness
+# check, per-call fp32 copy, immediate addmm_). Default is the deferred batched flush.
+_CAP_LEGACY = os.environ.get("EXL3_CAPTURE_LEGACY") == "1"
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -45,6 +57,7 @@ class Linear(Module):
         frange_dim: int = 0,
         fidx: int | None = None,
         finterleaved: bool = False,
+        fdequant = None,
         caps: dict = None,
         softcap: float = 0.0,
         pad_to: int = 128,
@@ -62,7 +75,8 @@ class Linear(Module):
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
         select_hq_bits: int = 0,
-        qgroup: str = None
+        qgroup: str = None,
+        no_defer_load: bool = False
     ):
         super().__init__(config, key, qmap)
 
@@ -83,6 +97,9 @@ class Linear(Module):
         self.frange_dim = frange_dim
         self.fidx = fidx
         self.finterleaved = finterleaved
+        # Optional architecture-supplied reader for the fused checkpoint tensor named by fkey.
+        # Signature: (stc, fkey, device) -> fp16 (out_features, in_features) tensor
+        self.fdequant = fdequant
         self.quant_type = None
         self.softcap = softcap
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
@@ -93,6 +110,7 @@ class Linear(Module):
         self.transposed_load = transposed_load
         self.transpose_fused_weights = transpose_fused_weights
         self.ftranspose_after_load = ftranspose_after_load
+        self.no_defer_load = no_defer_load
         self.select_hq_bits = select_hq_bits
         self.qgroup = qgroup or key
         self.lora_a_tensors = {}
@@ -162,7 +180,10 @@ class Linear(Module):
     # grid. E8M0 scales arrive as uint8 exponent bytes, value 2^(byte - 127). Mirrors the
     # transformers finegrained_fp8 reference dequant.
     def dequant_e8m0_blocks_(self, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        if weight.dtype == torch.int8:
+        # MiMo-V2 stores the same packed-FP4 expert weights as U8 rather than I8; the bytes are
+        # identical (SGLang's loader only bitcasts to match its int8 parameter, then masks as
+        # unsigned again), so both dtypes take the unpack path
+        if weight.dtype in (torch.int8, torch.uint8):
             u8 = weight.contiguous().view(torch.uint8)
             lut = torch.tensor(_MXFP4_LUT, dtype = torch.float, device = weight.device)
             w = torch.stack((lut[(u8 & 0x0F).long()], lut[(u8 >> 4).long()]), dim = -1)
@@ -194,6 +215,14 @@ class Linear(Module):
                 pad1 = (self.out_features,) if not self.is_sliced else None
                 pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
                 scale_q = self.config.stc.get_tensor(key + ".scale", dev, optional = True, no_defer = True)
+                if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
+                    # MiMo-V2 routed experts: same E8M0 block grid, named "weight_scale" and
+                    # stored as U8 exponent bytes. Only 2D uint8 scales route here; float
+                    # "weight_scale" tensors keep the per-row/per-tensor fp8 path below. Fetched
+                    # untransposed because the dequant runs in checkpoint (out, in) orientation
+                    ws_q = self.config.stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+                    if ws_q is not None and ws_q.dim() == 2 and ws_q.dtype == torch.uint8:
+                        scale_q = ws_q
                 if scale_q is not None and scale_q.dim() == 2:
                     # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
                     # orientation (out, in); dequant first, then orient/pad like a plain load
@@ -208,7 +237,7 @@ class Linear(Module):
                     scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     assert scale is None or scale_inv is None
-                    no_defer = scale is not None or scale_inv is not None or self.weight_scale != 1.0
+                    no_defer = self.no_defer_load or scale is not None or scale_inv is not None or self.weight_scale != 1.0
                     weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
                     bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)
                 if scale is not None:
@@ -341,24 +370,33 @@ class Linear(Module):
 
         elif self.fkey and self.config.stc.has_tensor_group(self.fkey, ["weight"]) and self.frange is not None:
 
-            weight = self.config.stc.get_tensor(
-                self.fkey + ".weight",
-                self.device,
-                no_defer = True
-            )
-            # Fused checkpoint tensor in FP8/FP4-block form (DeepSeek-V4 wo_a): dequantize the
-            # whole tensor before slicing out this group's rows
-            scale_q = self.config.stc.get_tensor(self.fkey + ".scale", self.device, optional = True, no_defer = True)
-            if scale_q is not None and scale_q.dim() == 2:
-                weight = self.dequant_e8m0_blocks_(weight, scale_q)
+            if self.fdequant is not None:
+                # Architecture-supplied reader for a fused tensor whose checkpoint layout the
+                # generic paths cannot describe (MiMo-V2: TP-shard-interleaved fused QKV with a
+                # per-shard, ceiling-padded FP8 scale grid). Returns the canonical, contiguous
+                # (out_features, in_features) fp16 matrix that frange indexes into
+                weight = self.fdequant(self.config.stc, self.fkey, self.device)
+                bias = None
+            else:
+                weight = self.config.stc.get_tensor(
+                    self.fkey + ".weight",
+                    self.device,
+                    no_defer = True
+                )
+                # Fused checkpoint tensor in FP8/FP4-block form (DeepSeek-V4 wo_a): dequantize the
+                # whole tensor before slicing out this group's rows
+                scale_q = self.config.stc.get_tensor(self.fkey + ".scale", self.device, optional = True, no_defer = True)
+                if scale_q is not None and scale_q.dim() == 2:
+                    weight = self.dequant_e8m0_blocks_(weight, scale_q)
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
             weight = self.pad_out(weight)
-            bias = self.config.stc.get_tensor(
-                self.fkey + ".bias",
-                self.device,
-                optional = True,
-                no_defer = True
-            )
+            if self.fdequant is None:
+                bias = self.config.stc.get_tensor(
+                    self.fkey + ".bias",
+                    self.device,
+                    optional = True,
+                    no_defer = True
+                )
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
                 bias = self.pad_out(bias)
@@ -562,6 +600,7 @@ class Linear(Module):
 
 
     def capture_H(self, x: torch.Tensor, params: dict):
+        _cap_t0 = _time.perf_counter() if _CAP_PROFILE else None
         if self.qmap not in params["capture"]:
             params["capture"][self.qmap] = self.init_H_data(True)
 
@@ -569,20 +608,38 @@ class Linear(Module):
         ext.count_inf_nan(x, params["capture"][self.qmap]["inf_nan"])
 
         if params["capture"][self.qmap]["first_key"] == self.key:
-            rows = np.prod(x.shape[:-1])
-            dim = x.shape[-1]
-            x = x.view((rows, dim)).to(torch.float, copy = True)  # TODO: Why copy here?
+            if _CAP_LEGACY:
+                rows = np.prod(x.shape[:-1])
+                dim = x.shape[-1]
+                x = x.view((rows, dim)).to(torch.float, copy = True)  # TODO: Why copy here?
 
-            # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
-            # accumulation, and no diagonal damping can repair non-finite entries afterwards.
-            # Drop the affected rows; the inf_nan counter above still reports them
-            finite = torch.isfinite(x).all(dim = 1)
-            if not finite.all():
-                x = x[finite]
-                rows = x.shape[0]
+                # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
+                # accumulation, and no diagonal damping can repair non-finite entries afterwards.
+                # Drop the affected rows; the inf_nan counter above still reports them
+                finite = torch.isfinite(x).all(dim = 1)
+                if not finite.all():
+                    x = x[finite]
+                    rows = x.shape[0]
 
-            params["capture"][self.qmap]["H"].addmm_(x.T, x)
-            params["capture"][self.qmap]["count"] += rows
+                params["capture"][self.qmap]["H"].addmm_(x.T, x)
+                params["capture"][self.qmap]["count"] += rows
+            else:
+                # Defer: queue the (viewed, uncast) activation and let flush_capture_H()
+                # filter non-finite rows device-side (zero-fill, no host sync) and
+                # accumulate this forward's entries through batched GEMMs. The finite-row
+                # count becomes a device scalar resolved once at finalize time.
+                rows = int(np.prod(x.shape[:-1]))
+                dim = x.shape[-1]
+                x = x.view((rows, dim))
+                pend = params.get("_cap_pending")
+                if pend is None:
+                    pend = []
+                    params["_cap_pending"] = pend
+                pend.append((params["capture"][self.qmap], x))
+
+        if _cap_t0 is not None:
+            CAP_STAT["wall"] += _time.perf_counter() - _cap_t0
+            CAP_STAT["calls"] += 1
 
 
     @override
@@ -820,6 +877,52 @@ class Linear(Module):
         assert unit == "channels"
         split = (True, first, last) if first is not None else None
         return Linear.tp_import_split(local_context, exported, plan, split)
+
+
+def flush_capture_H(params: dict):
+    """Consume the activations queued by capture_H() for one forward pass.
+
+    Grouped by (rows, dim, dtype): every entry goes through one fp32 bmm per chunk, then a
+    single add_ into its own H. Non-finite rows are zero-filled on the device instead of
+    being dropped behind a host sync (their contribution to H is exactly zero, and the
+    finite-row count is accumulated into each entry's count_dev scalar), so H matches the
+    legacy per-call addmm_ path to fp32 rounding (batched vs. sequential accumulation
+    order) while the forward loop runs sync-free.
+    """
+    _t0 = _time.perf_counter() if _CAP_PROFILE else None
+    pending = params.pop("_cap_pending", None)
+    if not pending:
+        return
+    shape_groups: dict = {}
+    order = []
+    for hd, x in pending:
+        key = (x.shape, x.dtype, x.device)
+        if key not in shape_groups:
+            shape_groups[key] = []
+            order.append(key)
+        shape_groups[key].append((hd, x))
+    for key in order:
+        entries = shape_groups[key]
+        # Chunk to bound the transient fp32 stack (b x rows x dim) + bmm output
+        for s in range(0, len(entries), 64):
+            chunk = entries[s:s + 64]
+            xs = torch.stack([e[1] for e in chunk])
+            xf = xs.to(torch.float)
+            finite = torch.isfinite(xf).all(dim = 2)
+            xf = xf.masked_fill_(~finite.unsqueeze(2), 0.0)
+            P = torch.bmm(xf.transpose(1, 2), xf)
+            fs = finite.sum(dim = 1)
+            for j, (hd, _x) in enumerate(chunk):
+                hd["H"].add_(P[j])
+                cd = hd.get("count_dev")
+                if cd is None:
+                    cd = torch.zeros((), dtype = torch.long, device = hd["H"].device)
+                    hd["count_dev"] = cd
+                cd.add_(fs[j])
+            xs = xf = P = fs = None
+    if _t0 is not None:
+        FLUSH_STAT["wall"] += _time.perf_counter() - _t0
+        FLUSH_STAT["calls"] += 1
 
 
 def convert_exl3_group(

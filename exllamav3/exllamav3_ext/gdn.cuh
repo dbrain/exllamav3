@@ -45,7 +45,8 @@ void cuda_recurrent_gated_delta_rule
     int k_head_dim,
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
-    bool history
+    bool history,
+    const c10::optional<at::Tensor>& state_base
 );
 
 void cuda_recurrent_gated_delta_rule_gr
@@ -61,6 +62,7 @@ void cuda_recurrent_gated_delta_rule_gr
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
+    const c10::optional<at::Tensor>& state_base,
     Graph* graph
 );
 
@@ -204,7 +206,7 @@ void kda_gate_op_gr
     const at::Tensor& qkv,          // [B,S,F] float
     const at::Tensor& b,            // [B,S,H] float
     const at::Tensor& f,            // [B,S,H*Dk] float
-    const at::Tensor& dt_bias,      // [H*Dk] bfloat16
+    const at::Tensor& dt_bias,      // [H*Dk] float or bfloat16
     const at::Tensor& a_log,        // [H] float or bfloat16
     at::Tensor& mixed_qkv,          // out [B,F,S] bfloat16
     at::Tensor& beta,               // out [B,S,H] bfloat16

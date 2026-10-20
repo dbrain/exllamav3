@@ -1,0 +1,11 @@
+.git
+.venv*
+build
+*.safetensors
+*.st
+__pycache__
+doc/container.md
+
+# Built in the image; a host build must not overwrite it
+exllamav3_ext*.so
+.rebuild.*

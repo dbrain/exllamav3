@@ -91,6 +91,10 @@ def eval_gguf(model, config, tokenizer, args, forward_fn):
 
     # Chunking (non-overlapping)
     n_chunks = len(tokens) // n_ctx
+    # Brief 05: llama.cpp's perplexity.c takes --chunks N, this mode otherwise evaluates the
+    # whole file. Cap it so both legs can be run over exactly the same number of chunks.
+    if getattr(args, "chunks", 0):
+        n_chunks = min(n_chunks, args.chunks)
     first = n_ctx // 2
     print(f"Perplexity: {len(tokens)} tokens, {n_chunks} chunks, n_ctx={n_ctx}, scoring positions [{first}, {n_ctx - 2}]")
 
@@ -256,6 +260,7 @@ if __name__ == "__main__":
     parser.add_argument("-l", "--length", type = int, help = "Length", default = 2048)
     parser.add_argument("-g", "--gguf", action = "store_true", help = "Use GGUF-equivalent eval logic (ignores -r and -l)")
     parser.add_argument("-c", "--ctx-size", type = int, help = "For GGUF-equiv.: size of the prompt context (default: 512)", default = 512)
+    parser.add_argument("--chunks", type = int, help = "For GGUF-equiv.: evaluate only the first N chunks, matching llama.cpp's --chunks (0 = all)", default = 0)
     parser.add_argument("-hf", "--hf", action = "store_true", help = "Use Transformers as backend (-m must be HF model)")
     parser.add_argument("-hf_d", "--hf_device", type = int, help = "Use specific single device ID for Transformers (default: device_map='auto')", default = None)
     parser.add_argument("-hf_t", "--hf_tight", action = "store_true", help = "For Transformers: Force FP16 dtype to save memory")

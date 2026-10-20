@@ -18,6 +18,25 @@ from .model_tp_cuda import (
 
 cleanupper = Cleanupper()
 
+
+def _has_avx512_bw(mod) -> bool:
+    """Whether the CPU has an AVX512-BW-or-better expert kernel tier.
+
+    FORK BUG WORKAROUND: moe_cpu_host.py calls exl3_moe_cpu_has_avx512_bw(),
+    but the extension exports only has_avx2 / has_avx512_vnni / has_avx512_vbmi,
+    so --moe_cpu_split and --moe_cpu_offload die with AttributeError. Both VNNI
+    and VBMI imply AVX512-BW (as this file's own comment notes: "true for the bw,
+    vnni and vbmi tiers alike"), so either one is sufficient; an AVX2-only CPU
+    stays False. Prefers the real symbol if a later build exports it.
+    """
+    fn = getattr(mod, "exl3_moe_cpu_has_avx512_bw", None)
+    if fn is not None:
+        return bool(fn())
+    vnni = getattr(mod, "exl3_moe_cpu_has_avx512_vnni", None)
+    vbmi = getattr(mod, "exl3_moe_cpu_has_avx512_vbmi", None)
+    return bool((vnni and vnni()) or (vbmi and vbmi()))
+
+
 """
 Persistent-worker handoff for CPU-offloaded MoE experts, following the native TP backend's
 CPU-helper pattern: one spawned child process owns the expert weights and consumes a job ring in
@@ -320,7 +339,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 
         # Swizzle the trellis copies band-contiguous when an AVX-512 kernel tier will consume
         # them (has_avx512_bw is true for the bw, vnni and vbmi tiers alike)
-        swz = TUNING.swizzle and cext.exl3_moe_cpu_has_avx512_bw()
+        swz = TUNING.swizzle and _has_avx512_bw(cext)
 
         def rehome_trellis(t):
             return arena.rehome(t, band_swizzle = swz and t.shape[2] // 16 != 8)
@@ -469,6 +488,14 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 class MoeCpuHost:
 
     def __init__(self, config):
+        # HIP (ROCm) support: kernel-wait flags over registered SHM only. The unported
+        # tiers (streamed prefill, fused split issue/collect, native memops) are gated off
+        # below and in block_sparse_mlp_cpu.py; the copy path + reconstruction fallback is
+        # the HIP surface.
+        if torch.version.hip and not (
+            hasattr(ext, "exl3_moe_cpu_worker_run") and hasattr(ext, "exl3_moe_flag_write")
+        ):
+            raise NotImplementedError("CPU MoE offload is unavailable on ROCm (bindings missing)")
         self.config = config
         self.model_dir = config.directory
         self.specs = []
@@ -753,7 +780,7 @@ class MoeCpuHost:
         self._start_watchdog()
         kern = "avx512-vbmi" if ext.exl3_moe_cpu_has_avx512_vbmi() else \
                ("avx512-vnni" if ext.exl3_moe_cpu_has_avx512_vnni() else \
-               ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
+               ("avx512-bw" if _has_avx512_bw(ext) else \
                ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
 
@@ -874,6 +901,10 @@ class MoeCpuHost:
         (dynamic map or static tail offset) happens inside the kernel.
         """
         rows = y.shape[0]
+        # HIP: the fused fast path needs moe_split_issue (not ported); the caller falls back
+        # to the copy path when this returns None.
+        if torch.version.hip:
+            return None
         spec = self.specs[layer_idx]
         if rows > self.cap_rows or not (y.is_contiguous() and routing_weights.is_contiguous()):
             return None
@@ -1042,7 +1073,7 @@ class MoeCpuHost:
             # Experts arrive band-swizzled when an AVX-512 CPU tier owns them (same rule as the
             # child's arena rehome, K8 excepted per matrix); the GPU restores the native tile
             # order into a parallel ring after each DMA
-            swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
+            swz = TUNING.swizzle and _has_avx512_bw(ext)
             d = dict(
                 vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
                               for _ in range(self.num_wslots)],
@@ -1182,6 +1213,11 @@ class MoeCpuHost:
         after them, so the CPU works the tail while the GPU streams. Falls back to the plain CPU
         path when nothing qualifies.
         """
+        # HIP: the streamed prefill tier depends on the fused exl3_moe binding (absent in the
+        # HIP build) and the CUDA stream-state machinery; route everything through the plain
+        # CPU handoff instead (verified reconstruction-equivalent path).
+        if torch.version.hip:
+            return self.submit(layer_idx, y, selected_experts, routing_weights)
         spec = self.specs[layer_idx]
         rows = y.shape[0]
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
@@ -1264,6 +1300,11 @@ class MoeCpuHost:
         A = assignments
         # Plain CPU path: the fp32 output and the readback staging
         fixed = rows * h * 4 + min(self.cap_rows, rows) * h * 4
+        # HIP: submit_prefill() routes every call through the plain CPU handoff (the streamed
+        # tier needs the fused exl3_moe binding), so the worst case is the plain path too.
+        # Without this the estimator reaches ext.exl3_moe_max_concurrency, absent on ROCm.
+        if torch.version.hip:
+            return fixed, 0
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
                 or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
             return fixed, 0

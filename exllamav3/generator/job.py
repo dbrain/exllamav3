@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import torch
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -8,6 +9,7 @@ import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
 import random
+import logging
 import time
 from ..ext import exllamav3_ext as ext
 from .loop_detect import LoopDetector
@@ -41,6 +43,19 @@ def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | No
     offsets = np.frombuffer(np.array(offsets, dtype = np.int32), dtype = np.uint8)
     return concat_strings, offsets
 
+
+_TT = bool(os.environ.get("KYO_TURN_TRACE"))
+# EXL3_TAIL_REPLY=1 (default off): a finished job also stashes a tail checkpoint at the END of its reply, so the
+# next turn (prompt = old prompt + reply + new message) resumes after the reply instead of replaying its last page
+_TAIL_REPLY = os.environ.get("EXL3_TAIL_REPLY", "0") == "1"
+def _ttrace_begin():
+    if not _TT: return 0.0
+    torch.cuda.synchronize()
+    return time.perf_counter()
+def _ttrace_end(what, t):
+    if not _TT: return
+    torch.cuda.synchronize()
+    print(f"trace:   {what}: {(time.perf_counter() - t) * 1000:.1f} ms", flush=True)
 
 class Job:
 
@@ -307,6 +322,13 @@ class Job:
         # Recurrent state
         self.recurrent_state = None
         self.last_recurrent_checkpoint_pos = None
+        self.roll_ckpt = os.environ.get("EXL3_ROLL_CKPT", "0") == "1"
+        self.roll_key = None
+        # EXL3_CKPT_INTERVAL_PP (default 0 = the generator's recurrent_checkpoint_interval_pp, 32768): checkpoint spacing
+        # during prompt ingestion before the tail window, read per job. A smaller grid lets a NEW conversation that shares
+        # only a long prefix (system prompt) of a cached one resume near the shared end instead of at token 0
+        self.ckpt_interval_pp = int(os.environ.get("EXL3_CKPT_INTERVAL_PP", "0"))
+        assert self.ckpt_interval_pp % PAGE_SIZE == 0, "EXL3_CKPT_INTERVAL_PP must be a multiple of the page size"
 
         # Loop detector
         self.loop_detector = None
@@ -322,6 +344,14 @@ class Job:
 
         # MTP state
         self.mtp_last_hidden = None
+        # EXL3_PF_DEFER: draft prefill chunks stashed by prefill() and run after the first token
+        # (generator._flush_mtp_defer); end = position of the last prompt token, carry = hidden state before it
+        self.mtp_defer = None
+        self.mtp_defer_plain = False
+        self.mtp_defer_end = 0
+        self.mtp_defer_carry = None
+        # set by _tail_restore: this job resumed mid-page, later chunks may start unaligned (reset on requeue)
+        self._unaligned_start = False
 
 
     def get_pinned_logit_mask(self):
@@ -717,7 +747,13 @@ class Job:
                         "eos_triggering_token_id": stop_token,
                         "eos_triggering_token_str": id_to_piece[stop_token]
                     })
-                    pass
+                    # The stop token itself is not streamed as a token, but its probability and top candidates are reported
+                    # (the entry of the position where the stop token was sampled), so a client can score every position.
+                    if self.held_probs:
+                        r.update({ "stop_token_prob": self.held_probs.torch()[:, -1:].clone() })
+                    if self.held_k_tokens:
+                        r.update({ "stop_token_top_k_tokens": self.held_k_tokens.torch()[:, -1:].clone() })
+                        r.update({ "stop_token_top_k_probs": self.held_k_probs.torch()[:, -1:].clone() })
                 if eos_reason == "stop_string":
                     r.update({ "eos_triggering_string": stop_string })
 
@@ -939,6 +975,8 @@ class Job:
             # An MTP draft carry refers to the pre-rewind context; drop it so drafting pauses until the next
             # target forward (or replay prefill) provides a fresh one. Signal the generator that any in-flight
             # draft verification window must be abandoned.
+            if self.mtp_defer:
+                self.generator._flush_mtp_defer(self, with_tail = self.mtp_defer_plain)
             self.mtp_last_hidden = None
             self.checkpoint_rewound = True
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
@@ -1219,12 +1257,64 @@ class Job:
             if seq.prefill_complete:
                 continue
 
+            restored = self._tail_restore(seq)
+            if restored:
+                progress += restored
+                if seq.prefill_complete:
+                    continue
+
             cp_pos = self.recurrent_state.position if self.recurrent_state is not None else -1
 
             prefill_start = seq.kv_position
-            prefill_end = seq.kv_position + self.generator.max_chunk_size
-            prefill_end = (prefill_end // PAGE_SIZE) * PAGE_SIZE
+            # Adaptive chunking (EXL3_PREFILL_BIG_CHUNK, default 4096, 0 = off): long prompts take big
+            # chunks (more rows per MoE expert per pass) while more than big + max_chunk_size tokens
+            # remain. The skipped boundary p + big - max_chunk_size then stays below the tail window
+            # (last 2 * max_chunk_size tokens, see is_checkpoint_boundary), so the tail keeps every
+            # recurrent checkpoint of plain max_chunk_size chunking
+            chunk = self.generator.max_chunk_size
+            big = int(os.environ.get("EXL3_PREFILL_BIG_CHUNK", "4096"))
+            if big > 65535:
+                raise ValueError(f"EXL3_PREFILL_BIG_CHUNK={big}: a forward is limited to 65535 rows (mixer kernel grid.y)")
+            # EXL3_PREFILL_BIG_CHUNK_MAXPOS (default 0 = off): from this kv position on, plain chunks again (smaller
+            # workspace, lower peak GPU/unified memory at very long context); the cached big-chunk workspace is
+            # released once per job at the switch
+            maxpos = int(os.environ.get("EXL3_PREFILL_BIG_CHUNK_MAXPOS", "0"))
+            if maxpos and big > chunk and seq.kv_position >= maxpos:
+                big = chunk
+                if not getattr(self, "_big_chunk_released", False):
+                    self._big_chunk_released = True
+                    torch.cuda.empty_cache()
+            remaining = len(seq.sequence_ids) - 1 - seq.kv_position
+            big_tail = big > chunk and big % chunk == 0 and self.big_tail_enabled()
+            if big_tail:
+                # EXL3_PREFILL_BIG_TAIL=1 (with EXL3_MIDCHUNK_CKPT=2): big chunks also inside the tail window, the
+                # mid-chunk path stashes every checkpoint boundary a chunk crosses (one per chunk: the mode-2
+                # kernel side-writes a single row, so a chunk is cut at its second interior boundary). A remainder
+                # <= big is one chunk (no tiny tail chunk)
+                chunk = min(remaining, big)
+                interior = [
+                    p for p in range((seq.kv_position // PAGE_SIZE + 1) * PAGE_SIZE, seq.kv_position + chunk, PAGE_SIZE)
+                    if self.is_checkpoint_boundary(pos = p)
+                ]
+                # EXL3_NC2_CKPT4: the CK4 kernel build side-writes up to 4 rows = 3 interior boundaries + the last full
+                # page (EXL3_PF_NO_TAIL), so an 8K prompt under EXL3_PREFILL_BIG_CHUNK=8192 runs as one chunk
+                keep = 3 if os.environ.get("EXL3_NC2_CKPT4", "0") == "1" else 1
+                if len(interior) > keep:
+                    chunk = interior[keep] - seq.kv_position
+            elif big > chunk and big % chunk == 0 and remaining > big + chunk:
+                chunk = big
+            prefill_end = seq.kv_position + chunk
+            if not (big_tail and prefill_end >= len(seq.sequence_ids) - 1):
+                prefill_end = (prefill_end // PAGE_SIZE) * PAGE_SIZE
             prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
+            # EXL3_PF_NO_TAIL=1 (GDN models): the last chunk runs to the end of the prompt even when that is not a page
+            # boundary (it would otherwise be a second forward pass re-reading every expert); the last-page recurrent
+            # checkpoint is written from inside the chunk (see no_tail_row below). EXL3_PF_TAIL_MERGE: extra rows beyond the
+            # chunk size a merged last chunk may take (default 0: only what fits in one chunk)
+            gdn_nt = self.gdn_no_tail_enabled()
+            if gdn_nt and seq.kv_position % PAGE_SIZE == 0 and \
+                    remaining <= chunk + int(os.environ.get("EXL3_PF_TAIL_MERGE", "0")):
+                prefill_end = len(seq.sequence_ids) - 1
 
             atomic_mm_prefill = bool(self.embeddings) and self.generator.model.caps.get("atomic_mm_prefill")
             mm_exact_chunks = bool(self.embeddings) and self.generator.model.caps.get("mm_exact_chunks")
@@ -1257,7 +1347,7 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks
+            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks or self._unaligned_start
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -1303,14 +1393,53 @@ class Job:
                     progress += best_match
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
+            # EXL3_RECURRENT_LAST_PAGE=0 skips that pass (fewer chunks, e.g. a 4K prompt in one pass at
+            # chunk 4096) at the cost of the prompt-end checkpoint: follow-up turns then restore from
+            # the last interval checkpoint instead of the last full page
             recurrent_last_page = False
-            if self.generator.recurrent_cache is not None:
+            no_tail_row = None
+            if self.generator.recurrent_cache is not None and os.environ.get("EXL3_RECURRENT_LAST_PAGE", "1") != "0":
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
-                if prefill_start < last_page_b <= prefill_end:
+                # The gap is measured from the start of the prompt for a page-aligned resume, as in a cold prefill, so the
+                # last chunks have the same shapes cold and resumed (a 6144 resume of a 7000-token prompt ran one 855-row
+                # chunk instead of cold's 768 + 87 and the recurrent state differed). Only a mid-page resume (tail
+                # checkpoint, never comparable to a cold prefill) keeps the distance to its checkpoint.
+                # EXL3_TAIL_OFFGRID=1 (default off): a page-aligned resume off the chunk grid (a branch or last-page checkpoint)
+                # never matches a cold prefill's chunks either, so it also measures the gap from the resume point
+                resume_pos = self.cached_pages * PAGE_SIZE
+                off_grid = os.environ.get("EXL3_TAIL_OFFGRID", "0") == "1" and resume_pos % self.generator.max_chunk_size != 0
+                gap_base = resume_pos if self._unaligned_start or off_grid else 0
+                # EXL3_PF_NO_TAIL=1 (default 0, big-tail mode only): no separate pass for the prompt's last page
+                # (a 4K prompt ran 3840 + 255, the 255-row tail cost ~1 s); the chunk runs whole and the KDA
+                # kernel side-writes the last-page state as a second mid-chunk checkpoint (stash_midchunk)
+                # Chunks under 512 rows keep the cut: chunk_kda runs the fla chain there (no HIP side-write)
+                if gdn_nt and prefill_end == seqlen and prefill_start < last_page_b < prefill_end and \
+                        prefill_start % PAGE_SIZE == 0:
+                    no_tail_row = last_page_b - prefill_start
+                elif big_tail and prefill_start < last_page_b < prefill_end and prefill_start % PAGE_SIZE == 0 and \
+                        prefill_end - prefill_start >= 512 and os.environ.get("EXL3_PF_NO_TAIL", "0") == "1":
+                    no_tail_row = last_page_b - prefill_start
+                elif prefill_start < last_page_b <= prefill_end and not (
+                        prefill_end > last_page_b and self._tail_ok(seq) and seqlen % PAGE_SIZE != 0 and
+                        last_page_b - gap_base < int(os.environ.get("EXL3_TAIL_MAXGAP", "1024"))):
+                    # (a prompt-end tail checkpoint, see _tail_stash, replaces this separate pass; it is still taken
+                    # when the last full-page checkpoint is EXL3_TAIL_MAXGAP tokens behind, which bounds the replay
+                    # after a restart from the disk slot)
                     prefill_end = last_page_b
                     recurrent_last_page = True
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
+
+            # EXL3_BRANCH_CKPT=1 (default off, read per chunk; GDN no-tail and KDA big-tail paths): the chunk replays prompt
+            # pages whose K/V were found by hash but whose recurrent state was not (the resume fell back to an older checkpoint,
+            # e.g. a new conversation sharing a long system prompt with a cached one). The kernel also side-writes the state at
+            # the end of that shared run, so the next prompt with the same prefix resumes there instead of replaying up to a chunk
+            branch_row = None
+            if (gdn_nt or big_tail) and self.recurrent_state is not None and prefill_start % PAGE_SIZE == 0 and \
+                    os.environ.get("EXL3_BRANCH_CKPT", "0") == "1":
+                L = getattr(self, "kv_only_end", 0)
+                if prefill_start < L < prefill_end and L - prefill_start != no_tail_row:
+                    branch_row = L - prefill_start
 
             # Exact multimodal chunking (DeepSeek-V4 vision): an image span is prefilled as
             # exactly one chunk (non-causal within itself) and never re-fed, since the
@@ -1380,7 +1509,7 @@ class Job:
 
                 params = {
                     "attn_mode": "flash_attn",
-                    "block_table": seq.block_index_tensor,
+                    "block_table": seq.prefill_block_table(),
                     "cache": self.generator.cache,
                     "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                     "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
@@ -1390,11 +1519,43 @@ class Job:
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
+                # EXL3_MIDCHUNK_CKPT=1 (default off): a chunk that crosses a recurrent checkpoint boundary also
+                # saves the recurrent state at that boundary (KDA layers split conv + core there), stashed below
+                if self.recurrent_state is not None and not self.embeddings and \
+                        (os.environ.get("EXL3_MIDCHUNK_CKPT", "0") in ("1", "2") or
+                         (gdn_nt and (no_tail_row is not None or branch_row is not None))) and \
+                        not self.generator.model.loaded_tp and prefill_start % PAGE_SIZE == 0:
+                    if gdn_nt:
+                        rows = sorted(r for r in (branch_row, no_tail_row) if r is not None)   # the kernel side-writes 2
+                    else:
+                        rows = [
+                            p - prefill_start
+                            for p in range(prefill_start + PAGE_SIZE, prefill_end, PAGE_SIZE)
+                            if self.is_checkpoint_boundary(pos = p)
+                        ]
+                        if no_tail_row is not None:
+                            rows = sorted(set(rows + [no_tail_row]))
+                        # the branch row only where the kernel has a free slot (a list over the limit drops every row)
+                        cap = (4 if os.environ.get("EXL3_NC2_CKPT4", "0") == "1" else
+                               2 if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 1)
+                        if branch_row is not None and branch_row not in rows and len(rows) < cap:
+                            rows = sorted(rows + [branch_row])
+                    if rows:
+                        params["checkpoint_rows"] = rows
+                        # 1: split conv + KDA core (reference), 2: in-kernel S side-write + async D2H (the only GDN mode)
+                        params["midchunk_mode"] = 2 if gdn_nt else int(os.environ["EXL3_MIDCHUNK_CKPT"])
                 if self.generator.mtp_draft:
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.
                     params["last_tokens_only"] = 1
+                    # EXL3_PF_SKIP (default off, read per chunk so one process can A/B): this
+                    # forward's return value is discarded below -- the first sampled token comes
+                    # from the following decode round -- so the 1-row lm_head is dead work
+                    if os.environ.get("EXL3_PF_SKIP", "0") == "1":
+                        params["skip_logits"] = True
+                    _tt = _ttrace_begin()
                     self.generator.model.forward(input_ids = prefill_ids, params = params)
+                    _ttrace_end(f"target fwd rows={prefill_ids.shape[-1]} start={prefill_start}", _tt)
                 else:
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
@@ -1403,7 +1564,7 @@ class Job:
                         target_hidden = params.get("export_states"),
                         cache = self.generator.draft_cache,
                         params = {
-                            "block_table": seq.block_index_tensor,
+                            "block_table": seq.prefill_block_table(),
                             "cache_seqlens": params["cache_seqlens"],
                         }
                     )
@@ -1418,17 +1579,39 @@ class Job:
                         self.mtp_last_hidden = seq.mtp_carry_hidden
                     else:
                         shifted_hidden = None
-                    self.generator.draft_model.prefill(
-                        input_ids = prefill_ids,
-                        params = {
-                            "target_hidden": shifted_hidden,
-                            "attn_mode": "flash_attn",
-                            "block_table": seq.block_index_tensor,
-                            "cache": self.generator.draft_cache,
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                            "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
-                        }
-                    )
+                    draft_params = {
+                        "target_hidden": shifted_hidden,
+                        "attn_mode": "flash_attn",
+                        "block_table": seq.prefill_block_table(),
+                        "cache": self.generator.draft_cache,
+                        "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                        "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
+                    }
+                    # EXL3_PF_SKIP: the draft prefill exists to fill the draft K/V (and indexer)
+                    # planes over the prompt; prefill_ls drops the MTP block's own output, so its
+                    # q/indexer-topk/attention/o_proj/MoE half is computed and never read. The
+                    # decode-time catch-up prefill (generator._flush_mtp_pending) does sample the
+                    # block, so it is deliberately not touched
+                    if self.generator.mtp_draft and os.environ.get("EXL3_PF_SKIP", "0") == "1":
+                        draft_params["kv_only"] = True
+                    # EXL3_PF_DEFER=1: single sequence MTP prefill stashes the draft chunks; the generator runs them
+                    # after the first token (first round is a plain target step). Flushed at job end and on rewind,
+                    # so the draft cache stays complete for prefix reuse
+                    if self.generator.mtp_draft and os.environ.get("EXL3_PF_DEFER", "0") == "1" and \
+                            len(self.sequences) == 1 and self.generator.spec_gate is None:
+                        draft_params["kv_only"] = True
+                        if self.mtp_defer is None:
+                            self.mtp_defer = []
+                        self.mtp_defer.append((prefill_ids.clone(), draft_params))
+                        self.mtp_defer_end = prefill_end
+                        self.mtp_defer_carry = seq.mtp_carry_hidden
+                    else:
+                        _tt = _ttrace_begin()
+                        self.generator.draft_model.prefill(
+                            input_ids = prefill_ids,
+                            params = draft_params
+                        )
+                        _ttrace_end(f"draft prefill rows={prefill_ids.shape[-1]}", _tt)
 
                 # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
                 # recurrent state beyond the chunk boundary. The extension is processed again by the
@@ -1457,9 +1640,18 @@ class Job:
                         page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
                     page.can_revert = False
 
+                if params.get("checkpoint_rows"):
+                    # a requested row the forward did not save (split declined) is a lost checkpoint: count it
+                    n = self.stash_midchunk(params.get("midchunk_states") or {}, prefill_start)
+                    missed = len(params["checkpoint_rows"]) - n
+                    if missed:
+                        m = self.generator.recurrent_cache.metrics
+                        m["midchunk_missed"] = m.get("midchunk_missed", 0) + missed
+
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
                     seq.prefill_complete = True
+                    self._tail_stash(seq)
 
                 if recurrent_last_page:
                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
@@ -1514,6 +1706,13 @@ class Job:
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
 
+            # End of the pages found by hash past the recurrent checkpoint (K/V valid, state not), read by EXL3_BRANCH_CKPT. Taken
+            # here, before any chunk runs: a chunk's page bookkeeping touches the page after its end, so a later chunk can't rescan
+            q = cached_pages
+            while q < len(seq.allocated_pages) and seq.allocated_pages[q].kv_position == PAGE_SIZE:
+                q += 1
+            self.kv_only_end = q * PAGE_SIZE
+
             # Metrics
             self.cached_pages += cached_pages
             self.total_pages += allocated_pages
@@ -1521,6 +1720,17 @@ class Job:
 
 
     def deallocate_pages(self):
+        if _TAIL_REPLY and self.is_finished and len(self.sequences) == 1 and self.sequences[0].allocated_pages:
+            try:
+                self._tail_stash(self.sequences[0], reply = True)   # BEFORE the mtp_defer flush -> honest draft_ok
+            except Exception as e:  # cleanup must not raise: a missed stash only costs a replay next turn
+                logging.warning("EXL3_TAIL_REPLY stash failed: %r", e)
+        if self.mtp_defer:
+            try:
+                self.generator._flush_mtp_defer(self, with_tail = self.mtp_defer_plain)
+            except Exception as e:  # cleanup must not raise: the draft cache only loses accept depth on reuse
+                logging.warning("EXL3_PF_DEFER flush failed: %r", e)
+            self.mtp_defer = None
         self.free_recurrent_state()
         for seq in self.sequences:
             if seq.allocated_pages is not None:
@@ -1559,7 +1769,50 @@ class Job:
                 f.is_active = f.trigger_token is None and not self.filters_suspended
 
 
-    def is_checkpoint_boundary(self, override_interval = None):
+    def gdn_no_tail_enabled(self):
+        """
+        EXL3_PF_NO_TAIL=1 for GDN (non-KDA) recurrent models: text-only job, no TP, every recurrent layer a GatedDeltaNet (or the
+        Qwen PLE layer) with the fused HIP chain (EXL3_GDN_FUSE=1, EXL3_GDN_PF on), the only path that side-writes the mid-chunk state.
+        """
+        if os.environ.get("EXL3_PF_NO_TAIL", "0") != "1" or os.environ.get("EXL3_GDN_FUSE", "0") != "1" or \
+                os.environ.get("EXL3_GDN_PF", "1") != "1":
+            return False
+        if self.recurrent_state is None or self.embeddings:
+            return False
+        g = self.generator
+        ok = getattr(g, "_gdn_no_tail_ok", None)
+        if ok is None:
+            from ..modules.gated_delta_net import GatedDeltaNet
+            from ..modules.ple import PLELayer   # Qwen 3.8: one PLE layer also holds a recurrent state (it saves its own mid-chunk state)
+            rl = g.model.get_recurrent_layers()
+            ok = bool(rl) and not g.model.loaded_tp and \
+                all(isinstance(m, PLELayer) or (isinstance(m, GatedDeltaNet) and not m.kda) for m in rl) and \
+                any(isinstance(m, GatedDeltaNet) for m in rl)
+            g._gdn_no_tail_ok = ok
+        return ok
+
+
+    def big_tail_enabled(self):
+        """
+        EXL3_PREFILL_BIG_TAIL=1, honored only with EXL3_MIDCHUNK_CKPT=2 and where the mid-chunk path can stash every
+        boundary: text-only recurrent job, no TP, every recurrent layer a KDA GatedDeltaNet (the mode-2 kernel).
+        """
+        if os.environ.get("EXL3_PREFILL_BIG_TAIL", "0") != "1" or os.environ.get("EXL3_MIDCHUNK_CKPT", "0") != "2":
+            return False
+        if self.recurrent_state is None or self.embeddings:
+            return False
+        g = self.generator
+        ok = getattr(g, "_big_tail_ok", None)
+        if ok is None:
+            from ..modules.gated_delta_net import GatedDeltaNet
+            rl = g.model.get_recurrent_layers()
+            ok = bool(rl) and not g.model.loaded_tp and \
+                all(isinstance(m, GatedDeltaNet) and m.kda for m in rl)
+            g._big_tail_ok = ok
+        return ok
+
+
+    def is_checkpoint_boundary(self, override_interval = None, pos = None):
         """
         Return whether the current sequence position should stash a recurrent checkpoint.
 
@@ -1570,13 +1823,18 @@ class Job:
         """
         seq = self.sequences[0]
         prompt_len = len(seq.sequence_ids) - 1
-        seq_pos = seq.kv_position
+        seq_pos = seq.kv_position if pos is None else pos
         if override_interval:
             return seq_pos % override_interval == 0
+        # EXL3_ROLL_CKPT=1 (default off): while decoding, every page boundary is a checkpoint candidate; the
+        # previous rolling one is dropped when the next lands (see maybe_stash_recurrent), so a follow-up turn
+        # resumes at the last full page of the reply instead of the last 2048-grid checkpoint
+        if self.roll_ckpt and pos is None and seq_pos >= len(seq.input_ids):
+            return seq_pos % PAGE_SIZE == 0
         elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
             return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
         else:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
+            return (seq_pos - self.cached_pages * PAGE_SIZE) % (self.ckpt_interval_pp or self.generator.recurrent_checkpoint_interval_pp) == 0
 
 
     def mm_exact_spans(self, seq):
@@ -1614,10 +1872,47 @@ class Job:
 
             page = seq.allocated_pages[last_page]
             assert page.kv_position == PAGE_SIZE
+            if self.roll_ckpt and interval is None and seq.kv_position >= len(seq.input_ids):
+                if self.roll_key is not None and self.roll_key != page.phash:
+                    cache.drop(self.roll_key)
+                    self.roll_key = None
+                grid = (seq.kv_position - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
+                if not grid and page.phash not in cache:
+                    self.roll_key = page.phash
+                cache.put(page.phash, self.recurrent_state)
+                return
             cache.put(page.phash, self.recurrent_state)
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position
+
+
+    def stash_midchunk(self, saved: dict, prefill_start: int):
+        """
+        Stash the mid-chunk recurrent states saved by the forward pass (EXL3_MIDCHUNK_CKPT), keyed like
+        maybe_stash_recurrent: the hash of the last page before the checkpoint. saved maps chunk row -> {layer
+        instance: (S, conv)} GPU clones; a row missing any recurrent layer (split declined) is skipped.
+        """
+        seq = self.sequences[0]
+        rc = self.generator.recurrent_cache
+        layers = self.generator.cache.get_all_recurrent_layers()
+        n = 0
+        for r, per_layer in sorted(saved.items()):
+            if set(per_layer) != set(layers):
+                continue
+            pos = prefill_start + r
+            page = seq.allocated_pages[pos // PAGE_SIZE - 1]
+            assert pos % PAGE_SIZE == 0 and page.kv_position == PAGE_SIZE
+            stashed = {"position": pos, "checkpoint_size": self.recurrent_state.checkpoint_size}
+            for k in layers:
+                s, c = per_layer[k][:2]
+                if len(per_layer[k]) == 3:
+                    per_layer[k][2].synchronize()  # mode 2: pinned host copies, D2H event on the side stream
+                stashed[k] = (s.cpu(), c.cpu())
+            rc.put(page.phash, None, stashed = stashed)
+            rc.metrics["midchunk_stashes"] = rc.metrics.get("midchunk_stashes", 0) + 1
+            n += 1
+        return n
 
 
     def find_recurrent_stash(self, target_pos: int):
@@ -1632,6 +1927,140 @@ class Job:
             if stashed is not None and stashed["position"] == (pi + 1) * PAGE_SIZE:
                 return stashed
         return None
+
+
+    def _tail_ok(self, seq) -> bool:
+        g = self.generator
+        return (
+            g.tail_ckpt_max > 0 and g.recurrent_cache is not None and self.recurrent_state is not None
+            and not self.embeddings and len(self.sequences) == 1 and not g.model.loaded_tp
+            and getattr(g.cache.recurrent_state_cls, "supports_tail_ckpt", False)   # opt-in per state class (GDNState only)
+        )
+
+
+    def _tail_stash(self, seq, reply = False):
+        """
+        Exact prompt-end checkpoint. Recurrent checkpoints sit on page boundaries, so a follow-up request replays
+        the prompt tail after the last full page (up to 255 tokens, each turn). Keep the recurrent state at the very
+        end of the prefill too (position len - 1), with the tokens of the partial last page. The partial page's K/V
+        stays valid in the page table (its first tokens are never overwritten), so _tail_restore can resume there.
+        Keyed by content (hash of the last full page + token ids), never by job.
+        """
+        if not self._tail_ok(seq):
+            return
+        end = seq.kv_position
+        # reply = True (EXL3_TAIL_REPLY, job finished): the last sampled token has no K/V yet, so end <= len - 1
+        if (end > len(seq.sequence_ids) - 1 if reply else end != len(seq.sequence_ids) - 1) or \
+                end % PAGE_SIZE == 0 or self.recurrent_state is None or self.recurrent_state.position != end:
+            return
+        g = self.generator
+        if end < g.tail_ckpt_min:                       # short one-shot prompts: the stash costs more than a replay
+            return
+        p0 = end // PAGE_SIZE
+        if len(seq.allocated_pages) <= p0 or (p0 > 0 and seq.allocated_pages[p0 - 1].kv_position != PAGE_SIZE):
+            return
+        prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
+        ids = seq.sequence_ids.torch_slice(p0 * PAGE_SIZE, end).clone()
+        # reply: the live decode carry; seq.mtp_carry_hidden still holds the prompt-end carry
+        carry_now = self.mtp_last_hidden if reply else seq.mtp_carry_hidden
+        for e in g.tail_ckpts:
+            if e["prev_hash"] == prev_hash and e["ids"].shape == ids.shape and torch.equal(e["ids"], ids):
+                # same content: refresh the page (the old one may be recycled) and the carry, move to MRU
+                e["page"] = seq.allocated_pages[p0]
+                e["draft_ok"] = not self.mtp_defer
+                if carry_now is not None:
+                    e["carry"] = carry_now.clone()
+                g.tail_ckpts[:] = [x for x in g.tail_ckpts if x is not e]
+                g.tail_ckpts.append(e)
+                return
+        while len(g.tail_ckpts) >= g.tail_ckpt_max:     # trim before the append: the peak stays at the bound
+            g.tail_ckpts.pop(0)
+        t = _ttrace_begin()
+        carry = self.mtp_last_hidden if reply else seq.mtp_carry_hidden
+        if _TT: print(f"trace:   tail checkpoint size {self.recurrent_state.checkpoint_size / 2**20:.0f} MiB", flush=True)
+        rc = g.recurrent_cache
+        if rc is not None and rc.async_stash_ok(self.recurrent_state):
+            stashed = rc.stash_async(self.recurrent_state)   # EXL3_NC2_ASYNC_STASH: settled before _tail_restore reads it
+        else:
+            stashed = self.recurrent_state.stash()
+        g.tail_ckpts.append({
+            "prev_hash": prev_hash, "ids": ids, "stashed": stashed,
+            "carry": None if carry is None else carry.clone(), "page": seq.allocated_pages[p0],
+            # EXL3_PF_DEFER: the draft K/V of this page is written after the first token, maybe never
+            "draft_ok": not self.mtp_defer,
+        })
+        _ttrace_end("tail checkpoint stash", t)
+
+
+    def _tail_restore(self, seq) -> int:
+        """
+        Resume a prompt exactly at the end of an earlier prompt's prefill when the new prompt starts with the same
+        tokens (see _tail_stash): copy the partial page's K/V, restore the recurrent state and the MTP carry.
+        Allocation revives every hashed prompt page whose K/V is still resident, but only the pages up to the last
+        full-page checkpoint count as cached; the restore may jump over the revived pages that follow, so a tail
+        checkpoint taken several turns after the last page checkpoint is still usable.
+        Returns the number of tokens skipped (0 = nothing done, the normal path runs).
+        """
+        if not self._tail_ok(seq):
+            return 0
+        g = self.generator
+        start = seq.kv_position
+        if not g.tail_ckpts or start % PAGE_SIZE != 0:
+            return 0
+        total = len(seq.sequence_ids) - 1
+        pages = seq.allocated_pages
+        valid = 0                                       # leading pages holding complete, hash-matched K/V
+        while valid < len(pages) and pages[valid].kv_position == PAGE_SIZE:
+            valid += 1
+        first = start // PAGE_SIZE
+        for e in reversed(g.tail_ckpts):
+            L = e["ids"].shape[-1]
+            ph = e["prev_hash"]
+            if ph is None:
+                i = 0
+            else:
+                i = next((k + 1 for k in range(max(first - 1, 0), min(valid, len(pages))) if pages[k].phash == ph), -1)
+            if i < first or i > valid or i >= len(pages):
+                continue
+            pos = i * PAGE_SIZE
+            if pos + L > total or not torch.equal(e["ids"], seq.sequence_ids.torch_slice(pos, pos + L)):
+                continue
+            dst = pages[i]
+            if dst.kv_position == PAGE_SIZE and dst.prev_hash != ph:   # a complete revived page must follow the entry's chain
+                continue
+            if dst.kv_position != PAGE_SIZE and g.draft_model and not e.get("draft_ok", True):
+                continue
+            if dst.kv_position != PAGE_SIZE:            # a complete revived page already holds this K/V
+                src = e["page"]
+                if src is dst or src.prev_hash != ph or src.kv_position < L or \
+                        not torch.equal(src.sequence[:, :L], e["ids"]):
+                    if _TT: print(f"trace: tail ckpt found but source page unusable (same={src is dst} kvp={src.kv_position})", flush=True)
+                    continue
+                t = _ttrace_begin()
+                for c in [g.cache] if not g.draft_model else [g.cache, g.draft_cache]:
+                    c.copy_page(c, src.page_index, dst.page_index, L)
+                dst.prev_hash = ph
+                dst.sequence[:, :L].copy_(e["ids"])
+                dst.kv_position = L
+                dst.can_revert = False
+                _ttrace_end(f"tail restore page copy rows={L}", t)
+            self.free_recurrent_state()
+            if g.recurrent_cache is not None:
+                g.recurrent_cache.settle()
+            self.recurrent_state = g.cache.new_from_stashed(e["stashed"], position = pos + L)
+            self.last_recurrent_checkpoint_pos = pos + L
+            if e["carry"] is not None:
+                seq.mtp_carry_hidden = e["carry"].clone()
+                self.mtp_last_hidden = seq.mtp_carry_hidden
+            seq.kv_position = pos + L
+            seq.prefill_complete = seq.kv_position >= total
+            self._unaligned_start = True
+            skipped = pos + L - start
+            self.cached_tokens += skipped
+            g.tail_ckpts[:] = [x for x in g.tail_ckpts if x is not e]
+            g.tail_ckpts.append(e)
+            return skipped
+        return 0
 
 
     def free_recurrent_state(self):

@@ -28,6 +28,8 @@ class AttnArgs(NamedTuple):
                                     # (lets cached kernels size windows / staging below the
                                     # block-table span; e.g. QSA's dense regime)
 
+    v_dim: int | None = None        # V lanes in use when V is zero-padded to dim (MiMo 128 of 192)
+
     def sanity_check(self):
         # Cache must be paged
         if self.q_cache is not None:
@@ -63,11 +65,16 @@ class AttnArgs(NamedTuple):
         return self.cu_seqlens is not None
 
     def get_window_size(self):
+        # window_size is an int (left window, right bound 0) or an explicit (left, right) pair
+        if isinstance(self.window_size, tuple):
+            return self.window_size
         if self.window_size is None or self.window_size == -1:
             return -1, -1
         return self.window_size, 0
 
     def is_swa(self):
+        if isinstance(self.window_size, tuple):
+            return self.window_size != (-1, -1)
         return self.window_size is not None and self.window_size != -1
 
 
@@ -83,7 +90,7 @@ def get_non_causal_span_arglist(args: AttnArgs):
         l = b - a
         window_size = (
             (max(args.window_size, l + pre), l - 1 if nc else 0)
-            if args.window_size is not None and args.window_size > 0 and nc else
+            if isinstance(args.window_size, int) and args.window_size > 0 and nc else
             args.get_window_size()
         )
         if args.q_cache is not None:

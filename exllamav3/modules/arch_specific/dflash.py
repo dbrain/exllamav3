@@ -24,6 +24,8 @@ class DFlashInputLayer(Module):
         qmap: str | None = None,
         key_aux_norms: str | None = None,
         num_aux_norms: int = 0,
+        input_embedding_scale: float = 1.0,
+        key_mask_embedding: str | None = None,
     ):
         super().__init__(config, key, None)
         self.module_name = "DFlashInputLayer"
@@ -69,6 +71,16 @@ class DFlashInputLayer(Module):
                 self.register_submodule(aux_norm)
 
         self.mask_token_id = mask_token_id
+        self.input_embedding_scale = input_embedding_scale
+
+        # Learned mask embedding. The original DFlash release looks mask_token_id up in the
+        # target's embedding table; some checkpoints ship their own vector instead, because
+        # the id is not in the target's trained vocabulary at all (MiMo-V2.6-Flash-RL:
+        # mask_token_id 151675 is past the end of the tokenizer and the target's embedding row
+        # for it is an untrained padding row, L2 norm 2e-5 against the shipped vector's 0.76).
+        # When present it replaces the embedding of every mask position in the block.
+        self.key_mask_embedding = key_mask_embedding
+        self.mask_embedding = None
 
         # Populated by attach_to()
         self.attached_model = None
@@ -83,6 +95,16 @@ class DFlashInputLayer(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
+        if self.key_mask_embedding:
+            self.mask_embedding = self.config.stc.get_tensor(
+                self.key_mask_embedding, device, allow_bf16 = True, no_defer = True
+            ).view(-1)
+
+
+    @override
+    def unload(self):
+        self.mask_embedding = None
+        super().unload()
 
 
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
@@ -103,4 +125,11 @@ class DFlashInputLayer(Module):
         else:
             x = self.attached_model().tp_producer.send(x)
             x = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (x, params))
+        if self.input_embedding_scale != 1.0:
+            x = x * self.input_embedding_scale
+        mask_embedding = getattr(self, "mask_embedding", None)
+        if mask_embedding is not None:
+            # The trailing native_draft_len - 1 positions are the mask tokens appended above;
+            # everything before them keeps its real embedding
+            x[:, -(self.native_draft_len - 1):, :] = mask_embedding.to(x.dtype)
         return x

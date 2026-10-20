@@ -1,11 +1,13 @@
 import argparse
+import os
 import torch
 import time
 import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear
+from ..modules.linear import flush_capture_H as _flush_capture_H
 from ..modules.linear import convert_exl3_group
-from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
+from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers, set_worker_stream, worker_stream
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
@@ -500,7 +502,16 @@ def _tile_split_devices(numel, devices, device_ratios):
 
 def quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
 
-    allow_grouping = state is not None and not args["image_dump"] and not args["verbose"]
+    # Brief 10b: batched grouping is a quantize-path property, not a verbosity one - the
+    # batched path simply cannot print the per-tensor verbose stats (logging only). image_dump
+    # still opts out (it needs per-tensor regularization images).
+    # Brief 10b R4: batched grouping (ldlq_batched / concatenated-H ldlq) is NOT bit-exact
+    # vs the sequential per-tensor path (qdiff vs r1: 1288/3093 tensors differ on layer1,
+    # suh/svh/trellis - floating-point reduction order differs across the batch). Off by
+    # default; opt in only for exploratory (non-exactness-gated) runs.
+    allow_grouping = (
+        state is not None and not args["image_dump"] and os.environ.get("EXL3_ENABLE_GROUPING") == "1"
+    )
     groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
 
     for group in groups:
@@ -561,8 +572,20 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
     assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
     global curr_progress, max_progress
 
-    allow_grouping = state is not None and not args["verbose"]
+    # See quantize_linears_single: grouping decoupled from verbose (brief 10b); the
+    # image_dump incompatibility is asserted above.
+    # See quantize_linears_single: grouping is off by default (not bit-exact, brief 10b R4).
+    allow_grouping = state is not None and os.environ.get("EXL3_ENABLE_GROUPING") == "1"
     groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
+
+    # EXL3_QUANT_THREADS=N (default 1): N worker threads per device, each on its own stream, so one
+    # tensor's host-side LDLQ/regularize overlaps another's tile kernels. Bit-identical to N = 1
+    # (see exl3_lib.quantize.set_worker_stream).
+    n_threads = max(1, int(os.environ.get("EXL3_QUANT_THREADS", "1")))
+    same_device_workers = n_threads > 1
+    if same_device_workers:
+        devices = [d for d in devices for _ in range(n_threads)]
+        device_ratios = None if device_ratios is None else [r for r in device_ratios for _ in range(n_threads)]
 
     # Split workload by group
     all_dev_groups = [[] for _ in devices]
@@ -592,9 +615,19 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
 
     def work_thread(device_idx, dev_groups):
         try:
-            work_thread_(device_idx, dev_groups)
+            if same_device_workers:
+                stream = torch.cuda.Stream(device = device_idx)
+                set_worker_stream(stream)
+                with torch.cuda.stream(stream):
+                    work_thread_(device_idx, dev_groups)
+                stream.synchronize()
+            else:
+                work_thread_(device_idx, dev_groups)
         except BaseException as e:
             errors.append(e)
+        finally:
+            if same_device_workers:
+                set_worker_stream(None)
 
     def work_thread_(device_idx, dev_groups):
         global curr_progress
@@ -638,8 +671,11 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
 
             # The device is idle from here until the slowest thread finishes; its measured speed
             # steers the next module's split
-            torch.cuda.synchronize(torch.device(device_idx))
-            auto_split.report("quant_thread", device_idx, work_numel, time.time() - t0)
+            if same_device_workers:
+                worker_stream().synchronize()
+            else:
+                torch.cuda.synchronize(torch.device(device_idx))
+                auto_split.report("quant_thread", device_idx, work_numel, time.time() - t0)
 
     # Launch
     threads = []
@@ -815,6 +851,7 @@ def capture_module_parallel(
                 get_preserve(i, params)
                 rs = module.prepare_for_device(state[i], params)
                 rs = module.forward(rs, params)
+                _flush_capture_H(params)
                 put_preserve(i, params)
                 if i < num_ref_states:
                     if model.calibration_all_experts:
@@ -860,6 +897,11 @@ def capture_module_parallel(
                 m = capture_H[qmap]
                 m["H"] += hd["H"].to(device)
                 m["count"] += hd["count"]
+                if "count_dev" in hd:
+                    if "count_dev" in m:
+                        m["count_dev"] += hd["count_dev"].to(m["count_dev"].device)
+                    else:
+                        m["count_dev"] = hd["count_dev"].to(torch.device(m["device"]))
                 m["num_total"] += hd["num_total"]
                 m["inf_nan"] += hd["inf_nan"].to(device)
         cap.clear()
@@ -1189,7 +1231,13 @@ def main(args, job_state):
                 # Capture calibration input states during forward pass. For block-sparse models, all expert layers
                 # are activated to ensure all down projections capture at least some calibration data. When the
                 # state is advanced later, only selected experts will be used.
+                capture_profile_start = None
+                cap_fwd_wall = 0.0
+                cap_ref_wall = 0.0
                 if state is not None:
+                    if os.environ.get("EXL3_QUANT_PROFILE") == "1":
+                        torch.cuda.synchronize()
+                        capture_profile_start = time.perf_counter()
                     capture_replicas = None
                     if parallel_calib and not module.caps.get("prefer_cpu"):
                         capture_replicas = load_parallel_calib_modules(
@@ -1216,6 +1264,9 @@ def main(args, job_state):
                         with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
                             capture_H = {}
                             ref_states = {}
+                            cap_fwd_wall = 0.0
+                            cap_ref_wall = 0.0
+                            prof_rows = int(os.environ.get("EXL3_PROF_ROWS", "0"))
                             for i in range(len(state)):
                                 progress.update(i)
                                 if i in bad_rows:
@@ -1228,11 +1279,28 @@ def main(args, job_state):
                                 }
                                 if slicing:
                                      params["q_mlp_slice"] = current_slice
+                                _t0 = time.perf_counter()
                                 get_preserve(i, params)
                                 rs = module.prepare_for_device(state[i], params)
-                                rs = module.forward(rs, params)
+                                if i < prof_rows:
+                                    from torch.profiler import profile as _tprofile, ProfilerActivity as _PA
+                                    with _tprofile(activities = [_PA.CPU, _PA.CUDA]) as _prof:
+                                        rs = module.forward(rs, params)
+                                    for _sk in ("self_device_time_total", "self_cuda_time_total"):
+                                        try:
+                                            _tbl = _prof.key_averages().table(sort_by = _sk, row_limit = 30)
+                                            break
+                                        except Exception:
+                                            _tbl = None
+                                    print(f" -- TORCH_PROF module={module.key} row={i}\n{_tbl}", flush = True)
+                                    del _prof
+                                else:
+                                    rs = module.forward(rs, params)
                                 put_preserve(i, params)
+                                cap_fwd_wall += time.perf_counter() - _t0
+                                _flush_capture_H(params)
                                 if i < num_ref_states:
+                                    _t1 = time.perf_counter()
                                     if model.calibration_all_experts:
                                         # Do not activate all experts for reference state, for error measurement
                                         params = {
@@ -1250,8 +1318,32 @@ def main(args, job_state):
                                     else:
                                         bad_rows.add(i)
                                         print(f" !! Non-finite reference state in calibration row {i}, excluding row")
+                                    cap_ref_wall += time.perf_counter() - _t1
                                 rs = None
                     print(f" -- Captured: {module.key}" + slice_str, flush = True)
+                    if capture_profile_start is not None:
+                        for device_idx in devices:
+                            torch.cuda.synchronize(torch.device(device_idx))
+                        capture_elapsed = time.perf_counter() - capture_profile_start
+                        print(
+                            f" -- QUANT_PROFILE stage=hessian_capture module={module.key} "
+                            f"seconds={capture_elapsed:.6f} rows={len(state) - len(bad_rows)}",
+                            flush=True,
+                        )
+                        from ..modules import linear as _linear_mod
+                        print(
+                            f" -- QUANT_PROFILE stage=capture_split module={module.key} "
+                            f"prepare_fwd={cap_fwd_wall:.6f} ref={cap_ref_wall:.6f} "
+                            f"capture_H_wall={_linear_mod.CAP_STAT['wall']:.6f} "
+                            f"capture_H_calls={_linear_mod.CAP_STAT['calls']} "
+                            f"flush_wall={_linear_mod.FLUSH_STAT['wall']:.6f} "
+                            f"flush_calls={_linear_mod.FLUSH_STAT['calls']}",
+                            flush=True,
+                        )
+                        _linear_mod.CAP_STAT["wall"] = 0.0
+                        _linear_mod.CAP_STAT["calls"] = 0
+                        _linear_mod.FLUSH_STAT["wall"] = 0.0
+                        _linear_mod.FLUSH_STAT["calls"] = 0
 
                     # More feedback
                     if len(capture_H):
@@ -1424,6 +1516,9 @@ def main(args, job_state):
                 shutil.rmtree(ckpt_dir_old)
             os.rename(ckpt_dir, ckpt_dir_old)
             os.rename(ckpt_dir_new, ckpt_dir)
+            if os.environ.get("EXL3_CKPT_KEEP_OLD", "1") == "0":
+                # Disk-tight runs: the previous checkpoint is redundant once the new one is in place
+                shutil.rmtree(ckpt_dir_old)
             last_checkpoint_time = time.time()
 
     # Quantize additional modules (uncalibrated side models: MTP head, vision tower)
@@ -1498,6 +1593,11 @@ def main(args, job_state):
             # Unload current module
             module.unload()
             del q_tensors
+
+    if os.environ.get("EXL3_SKIP_SIDE_MODELS") == "1":
+        # Main model done; MTP/vision tensors and the final pack are assembled separately
+        print(" -- EXL3_SKIP_SIDE_MODELS=1: main model quantized, stopping before side models and compile")
+        return
 
     if mtp_model:
         quantize_side_model(mtp_model, "MTP")

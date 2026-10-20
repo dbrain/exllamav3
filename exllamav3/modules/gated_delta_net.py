@@ -8,6 +8,9 @@ from . import Module, Linear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
+from .quant.exl3 import row_pad_pitch as _row_pad_pitch
+
+_MIDCKPT_STREAM = None  # EXL3_MIDCHUNK_CKPT=2 side stream for the checkpoint D2H
 from ..cache import Cache
 from ..util.tensor import g_tensor_cache
 from .multilinear import SlicedMultiLinear
@@ -16,6 +19,13 @@ import os
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+_QKVZ_DEC_MULTI = os.environ.get("EXL3_GDN_QKVZ_MULTI", "1") != "0"   # (qkv+z one launch)
+# EXL3_QWD_AB (default 0 until proven) folds the fp16 b / a projections, and with a bf16 dt_bias / fp32 a_log also
+# gated_delta_net_fused_op_2 (beta, g), into the qkv|z launch as extra blocks (bit-identical to the separate launches);
+# EXL3_QWD_AB_FIRST=1 puts those blocks first in the grid
+_QWD_AB_FLAGS = 1 if os.environ.get("EXL3_QWD_AB_FIRST", "0") != "0" else 0
+def _qwd_ab_on() -> bool:   # read per call so a served A/B run can flip it (serve_ab arm switch)
+    return os.environ.get("EXL3_QWD_AB", "0") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
@@ -27,6 +37,37 @@ from ..cache.recurrent import (
 from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 
+# Fused KDA beta/g gate kernel (ROCm fused_elt_rocm.cu); read at import
+_FUSE_KDA_GATE = hasattr(ext, "kda_gate") and os.environ.get("EXL3_FUSE_KDA_GATE", "1") != "0"
+# Decode-graph KDA gate: keep dt_bias in fp32 (as prefill and the HF ForgetGate do) instead of a bf16
+# copy. GLM dt_bias is stored fp32 and is not bf16-exact (max rounding error 0.03)
+_KDA_DT_F32 = os.environ.get("EXL3_KDA_DT_F32", "0") != "0"
+KDA_KNOBS = {
+    "half_a": os.environ.get("EXL3_KDA_HALF_A", "1") != "0",
+    "dec_cat": os.environ.get("EXL3_KDA_DEC_CAT", "1") != "0",
+    "lr_batched": os.environ.get("EXL3_KDA_DEC_LR_BATCHED", "1") != "0",
+    # kda-dec step 2: f_b fused into the gate kernel, g_b fused into the gated norm (bit-exact)
+    "lr_fused": os.environ.get("EXL3_KDA_DEC_LR_FUSED", "1") != "0",
+}
+
+# EXL3_STATE_REBASE (default 0): a speculative-round rewind sets a per-slot committed-state history index
+# instead of copying the accepted state back to history index 0 (a 0-byte rewind). Read per call so a single
+# load can interleave OFF / ON arms. Off: every state_base entry stays 0 and the ext reads index 0 exactly as
+# before (the reset below only fires if a previous ON arm left an index set, so the off path stays 0-cost).
+def _state_rebase() -> bool:
+    return os.environ.get("EXL3_STATE_REBASE", "0") == "1"
+
+# One committed-index tensor shared by every GDN layer of a cache (all layers rewind the same slot by the
+# same count, so the index is identical): the rewind then costs ONE tiny write instead of one per layer.
+_base_pool = {}
+_base_value = {}   # (cache_id, slot) -> committed index; the authoritative value behind the shared tensor
+def _shared_base(cache_id: int, max_batch_size: int, device):
+    t = _base_pool.get(cache_id)
+    if t is None or t.device != torch.device(device) or t.numel() != max_batch_size:
+        t = torch.zeros((max_batch_size,), dtype = torch.int32, device = device)
+        _base_pool[cache_id] = t
+    return t
+
 
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     """Split a batch of recurrent-layer states into per-device (conv_jobs, state_jobs) for the
@@ -37,8 +78,16 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     batched; any other recurrent-state type sharing the same cache (e.g. SWA, short-conv)
     falls back to its own .rewind() call, unchanged."""
     jobs_by_device = {}
+    base_done = set()
     for l in layers:
         if isinstance(l, GDNLayerState):
+            # EXL3_STATE_REBASE: all layers of a cache share one state_base tensor -> set it once per cache
+            if l.cache_id not in base_done:
+                if _state_rebase():
+                    l._set_base(slot, (last_history + 1 - num_tokens) if num_tokens > 0 else 0)
+                    base_done.add(l.cache_id)
+                elif _base_value.get((l.cache_id, slot), 0) != 0:
+                    l._set_base(slot, 0); base_done.add(l.cache_id)   # undo an ON arm earlier in a mixed load
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
             # torch.device, so normalize rather than assume a .index attribute
             device_index = torch.device(l.device).index
@@ -68,7 +117,15 @@ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, las
     _dispatch_rewind_jobs(_collect_rewind_jobs(layers, slot, last_history, num_tokens))
 
 
+_ABCAT = os.environ.get("EXL3_QWD4_ABCAT", "1") != "0"
+QWD3 = {"skip": 0}   # harness-only kill test: 1 = reuse the last b / a outputs (skip the skinny launches), 2 = also reuse beta / g. NOT bit-identical, never committed.
+
 class GDNState:
+
+    # Prompt-end checkpoints (Job._tail_stash) are validated for this state class only
+    supports_tail_ckpt = True
+    # RecurrentCache.put may call stash(async_ = True) (EXL3_NC2_ASYNC_STASH)
+    supports_async_stash = True
 
     def __init__(
         self,
@@ -127,13 +184,24 @@ class GDNState:
         return 0
 
 
-    def stash(self):
+    def stash(self, async_: bool = False, pin_pool: dict = None):
+        """async_ (EXL3_NC2_ASYNC_STASH, via RecurrentCache.stash_async only): non-blocking D2H into pinned host tensors on the
+        current stream plus one event in stashed["_ev"]; the cache syncs it and moves the copies to pageable memory
+        (RecurrentCache._finish, worker thread) before any reader sees the entry."""
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
         }
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
+            layers = self.cache.get_all_recurrent_layers()
+            if async_ and all(isinstance(l, GDNLayerState) for l in layers.values()):
+                for k, l in layers.items():
+                    stashed[k] = l.stash_async(self.slot, pin_pool)
+                ev = torch.cuda.Event()
+                ev.record()
+                stashed["_ev"] = ev
+                return stashed
+            for k, l in layers.items():
                 stashed[k] = l.stash(self.slot)
         else:
             cp_handle = new_checkpoint_handle()
@@ -193,6 +261,15 @@ class GDNLayerState:
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
+        # EXL3_STATE_REBASE: per-slot history index of the committed state (shared per cache; _base_value)
+        self.state_base = torch.empty((max_batch_size,), dtype = torch.int32, device = "meta")
+
+
+    def _set_base(self, slot: int, value: int):
+        key = (self.cache_id, slot)
+        if _base_value.get(key) != value:
+            self.state_base[slot] = value
+            _base_value[key] = value
 
 
     def get_checkpoint_size(self):
@@ -209,6 +286,7 @@ class GDNLayerState:
     def alloc(self, device):
         self.conv_state = torch.empty_like(self.conv_state, device = device)
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = device)
+        self.state_base = _shared_base(self.cache_id, self.max_batch_size, device)
         self.conv_state.zero_()
         self.recurrent_state.zero_()
         self.device = device
@@ -217,6 +295,7 @@ class GDNLayerState:
     def free(self):
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
+        self.state_base = torch.empty_like(self.state_base, device = "meta")
         self.device = None
 
 
@@ -224,6 +303,7 @@ class GDNLayerState:
         if self.device is not None:
             self.conv_state[idx].zero_()
             self.recurrent_state[idx].zero_()
+            self._set_base(idx, 0)
 
 
     def get_state_tensors(self):
@@ -235,10 +315,16 @@ class GDNLayerState:
 
     def rewind(self, slot: int, last_history: int, num_tokens: int):
         assert num_tokens <= last_history
-        if num_tokens > 0:
-            r_state = self.recurrent_state[slot, 0]
-            r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
-            r_state.copy_(r_state_rewind)
+        if _state_rebase():
+            # 0-byte rewind: point the committed state at the accepted history index instead of copying
+            self._set_base(slot, (last_history + 1 - num_tokens) if num_tokens > 0 else 0)
+        else:
+            if _base_value.get((self.cache_id, slot), 0) != 0:
+                self._set_base(slot, 0)   # a previous ON arm moved the commit index; stock reads index 0
+            if num_tokens > 0:
+                r_state = self.recurrent_state[slot, 0]
+                r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
+                r_state.copy_(r_state_rewind)
         cdim = self.module.conv_kernel_size
         if last_history > 0:
             c_state = self.conv_state[slot, :, :cdim]
@@ -267,6 +353,9 @@ class GDNLayerState:
     def rewind_state_job(self, slot: int, last_history: int, num_tokens: int):
         """Job descriptor for the batched recurrent-state rewind kernel (ext.batched_state_rewind),
         computed without performing any copy. Same gating condition as rewind()'s state branch."""
+        if _state_rebase():
+            # 0-byte rewind: no copy job; the shared base is set once by _collect_rewind_jobs
+            return None
         if num_tokens == 0:
             return None
         return ext.StateRewindJob(
@@ -278,16 +367,32 @@ class GDNLayerState:
 
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
+        b = _base_value.get((self.cache_id, slot), 0)
         return (
-            self.recurrent_state[slot, :1].cpu(),
+            self.recurrent_state[slot, b:b + 1].cpu(),
             self.conv_state[slot, :, :cdim].cpu()
         )
+
+
+    def stash_async(self, slot, pin_pool: dict = None):
+        """Non-blocking D2H into pinned host tensors, reused from pin_pool ((shape, dtype) -> free list) when given:
+        a pinned allocation costs ~1 ms of host time, more than the blocking copy it replaces."""
+        cdim = self.module.conv_kernel_size
+        b = _base_value.get((self.cache_id, slot), 0)
+        out = []
+        for src in (self.recurrent_state[slot, b:b + 1], self.conv_state[slot, :, :cdim]):
+            free = None if pin_pool is None else pin_pool.get((tuple(src.shape), src.dtype))
+            dst = free.pop() if free else torch.empty(src.shape, dtype = src.dtype, pin_memory = True)
+            dst.copy_(src, non_blocking = True)
+            out.append(dst)
+        return tuple(out)
 
 
     def unstash(self, slot, stashed, position: int = 0):
         cdim = self.module.conv_kernel_size
         s, c = stashed
         self.recurrent_state[slot, :1].copy_(s)
+        self._set_base(slot, 0)   # restored committed state lands at index 0
         self.conv_state[slot, :, :cdim].copy_(c)
 
 
@@ -689,7 +794,7 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
-            self.bc_split = True
+            self.bc_split = self.bc is not None
 
             # Sliced qkv+z bundle: both projections read x and are cut into equal-width column
             # slices run as one launch (SlicedMultiLinear); the graph object gets the tables, the
@@ -729,11 +834,11 @@ class GatedDeltaNet(Module):
         )
 
         if is_quantized_kda:
-            # The gate op reads dt_bias as bf16; converted models may round-trip it as fp32
-            # (exact for originally-bf16 values). Allocated here, FILLED in the deferred-fill
+            # The gate op reads dt_bias as bf16 (default) or fp32 (EXL3_KDA_DT_F32=1; GLM stores it
+            # fp32 and it is not bf16-exact). Allocated here, FILLED in the deferred-fill
             # block on the first forward: at this point dt_bias may still be an unfilled
             # deferred tensor, and a .to() would copy garbage
-            self.dt_bias_bc = torch.empty_like(self.dt_bias, dtype = torch.bfloat16)
+            self.dt_bias_bc = torch.empty_like(self.dt_bias, dtype = torch.float if _KDA_DT_F32 else torch.bfloat16)
             # Transposed fp16 copies of the small projections for the graph GEMVs; weights may
             # not be materialized yet (deferred load) so only allocate here and fill on the
             # first forward (the BC keeps references)
@@ -766,7 +871,7 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
-            self.bc_split = True
+            self.bc_split = self.bc is not None
 
 
     @override
@@ -883,6 +988,105 @@ class GatedDeltaNet(Module):
             core_attn_out, core_attn_out_f, qkv_xh, o_xh,
         )
 
+    def _dec_qkvz_linears(self):
+        """(qkv_proj, z_proj) when one exl3_dec_gemv_multi launch can replace their two forwards (same K, mcg and
+        input width, no bias), else None. one launch instead of two, one grid of both matrices."""
+        lins = getattr(self, "_dec_qkvz", False)
+        if lins is False:
+            from .mla_attn import dec_proj_ok, dec_proj_shapes
+            lins = None
+            if self.qkv_proj is not None and self.z_proj is not None and self.qkvz_proj is None:
+                cand = (self.qkv_proj, self.z_proj)
+                if all(dec_proj_ok(l) for l in cand) and dec_proj_shapes(cand):
+                    lins = cand
+            self._dec_qkvz = lins
+        return lins
+
+    def project_qkvz_dec(self, x: torch.Tensor, params: dict, bsz: int, seqlen: int):
+        """Decode qkv + z in ONE exl3_dec launch (both Hadamard stages inside): batch 1, or the R-row verify
+        launch (dflash_verify). Returns (qkv, z) with the Linears' shapes and dtype, or None to fall back."""
+        rows = bsz * seqlen
+        if rows > 8 or x.dtype != torch.half or "capture" in params or "ovr" in params or not x.is_contiguous():
+            return None
+        if rows > 1 and not (params.get("dflash_verify") and os.environ.get("EXL3_VERIFY_GEMV_R", "0") != "0"
+                             and hasattr(ext, "exl3_dec_gemv_r_multi")):
+            return None
+        lins = self._dec_qkvz_linears()
+        if lins is None or x.shape[-1] != lins[0].in_features:
+            return None
+        from .mla_attn import dec_proj_multi
+        qkv, z = dec_proj_multi(lins, x, rows)
+        return (qkv.view(bsz, seqlen, -1), z.view(bsz, seqlen, -1))
+
+
+    def _ab_cat(self, x: torch.Tensor, params: dict, bsz: int, seqlen: int):
+        """decode b and a skinny projections in ONE launch (ext.skinny_cat_w, same per-column reduction order as the two
+        separate skinny launches, bit-identical). Returns (b, a) fp32 [bsz, seqlen, heads] or None to fall back. EXL3_QWD4_ABCAT=0 = off."""
+        ok = getattr(self, "_ab_cat_ok_v", None)
+        if ok is None:
+            mods = (self.b_proj, self.a_proj)
+            ok = (hasattr(ext, "skinny_cat_w") and not self.kda and
+                  all(m is not None and m.quant_type == "fp16" and type(m.inner).__name__ == "LinearFP16" and m.inner.bias is None and
+                      m.inner._pinned_store is None and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 and
+                      m.softcap == 0.0 and m.out_features == m.out_features_unpadded and m.out_features == self.num_v_heads and
+                      m.inner.weight.is_contiguous() and m.inner.weight.dtype == torch.half and m.inner.out_dtype == torch.float for m in mods))
+            self._ab_cat_ok_v = ok
+        if not ok or bsz * seqlen != 1 or x.dtype != torch.half or not x.is_contiguous() or "capture" in params or "ovr" in params:
+            return None
+        h = self.num_v_heads
+        b = torch.empty((bsz, seqlen, h), dtype = torch.float, device = x.device)
+        a = torch.empty((bsz, seqlen, h), dtype = torch.float, device = x.device)
+        ext.skinny_cat_w(x.view(1, -1), [self.b_proj.inner.weight, self.a_proj.inner.weight], [b.view(1, h), a.view(1, h)])
+        return b, a
+
+    def _qwd_ab_ok(self) -> bool:
+        ok = getattr(self, "_qwd_ab_ok_v", None)
+        if ok is None:
+            lins = self._dec_qkvz_linears()
+            mods = (self.b_proj, self.a_proj)
+            ok = (lins is not None and hasattr(ext, "exl3_dec_gemv_x") and not self.kda and
+                  all(m is not None and m.quant_type == "fp16" and type(m.inner).__name__ == "LinearFP16" and m.inner.bias is None and
+                      m.inner._pinned_store is None and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 and
+                      m.softcap == 0.0 and m.out_features == m.out_features_unpadded and m.out_features == self.num_v_heads and
+                      m.inner.weight.is_contiguous() and m.inner.weight.dtype == torch.half and
+                      m.inner.weight.shape[0] == lins[0].in_features and m.inner.out_dtype == torch.float for m in mods) and
+                  int(round(lins[0].inner.K * 2)) == 10 and lins[0].inner.in_features // 128 <= 64)
+            self._qwd_ab_ok_v = ok
+        return ok
+
+    def project_qkvz_ab_dec(self, x: torch.Tensor, params: dict, bsz: int, seqlen: int):
+        """qkv + z + b + a (+ beta / g) in ONE launch (exl3_dec_gemv_x), batch 1 only. Returns (qkv, z, b, a, None, None) with b, a fp32
+        [bsz, seqlen, num_v_heads], or (qkv, z, None, None, beta, g) when the gate math rides along, or None to fall back."""
+        if bsz * seqlen != 1 or x.dtype != torch.half or "capture" in params or "ovr" in params or not x.is_contiguous():
+            return None
+        if not self._qwd_ab_ok():
+            return None
+        lins = self._dec_qkvz_linears()
+        if x.shape[-1] != lins[0].in_features:
+            return None
+        from .quant.exl3 import dec_workspace
+        scratch, counters = dec_workspace(x.device)
+        outs = [torch.empty((1, l.inner.out_features), dtype = l.inner.default_out_dtype, device = x.device) for l in lins]
+        h = self.num_v_heads
+        gate = h % 16 == 0 and self.dt_bias.dtype == torch.bfloat16 and self.a_log.dtype == torch.float and \
+               self.dt_bias.is_contiguous() and self.a_log.is_contiguous() and self.dt_bias.numel() == h and self.a_log.numel() == h
+        if gate:
+            o1 = torch.empty((1, h), dtype = torch.bfloat16, device = x.device)
+            o2 = torch.empty((1, h), dtype = torch.float, device = x.device)
+            gargs = [self.dt_bias, self.a_log]
+        else:
+            o1 = torch.empty((1, h), dtype = torch.float, device = x.device)
+            o2 = torch.empty((1, h), dtype = torch.float, device = x.device)
+            gargs = []
+        ext.exl3_dec_gemv_x(
+            x.reshape(1, -1), [l.inner.trellis for l in lins], [l.inner.suh for l in lins], [l.inner.svh for l in lins],
+            outs, scratch, counters, [float(l.inner.K) for l in lins], bool(lins[0].inner.mcg), _QWD_AB_FLAGS,
+            [self.b_proj.inner.weight, self.a_proj.inner.weight], [o1, o2], gargs, float(self.beta_scale))
+        qkv, z = outs[0].view(bsz, seqlen, -1), outs[1].view(bsz, seqlen, -1)
+        if gate:
+            return (qkv, z, None, None, o1.view(bsz, seqlen, -1), o2.view(bsz, seqlen, -1))
+        return (qkv, z, o1.view(bsz, seqlen, -1), o2.view(bsz, seqlen, -1), None, None)
+
     def project_qkvz_sliced(self, x: torch.Tensor, bsz: int, seqlen: int) -> tuple:
         """qkv and z projections as one sliced mgemm (fp32 outputs, like the Linears); m <= 32"""
         mq = self.multi_qkvz
@@ -948,7 +1152,303 @@ class GatedDeltaNet(Module):
         )
 
 
+    def _pfe_f16_out(self, m, x: torch.Tensor, params: dict, env: str) -> bool:
+        # EXL3_PFE_QKVZ / EXL3_PFE_OPROJ (default 1): request this projection's output in fp16 instead of fp32.
+        # Where the fp32 output is an fp16 GEMM plus a widen (_f32_via_f16, HIP reconstruct path) the fp16
+        # buffer holds the same values and the consumer widens in-kernel: drops the widen copy, bit-exact
+        if os.environ.get(env, "1") != "1" or "capture" in params or "quant_preserve" in params:
+            return False
+        from .quant import exl3 as _exl3
+        rows = x.numel() // x.shape[-1]
+        if not (_exl3._f32_via_f16 and rows >= _exl3._f32_via_f16_min_rows):
+            return False
+        if type(m.inner).__name__ != "LinearEXL3" or m.inner.bias is not None:
+            return False
+        if rows <= _exl3.AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct \
+                or params.get("reconstruct"):
+            return False
+        return (
+            not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 and m.softcap == 0.0 and
+            m.out_features == m.out_features_unpadded
+        )
+
+    def _kda_qkv_f16(self, x: torch.Tensor) -> bool:
+        # EXL3_KDA_QKV_F16=1 (default): take qkv_proj's output in fp16 instead of fp32. On HIP the fp32 output
+        # is an fp16 GEMM plus a widen (_f32_via_f16), so the fp16 buffer holds the same values; the
+        # conv casts to bf16 in-kernel and accumulates in fp32. Drops a ~200 MB fp32 write per KDA
+        # layer per 2K chunk (and the MALL flush it causes). Bit-exact only on the reconstruct path
+        if os.environ.get("EXL3_KDA_QKV_F16", "1") != "1":
+            return False
+        from .quant import exl3 as _exl3
+        m = self.qkv_proj
+        rows = x.numel() // x.shape[-1]
+        if not (_exl3._f32_via_f16 and rows >= _exl3._f32_via_f16_min_rows):
+            return False
+        if type(m.inner).__name__ != "LinearEXL3" or m.inner.bias is not None:
+            return False
+        if rows <= _exl3.AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
+            return False
+        return (
+            not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 and m.softcap == 0.0 and
+            m.out_features == m.out_features_unpadded
+        )
+
+    def _kda_f16_gates(self, x: torch.Tensor) -> bool:
+        # EXL3_KDA_F16_GATES=1: keep the KDA gate projections in fp16 (no fp32 widen of the
+        # 2048x8192 g_b/f_b outputs, ~0.5 ms each). Bit-exact only where LinearFP16 already
+        # computes fp32 outputs as an fp16 GEMM plus a widen (HIP, rows >= the via-f16 threshold)
+        # z is then fp16: the fused gated norm must take an fp16 gate (ext.py ROCM_KNOBS["gnorm_f16g"]),
+        # else it drops to the torch fallback (5.9 vs 0.5 ms per call, -3 % 4K prefill; glm-next r3)
+        if os.environ.get("EXL3_KDA_F16_GATES", "1") != "1":
+            return False
+        from .quant import fp16 as _fp16
+        if not (_fp16._f32_via_f16 and x.numel() // x.shape[-1] >= _fp16._f32_via_f16_min_rows):
+            return False
+        mods = (self.g_a_proj, self.g_b_proj, self.b_proj, self.f_a_proj, self.f_b_proj)
+        return all(
+            m.quant_type == "fp16" and type(m.inner).__name__ == "LinearFP16" and m.inner.bias is None and
+            m.inner._pinned_store is None and not m.lora_a_tensors and
+            m.pre_scale == 1.0 and m.post_scale == 1.0 and m.softcap == 0.0 and
+            m.out_features == m.out_features_unpadded
+            for m in mods
+        )
+
+    def _kda_dec_cat_ok(self) -> bool:
+        ok = getattr(self, "_kda_dec_cat_ok_v", None)
+        if ok is None:
+            mods = (self.g_a_proj, self.g_b_proj, self.b_proj, self.f_a_proj, self.f_b_proj)
+            ok = hasattr(ext, "skinny_cat") and all(
+                m.quant_type == "fp16" and type(m.inner).__name__ == "LinearFP16" and m.inner.bias is None and
+                m.inner._pinned_store is None and not m.lora_a_tensors and
+                m.pre_scale == 1.0 and m.post_scale == 1.0 and m.softcap == 0.0 and
+                m.out_features == m.out_features_unpadded and m.inner.weight.is_contiguous()
+                for m in mods
+            ) and self.g_a_proj.out_features == self.f_a_proj.out_features \
+              and self.g_a_proj.out_features * 2 + self.b_proj.out_features <= 512
+            self._kda_dec_cat_ok_v = ok
+        return ok
+
+    def _kda_lr_fused_ok(self) -> bool:
+        # kda_fb_gate / kda_gb_norm preconditions that do not depend on the input (cached)
+        ok = getattr(self, "_kda_lr_fused_ok_v", None)
+        if ok is None:
+            wg, wf = self.g_b_proj.inner.weight, self.f_b_proj.inner.weight
+            hd = self.num_v_heads * self.k_head_dim
+            ok = hasattr(ext, "kda_fb_gate") and hasattr(ext, "kda_gb_norm") and _FUSE_KDA_GATE and \
+                os.environ.get("EXL3_FUSE_GNORM", "1") != "0" and \
+                self.g_a_proj.out_features == 128 and self.f_a_proj.out_features == 128 and \
+                wg.shape == wf.shape == (128, hd) and self.v_head_dim == 128 and self.k_head_dim * self.num_v_heads == hd and \
+                hd % 64 == 0 and wg.data_ptr() % 16 == 0 and wf.data_ptr() % 16 == 0 and \
+                self.b_proj.out_features == self.num_v_heads and \
+                self.dt_bias.dtype == torch.float and self.a_log.dtype == torch.float and \
+                self.dt_bias.is_contiguous() and self.a_log.is_contiguous() and self.dt_bias.numel() == hd and \
+                self.norm.gate_activation == "sigmoid" and \
+                self.norm.out_dtype in (torch.half, torch.float) and \
+                self.norm.weight.dtype in (torch.bfloat16, torch.float) and self.norm.weight.is_contiguous() and \
+                self.norm.weight.numel() == self.norm.groups * self.v_head_dim
+            self._kda_lr_fused_ok_v = ok
+        return ok
+
+    def _kda_dec_cat(self, x: torch.Tensor, params: dict):
+        # EXL3_KDA_DEC_CAT=1 (decode, rows <= 8, fp16 x): g_a | f_a | b in ONE skinny launch
+        # (ext.skinny_cat: same per-column reduction order as the separate skinny launches, so
+        # bit-identical; g_a/f_a rounded to fp16 RNE in-kernel exactly like ha). skinny_cat_w reads
+        # the three weights in place (no concat copy). With EXL3_KDA_DEC_LR_FUSED=1 the g_b/f_b second
+        # stages move into kda_fb_gate / kda_gb_norm: returns (None, b, None, gaf) and the caller
+        # runs them. Else EXL3_KDA_DEC_LR_BATCHED=1 runs g_b/f_b as one strided-batched GEMM
+        lead = x.shape[:-1]
+        rows = x.numel() // x.shape[-1]
+        na = self.g_a_proj.out_features
+        gaf = torch.empty((2, rows, na), dtype = torch.half, device = x.device)
+        b = torch.empty((*lead, self.b_proj.out_features), dtype = torch.float, device = x.device)
+        if hasattr(ext, "skinny_cat_w"):
+            ext.skinny_cat_w(x.view(rows, x.shape[-1]),
+                             [m.inner.weight for m in (self.g_a_proj, self.f_a_proj, self.b_proj)],
+                             [gaf[0], gaf[1], b])
+        else:
+            w = getattr(self, "kda_dec_cat_w", None)
+            if w is None:
+                w = torch.cat([m.inner.weight for m in (self.g_a_proj, self.f_a_proj, self.b_proj)], 1).contiguous()
+                self.kda_dec_cat_w = w
+            ext.skinny_cat(x.view(rows, x.shape[-1]), w, [gaf[0], gaf[1], b])
+        if KDA_KNOBS["lr_fused"] and self._kda_lr_fused_ok():
+            return None, b, None, gaf
+        if KDA_KNOBS["lr_batched"] and self.g_b_proj.inner.weight.shape == self.f_b_proj.inner.weight.shape:
+            lw = getattr(self, "kda_dec_lr_w", None)
+            if lw is None:
+                lw = torch.stack([self.g_b_proj.inner.weight, self.f_b_proj.inner.weight]).contiguous()
+                self.kda_dec_lr_w = lw
+            zf = torch.empty((2, rows, lw.shape[-1]), dtype = torch.float, device = x.device)
+            ext.hgemm_batched(gaf, lw, zf)
+            z = zf[0].view(*lead, lw.shape[-1])
+            f = zf[1].view(*lead, lw.shape[-1])
+        else:
+            z = self.g_b_proj.forward(gaf[0].view(*lead, na), params)
+            f = self.f_b_proj.forward(gaf[1].view(*lead, na), params)
+        return z, b, f, None
+
+    def _kda_gb_norm(self, core_attn_out: torch.Tensor, gaf: torch.Tensor, params: dict) -> torch.Tensor:
+        # g_b folded into the gated norm (z only feeds the norm). Same conditions as the fused norm
+        # path GatedRMSNorm.forward would take; otherwise materialize z and use the norm as before
+        n = self.norm
+        if core_attn_out.dtype == torch.bfloat16 and core_attn_out.is_contiguous():
+            y = torch.empty_like(core_attn_out, dtype = n.out_dtype)
+            ext.kda_gb_norm(core_attn_out, gaf[0], self.g_b_proj.inner.weight, n.weight, y,
+                            n.rms_norm_eps, n.constant_bias, n.groups, n.gate_first, 1)
+            return y
+        z = self.g_b_proj.forward(gaf[0].view(*core_attn_out.shape[:-2], gaf.shape[-1]), params)
+        z = z.view(core_attn_out.shape)
+        # EXL3_NC2_KDA_OPAD=1 (read per call): write the norm output at the o_proj row pitch, so o_proj skips its
+        # pad_copy_in (same kernel, only the store address moves: bit-exact)
+        o_pitch = 0
+        _pad_ok = getattr(ext.gated_rms_norm, "pad_ok", None)
+        if os.environ.get("EXL3_NC2_KDA_OPAD", "0") == "1" and _pad_ok is not None and not n.gate_first and \
+                _pad_ok(core_attn_out, n.weight, n.out_dtype or torch.half, z, n.groups,
+                        1 if n.gate_activation == "sigmoid" else 0):
+            o_pitch = _row_pad_pitch(self.o_proj, self.num_v_heads * self.v_head_dim,
+                                     core_attn_out.numel() // (self.num_v_heads * self.v_head_dim), params)
+        return n.forward(core_attn_out, params, gate = z, out_pitch = o_pitch)
+
+    def _kda_gates_f16(self, x: torch.Tensor, params: dict, small_first: bool):
+        h = torch.half
+        if os.environ.get("EXL3_KDA_SMALL_CAT", "0") == "1":
+            # g_a | b | f_a share x: one N=320 GEMM instead of three N<=128 ones (48 vs 3x16 WGs)
+            w = getattr(self, "kda_small_cat_w", None)
+            if w is None:
+                w = torch.cat([m.inner.weight for m in (self.g_a_proj, self.b_proj, self.f_a_proj)], 1).contiguous()
+                self.kda_small_cat_w = w
+            x2 = x.view(-1, x.shape[-1])
+            y = torch.matmul(x2, w).view(*x.shape[:-1], w.shape[1])
+            n_ga, n_b = self.g_a_proj.out_features, self.b_proj.out_features
+            ga, b, fa = y[..., :n_ga], y[..., n_ga:n_ga + n_b], y[..., n_ga + n_b:]
+        elif small_first:
+            # x-consumers back to back while x is still in the MALL
+            ga = self.g_a_proj.forward(x, params, out_dtype = h)
+            b = self.b_proj.forward(x, params, out_dtype = h)
+            fa = self.f_a_proj.forward(x, params, out_dtype = h)
+        else:
+            ga = self.g_a_proj.forward(x, params, out_dtype = h)
+            b = fa = None
+        z = self.g_b_proj.forward(ga, params, out_dtype = h)
+        if b is None:
+            b = self.b_proj.forward(x, params, out_dtype = h)
+        beta = torch.sigmoid(b.float() * self.beta_scale).to(torch.bfloat16)
+        if fa is None:
+            fa = self.f_a_proj.forward(x, params, out_dtype = h)
+        f = self.f_b_proj.forward(fa, params, out_dtype = h)
+        return z, beta, f
+
     @override
+    def _midchunk_segments(self, params: dict, bsz: int, seqlen: int, save_state: bool, save_history: bool):
+        """Row bounds [0, r1, .., T] for a mid-chunk checkpoint split, or None. Only the KDA chunk path, bsz 1,
+        rows % 64 == 0 (fla chunk BT) and every segment > 256 rows (same conv kernel as the unsplit call)."""
+        rows = params.get("checkpoint_rows")
+        if not rows or not self.kda or bsz != 1 or not save_state or save_history or params.get("midchunk_mode", 1) != 1:
+            return None
+        rows = sorted(set(int(r) for r in rows))
+        segs = [0] + rows + [seqlen]
+        if any(r % 64 for r in rows) or any(b - a <= 256 for a, b in zip(segs[:-1], segs[1:])):
+            return None
+        return segs
+
+
+    def _midchunk_kda_ckpt(self, params: dict, bsz: int, seqlen: int, save_state: bool, save_history: bool,
+                           mixed_qkv: torch.Tensor):
+        """EXL3_MIDCHUNK_CKPT=2: one unsplit call; the HIP KDA kernel side-writes S at the checkpoint row, conv state
+        there = the last cdim pre-conv inputs (bf16). Single row, rows % 64 == 0 only. Returns the ckpt dict or None."""
+        rows = params.get("checkpoint_rows")
+        if not rows or params.get("midchunk_mode") != 2 or bsz != 1 or not save_state or save_history:
+            return None
+        # GDN (not KDA): only the fused HIP chain (EXL3_GDN_FUSE=1 + EXL3_GDN_PF=1, chunk path) side-writes the state
+        if not self.kda and (os.environ.get("EXL3_GDN_FUSE", "0") != "1" or os.environ.get("EXL3_GDN_PF", "1") != "1"
+                             or seqlen < self.num_v_heads):
+            return None
+        rows = sorted(set(int(r) for r in rows))
+        cdim = self.conv_kernel_size
+        # EXL3_PF_NO_TAIL=1: the job also asks for the prompt's last full page, so up to 2 rows (kernel side-writes 2)
+        max_rows = 2 if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 1
+        if self.kda and os.environ.get("EXL3_NC2_CKPT4", "0") == "1":
+            max_rows = 4  # CK4 kernel build (vendor/fla/hip/kda_fused_h_hip.py): 8192-row chunks
+        if len(rows) > max_rows or any(r % 64 or not cdim <= r < seqlen for r in rows):
+            return None
+        cks = [{
+            "row": r,
+            "chunk": r // 64,
+            "s": torch.empty((1, self.num_v_heads, self.k_head_dim, self.v_head_dim), dtype = torch.float, device = self.device),
+            "conv": mixed_qkv[0, :, r - cdim:r].to(torch.bfloat16).contiguous(),
+        } for r in rows]
+        return cks[0] if len(cks) == 1 else cks
+
+
+    def _midchunk_kda_d2h(self, params: dict, ck: dict):
+        """Async D2H of a written mode-2 checkpoint into pinned buffers on a side stream; the event is synced at
+        stash time (Job.stash_midchunk)."""
+        if not ck.get("ok"):
+            return
+        global _MIDCKPT_STREAM
+        if _MIDCKPT_STREAM is None:
+            _MIDCKPT_STREAM = torch.cuda.Stream(device = self.device)
+        side = _MIDCKPT_STREAM
+        side.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(side):
+            hs = torch.empty(ck["s"].shape, dtype = ck["s"].dtype, pin_memory = True)
+            hc = torch.empty(ck["conv"].shape, dtype = ck["conv"].dtype, pin_memory = True)
+            hs.copy_(ck["s"], non_blocking = True)
+            hc.copy_(ck["conv"], non_blocking = True)
+            ev = torch.cuda.Event()
+            ev.record(side)
+        ck["s"].record_stream(side)
+        ck["conv"].record_stream(side)
+        layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+        params.setdefault("midchunk_states", {}).setdefault(ck["row"], {})[layer_instance] = (hs, hc, ev)
+
+
+    def _midchunk_conv_core(self, mixed_qkv, beta, g, conv_state, recurrent_state, recurrent_slots,
+                            params, segs, g_cumsum):
+        """Conv + KDA core as one call per segment, state chained in place through the slot. After each
+        segment but the last, save GPU clones of the slices GDNLayerState.stash() copies (S, conv) in
+        params["midchunk_states"][row][layer_instance]."""
+        slot = params["recurrent_states"][0].slot
+        layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+        cdim = self.conv_kernel_size
+        saved = params.setdefault("midchunk_states", {})
+        outs = []
+        for i, (a, b) in enumerate(zip(segs[:-1], segs[1:])):
+            last = i == len(segs) - 2
+            qkv_s = causal_conv1d_update(
+                mixed_qkv = mixed_qkv[:, :, a:b],
+                conv_state = conv_state,
+                recurrent_slots = recurrent_slots,
+                conv1d_weight = self.conv1d_weight_flat,
+                conv1d_bias = self.conv1d_bias,
+                history = False,
+                params = params,
+            )
+            if not last:
+                conv_snap = conv_state[slot, :, :cdim].clone()
+            outs.append(gated_delta_rule_fn(
+                mixed_qkv = qkv_s,
+                beta = beta[:, a:b],
+                g = g[:, a:b],
+                recurrent_state = recurrent_state,
+                recurrent_slots = recurrent_slots,
+                history = False,
+                save_state = True,
+                num_k_heads = self.num_k_heads,
+                num_v_heads = self.num_v_heads,
+                k_dim = self.k_dim,
+                v_dim = self.v_dim,
+                k_head_dim = self.k_head_dim,
+                v_head_dim = self.v_head_dim,
+                params = params,
+                channelwise_g = True,
+                g_cumsum = g_cumsum,
+            ))
+            if not last:
+                saved.setdefault(b, {})[layer_instance] = (recurrent_state[slot, :1].clone(), conv_snap)
+        return torch.cat(outs, dim = 1)
+
+
     def forward(
         self,
         x: torch.Tensor,
@@ -988,10 +1488,12 @@ class GatedDeltaNet(Module):
             else:
                 rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
             conv_state, recurrent_state = rsl.get_state_tensors()
+            recurrent_base = getattr(rsl, "state_base", None)
             save_state = True
         else:
             recurrent_slots = None
             conv_state, recurrent_state = None, None
+            recurrent_base = None
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
 
@@ -1033,7 +1535,7 @@ class GatedDeltaNet(Module):
                 else:
                     self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
+            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_base, recurrent_slots, save_history)
             if self.tp_reduce:
                 params["backend"].all_reduce(y)
             return to2(y, out_dtype, self.out_dtype)
@@ -1043,6 +1545,8 @@ class GatedDeltaNet(Module):
         # while Qwen3-Next uses fused projections. The fused C++ helper expects the
         # packed layout used by fused projections; applying it to split qkv tensors
         # causes incorrect head ordering and broken generations.
+        g_cumsum = False
+        lr_gaf = None
         if self.qkvz_proj is not None and self.ba_proj is not None:
             qkvz = self.qkvz_proj.forward(x, params)
             ba = self.ba_proj.forward(x, params)
@@ -1064,90 +1568,229 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
         elif self.kda:
-            qkv = self.qkv_proj.forward(x, params)
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            # EXL3_KDA_SMALL_FIRST=1: run the small x-consumers (g_a, b, f_a) before qkv_proj.
+            # qkv_proj writes a ~200 MB output that evicts x from the 32 MB MALL; the small-N
+            # GEMMs (16 workgroups, DRAM-latency bound) then take 1.0-1.5 ms instead of 0.2 ms.
+            # Same kernels, same inputs: bit-exact. End-to-end gain alone was noise (+0.1%, step 3 A/B)
+            small_first = os.environ.get("EXL3_KDA_SMALL_FIRST", "1") == "1"
+            qkv_dtype = torch.half if self._kda_qkv_f16(x) else None
+            if not small_first:
+                qkv = self.qkv_proj.forward(x, params, qkv_dtype)
 
-            # Low-rank sigmoid output gate stands in for z (applied by the gated norm)
-            z = self.g_b_proj.forward(self.g_a_proj.forward(x, params).to(torch.half), params) \
-                .view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
+            if self._kda_f16_gates(x):
+                z, beta, f = self._kda_gates_f16(x, params, small_first)
+                b = None
+            else:
+                # Low-rank sigmoid output gate stands in for z (applied by the gated norm)
+                # r35: at decode (rows <= 8, half x) the skinny hgemm rounds its fp32 sum straight to
+                # fp16 (RNE), identical to fp32 out + .to(half), minus one copy launch per projection
+                ha = torch.half if (KDA_KNOBS["half_a"] and x.dtype == torch.half and
+                                    x.numel() // x.shape[-1] <= 8) else None
+                beta = None
+                if ha is not None and KDA_KNOBS["dec_cat"] and self._kda_dec_cat_ok():
+                    z, b, f, lr_gaf = self._kda_dec_cat(x, params)
+                else:
+                    z = self.g_b_proj.forward(self.g_a_proj.forward(x, params, ha).to(torch.half), params)
+                    b = self.b_proj.forward(x, params)
+                    f = self.f_b_proj.forward(self.f_a_proj.forward(x, params, ha).to(torch.half), params)
+            if z is not None:
+                z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
 
-            beta = torch.sigmoid(self.b_proj.forward(x, params).float() * self.beta_scale) \
-                .to(torch.bfloat16)
+            if small_first:
+                qkv = self.qkv_proj.forward(x, params, qkv_dtype)
+            # EXL3_KDA_FUSED_CAST=1 (default): hand the conv the fp16 (bsz, f, seq) view; it casts
+            # to bf16 in-kernel (bit-equal), saving a full transpose-cast pass over qkv
+            if os.environ.get("EXL3_KDA_FUSED_CAST", "1") != "0":
+                mixed_qkv = qkv.transpose(1, 2)
+            else:
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
 
             # Per-k-channel log decay from the low-rank forget gate: "safe gate" form when a
-            # lower bound is configured, else softplus (per the Kimi/GLM5.3 reference)
-            f = self.f_b_proj.forward(self.f_a_proj.forward(x, params).to(torch.half), params)
-            gf = (f.float() + self.dt_bias.float().view(1, 1, -1)) \
-                .view(bsz, seqlen, self.num_v_heads, self.k_head_dim)
-            decay = torch.exp(self.a_log.float()).view(1, 1, self.num_v_heads, 1)
-            if self.gate_lower_bound is not None:
-                g = self.gate_lower_bound * torch.sigmoid(decay * gf)
+            # lower bound is configured, else softplus (per the Kimi/GLM5.3 reference).
+            # f may be fp16 (EXL3_KDA_F16_GATES): fp16 + fp32 promotes in one fp32 kernel
+            # EXL3_KDA_G_FUSED=1 (default, +2.0% 4K prefill, bit-exact): when the fla chunk path will run
+            # (prefill, no history), one Triton pass computes the gate AND fla's chunk-local cumsum
+            # (bit-equal to the torch chain + chunk_local_cumsum; kda_gate.py uses BS=32 tiles for that).
+            # Saves ~2.9 ms per KDA layer per 2048-row chunk (3.5 -> 0.6 ms, scratch/dg/s5_mb.py)
+            g_cumsum = (
+                os.environ.get("EXL3_KDA_G_FUSED", "1") == "1"
+                and seqlen >= self.num_v_heads and not save_history
+            )
+            if lr_gaf is not None:
+                # EXL3_KDA_DEC_LR_FUSED: f = f_a @ f_b and the gate in one launch (kda_gate math)
+                g_cumsum = False
+                beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = x.device)
+                g = torch.empty((bsz, seqlen, self.num_v_heads, self.k_head_dim), dtype = torch.float, device = x.device)
+                lb = self.gate_lower_bound
+                ext.kda_fb_gate(lr_gaf[1], self.f_b_proj.inner.weight, b, self.dt_bias, self.a_log,
+                                float(self.beta_scale), float(lb or 0.0), lb is not None, beta, g)
+            elif g_cumsum:
+                if beta is None:
+                    beta = torch.sigmoid(b.float() * self.beta_scale).to(torch.bfloat16)
+                from .gated_delta_net_fn.kda_gate import kda_gate
+                from ..vendor.fla import RCP_LN2
+                g = kda_gate(
+                    f.contiguous(), self.dt_bias.float(), torch.exp(self.a_log.float()),
+                    self.num_v_heads, self.k_head_dim, self.gate_lower_bound,
+                    cumsum_chunk = 64, cumsum_scale = RCP_LN2,
+                )
+            elif beta is None and _FUSE_KDA_GATE and b.dtype == torch.float and f.dtype == torch.float \
+                    and self.dt_bias.dtype == torch.float and self.a_log.dtype == torch.float \
+                    and b.is_contiguous() and f.is_contiguous():
+                # One launch for beta and g (fused_elt_rocm.cu kda_gate), same per-element math
+                beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = f.device)
+                g = torch.empty((bsz, seqlen, self.num_v_heads, self.k_head_dim), dtype = torch.float, device = f.device)
+                lb = self.gate_lower_bound
+                ext.kda_gate(b, f, self.dt_bias, self.a_log, float(self.beta_scale),
+                             float(lb or 0.0), lb is not None, beta, g)
             else:
-                g = -decay * torch.where(gf > 20.0, gf, torch.log1p(torch.exp(gf)))
+                if beta is None:
+                    beta = torch.sigmoid(b.float() * self.beta_scale).to(torch.bfloat16)
+                gf = (f + self.dt_bias.float().view(1, 1, -1)) \
+                    .view(bsz, seqlen, self.num_v_heads, self.k_head_dim)
+                decay = torch.exp(self.a_log.float()).view(1, 1, self.num_v_heads, 1)
+                if self.gate_lower_bound is not None:
+                    g = self.gate_lower_bound * torch.sigmoid(decay * gf)
+                else:
+                    g = -decay * torch.where(gf > 20.0, gf, torch.log1p(torch.exp(gf)))
         else:
-            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
+            # EXL3_QWG_ABFIRST=1 runs the two skinny b / a projections before qkv / z (independent kernels, bit-exact)
+            ab_first = os.environ.get("EXL3_QWG_ABFIRST", "0") == "1"
+            if ab_first:
+                b = self.b_proj.forward(x, params)
+                a = self.a_proj.forward(x, params)
+            qzab = self.project_qkvz_ab_dec(x, params, bsz, seqlen) if (_QKVZ_DEC_MULTI and not ab_first and _qwd_ab_on()) else None
+            qz = None if qzab is not None else (self.project_qkvz_dec(x, params, bsz, seqlen) if _QKVZ_DEC_MULTI else None)
+            if qzab is not None:
+                qkv, z, b, a, beta_ab, g_ab = qzab
+            elif qz is not None:
+                qkv, z = qz
+            elif getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
-                qkv = self.qkv_proj.forward(x, params)
-                z = self.z_proj.forward(x, params)
+                qkv_dt = torch.half if self._pfe_f16_out(self.qkv_proj, x, params, "EXL3_PFE_QKVZ") else None
+                z_dt = torch.half if self._pfe_f16_out(self.z_proj, x, params, "EXL3_PFE_QKVZ") else None
+                qkv = self.qkv_proj.forward(x, params, qkv_dt)
+                z = self.z_proj.forward(x, params, z_dt)
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
-            b = self.b_proj.forward(x, params)
-            a = self.a_proj.forward(x, params)
+            if not ab_first and qzab is None:
+                _c = getattr(self, "_qd3_ba", None)
+                if QWD3["skip"] and _c is not None and _c[0] == x.shape:
+                    b, a = _c[1], _c[2]
+                else:
+                    ba = self._ab_cat(x, params, bsz, seqlen) if QWD3.get("abcat", _ABCAT) else None
+                    if ba is not None:
+                        b, a = ba
+                    else:
+                        b = self.b_proj.forward(x, params)
+                        a = self.a_proj.forward(x, params)
+                    self._qd3_ba = (x.shape, b, a)
 
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            # EXL3_GDN_FUSED_CAST=1 (default): the conv casts the fp16 transposed view in-kernel (bit-equal),
+            # replacing two full passes (strided cast + transpose copy) over qkv
+            if os.environ.get("EXL3_GDN_FUSED_CAST", "1") != "0":
+                mixed_qkv = qkv.transpose(1, 2)
+            else:
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
 
-            beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
-            g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
+            if qzab is not None and beta_ab is not None:
+                beta, g = beta_ab, g_ab
+            else:
+                _c = getattr(self, "_qd3_bg", None)
+                if QWD3["skip"] >= 2 and _c is not None and _c[0] == x.shape:
+                    beta, g = _c[1], _c[2]
+                else:
+                    beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
+                    g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
+                    ext.gated_delta_net_fused_op_2(
+                        b, a,
+                        self.dt_bias,
+                        self.a_log,
+                        beta, g,
+                        self.beta_scale
+                    )
+                    self._qd3_bg = (x.shape, beta, g)
 
-            ext.gated_delta_net_fused_op_2(
-                b, a,
-                self.dt_bias,
-                self.a_log,
-                beta, g,
-                self.beta_scale
+        # Mid-chunk recurrent checkpoints (EXL3_MIDCHUNK_CKPT, set by the job via params): split conv + KDA
+        # core at the given rows, chaining conv state and S, and save the state at each split row
+        segs = self._midchunk_segments(params, bsz, seqlen, save_state, save_history)
+        if segs is not None:
+            core_attn_out = self._midchunk_conv_core(
+                mixed_qkv, beta, g, conv_state, recurrent_state, recurrent_slots, params, segs, g_cumsum
+            )
+        else:
+            ck = self._midchunk_kda_ckpt(params, bsz, seqlen, save_state, save_history, mixed_qkv)
+            if ck is not None:
+                params["kda_ckpt"] = ck
+            # Convolution. EXL3_PF_GLUE=1 (default off, bit-exact): KDA chunk path writes q | k | v planes
+            plane = (self.k_dim if os.environ.get("EXL3_PF_GLUE", "0") == "1" and self.kda
+                     and self.k_dim == self.v_dim and not save_history and seqlen >= self.num_v_heads else 0)
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv = mixed_qkv,
+                conv_state = conv_state,
+                recurrent_slots = recurrent_slots,
+                conv1d_weight = self.conv1d_weight_flat,
+                conv1d_bias = self.conv1d_bias,
+                history = save_history,
+                params = params,
+                plane = plane,
             )
 
-        # Convolution
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv = mixed_qkv,
-            conv_state = conv_state,
-            recurrent_slots = recurrent_slots,
-            conv1d_weight = self.conv1d_weight_flat,
-            conv1d_bias = self.conv1d_bias,
-            history = save_history,
-            params = params,
-        )
-
-        # Delta rule
-        core_attn_out = gated_delta_rule_fn(
-            mixed_qkv = mixed_qkv,
-            beta = beta,
-            g = g,
-            recurrent_state = recurrent_state,
-            recurrent_slots = recurrent_slots,
-            history = save_history,
-            save_state = save_state,
-            num_k_heads = self.num_k_heads,
-            num_v_heads = self.num_v_heads,
-            k_dim = self.k_dim,
-            v_dim = self.v_dim,
-            k_head_dim = self.k_head_dim,
-            v_head_dim = self.v_head_dim,
-            params = params,
-            channelwise_g = self.kda,
-        )
+            # Delta rule
+            core_attn_out = gated_delta_rule_fn(
+                mixed_qkv = mixed_qkv,
+                beta = beta,
+                g = g,
+                recurrent_state = recurrent_state,
+                recurrent_slots = recurrent_slots,
+                recurrent_base = recurrent_base,
+                history = save_history,
+                save_state = save_state,
+                num_k_heads = self.num_k_heads,
+                num_v_heads = self.num_v_heads,
+                k_dim = self.k_dim,
+                v_dim = self.v_dim,
+                k_head_dim = self.k_head_dim,
+                v_head_dim = self.v_head_dim,
+                params = params,
+                channelwise_g = self.kda,
+                g_cumsum = g_cumsum,
+            )
+            if ck is not None:
+                params.pop("kda_ckpt")
+                for c in (ck if isinstance(ck, list) else [ck]):
+                    self._midchunk_kda_d2h(params, c)
 
         # Norm
-        core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
+        if lr_gaf is not None:
+            core_attn_out = self._kda_gb_norm(core_attn_out, lr_gaf, params)
+        else:
+            o_pitch = 0
+            _pad_ok = getattr(ext.gated_rms_norm, "pad_ok", None)
+            # EXL3_NC2_KDA_NPAD=1 (read per call): KDA prefill too (GLM: 34 layers, o_proj K 8192), so o_proj skips its
+            # pad_copy_in; same fused kernel, only the store address moves (bit-exact). The pitched forward needs fp16 out
+            kda_ok = not self.kda or (os.environ.get("EXL3_NC2_KDA_NPAD", "0") == "1" and self.norm.out_dtype == torch.half)
+            if _pad_ok is not None and kda_ok and not self.norm.gate_first and \
+                    _pad_ok(core_attn_out, self.norm.weight, self.norm.out_dtype or torch.half, z, self.norm.groups,
+                            1 if self.norm.gate_activation == "sigmoid" else 0):
+                o_pitch = _row_pad_pitch(self.o_proj, self.num_v_heads * self.v_head_dim,
+                                         core_attn_out.numel() // (self.num_v_heads * self.v_head_dim), params)
+            core_attn_out = self.norm.forward(core_attn_out, params, gate = z, out_pitch = o_pitch)
         core_attn_out = core_attn_out.view(bsz, seqlen, self.num_v_heads * self.v_head_dim)
 
-        # Output projection
-        x = self.o_proj.forward(core_attn_out, params)
+        # Output projection (fp16 when the block's residual apply reads fp16: params["pfe_y_half"])
+        o_dt = torch.half if params.get("pfe_y_half") and \
+            self._pfe_f16_out(self.o_proj, core_attn_out, params, "EXL3_PFE_OPROJ") else None
+        x = self.o_proj.forward(core_attn_out, params, o_dt)
 
         # TP reduction
         if self.tp_reduce:
             params["backend"].all_reduce(x)
 
+        # EXL3_NC2_ATTN_F16 (default off): keep o_proj's fp16 output when the block asked for it (see MLAttention)
+        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+            return x
         return to2(x, out_dtype, self.out_dtype)
 
 

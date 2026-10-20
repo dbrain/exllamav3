@@ -1,4 +1,11 @@
+#if defined(USE_ROCM)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_cooperative_groups.h>
+#else
 #include <cuda_fp16.h>
+#include <cooperative_groups.h>
+#endif
 #include "exl3_gemv_int8.cuh"
 #include "exl3_gemv_int8_kernel.cuh"
 #include "comp_units/exl3_gemv_int8_instances.cuh"
@@ -6,18 +13,22 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "../util.h"
 #include "../util.cuh"
+#if !defined(USE_ROCM)
 #include "../ptx.cuh"
+#endif
 #include "exl3_dq.cuh"
 #include "exl3_devctx.cuh"
 #include "hadamard_inner.cuh"
-#include <cooperative_groups.h>
 #include <cstdlib>
+#include <cstring>
 #include <set>
 #include <map>
 
 
 // Mode 0: disabled; 1: int8 + error-feedback residual pass (~15-16 bit effective activation
 // precision, KL at parity with fp16 or better); 2: plain int8 (cheaper, ~0.9% output RMS deviation).
+// ROCm: default OFF (0) - the HIP port (gfx1151) is opt-in until measured on more parts; set
+// EXL3_INT8_GEMV=1 or 2 explicitly to enable it.
 static int _exl3_gemv_int8_mode = 0;
 bool _exl3_gemv_int8_mode_chk = false;
 
@@ -25,8 +36,19 @@ static int exl3_gemv_int8_mode()
 {
     if (_exl3_gemv_int8_mode_chk) return _exl3_gemv_int8_mode;
     const char* e = getenv("EXL3_INT8_GEMV");
+#if defined(USE_ROCM)
+    _exl3_gemv_int8_mode = e ? atoi(e) : 0;
+#else
     _exl3_gemv_int8_mode = e ? atoi(e) : 2;
+#endif
     return _exl3_gemv_int8_mode;
+}
+
+// EXL3_INT8_GEMV_TRACE=1: one stderr line per call the int8 path handled (route proof for tests)
+static bool exl3_gemv_int8_trace()
+{
+    static const bool t = [] { const char* e = getenv("EXL3_INT8_GEMV_TRACE"); return e && *e && *e != '0'; }();
+    return t;
 }
 
 bool exl3_gemv_int8_enabled()
@@ -47,8 +69,15 @@ int exl3_gemv_int8_max_k(int device)
 {
     static const int env_max_k = [] { const char* e = getenv("EXL3_INT8_GEMV_MAX_K"); return e ? atoi(e) : 0; }();
     if (env_max_k) return MIN(env_max_k, 8);
+#if defined(USE_ROCM)
+    // gfx1151 (RDNA 3.5): every instantiated K is allowed; the caller (exl3_gemv on ROCm) already
+    // restricts the path to mul1 tensors at m <= 2, and the mode defaults to off
+    (void) device;
+    return 8;
+#else
     int cc = DevCtx::instance().get_cc(device);
     return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : 5;
+#endif
 }
 
 struct GemvInt8Workspace
@@ -150,6 +179,7 @@ static bool exl3_gemv_int8_sq
                + stage + (size_t) 2 * M * 128 * 4;
     };
 
+#if !defined(USE_ROCM)
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(rows_max));
@@ -161,6 +191,11 @@ static bool exl3_gemv_int8_sq
         gemv_attr_set[device].insert(fn);
         cuda_check(cudaPeekAtLastError());
     }
+#else
+    // HIP: no opt-in dynamic LDS attribute or carveout; gemv_int8_sq_rows_max bounds the request
+    // under the 64 KB workgroup limit
+    (void) rows_max;
+#endif
 
     int ksplit, rows_per;
     decomp(6 * num_sms, ksplit, rows_per);
@@ -176,6 +211,15 @@ static bool exl3_gemv_int8_sq
         gemv_occ_cache[device][occ_key] = maxb;
     }
     int grid = MIN(MAX(maxb, 1) * num_sms, 1024);
+#if defined(USE_ROCM)
+    // RDNA: the occupancy query (LDS-bound, 2 blocks/CU at the widest slices) leaves the CUs half
+    // empty and the register-staged B pipeline latency-bound. Oversubscribe the persistent grid so
+    // more waves are in flight; EXL3_INT8_GEMV_BLOCKS_PER_CU overrides (0 = occupancy estimate)
+    {
+        static const int bpc = [] { const char* e = getenv("EXL3_INT8_GEMV_BLOCKS_PER_CU"); return e ? atoi(e) : 8; }();
+        if (bpc > 0) grid = MIN(bpc * num_sms, 1024);
+    }
+#endif
     decomp(grid, ksplit, rows_per);
     size_t smem = smem_for(rows_per);
     if (ksplit > SQ_KSPLIT_CAP) return false;
@@ -206,6 +250,9 @@ static bool exl3_gemv_int8_sq
         cudaGetLastError();
         return false;
     }
+    if (exl3_gemv_int8_trace())
+        fprintf(stderr, "[exl3_gemv_int8] sq kernel: m=%d k=%d n=%d K=%d residual=%d grid=%d rows_per=%d ksplit=%d smem=%zu\n",
+                size_m, size_k, size_n, K, (int) residual, grid, rows_per, ksplit, smem);
     if (graph)
     {
         graph->record_param(fn, GP_gemm_A, 0);
@@ -251,7 +298,9 @@ bool exl3_gemv_int8
     // weights and the B stream; measured on 3090, larger m and batched residual lose to the fp16
     // tensor-core kernel). Falls through to the cooperative kernel on a constraint miss at m == 1;
     // batched rows beyond the gate go straight to the regular kernel.
-    if (size_m <= (residual ? 1 : 2) && exl3_gemv_int8_sq(
+    // EXL3_INT8_GEMV_FORCE_COOP=1 (testing): skip the sq kernel so the cooperative kernel is exercised
+    static const bool force_coop = [] { const char* e = getenv("EXL3_INT8_GEMV_FORCE_COOP"); return e && *e && *e != '0'; }();
+    if (!force_coop && size_m <= (residual ? 1 : 2) && exl3_gemv_int8_sq(
         (const half*) A.data_ptr(), (const uint16_t*) B.data_ptr(), C.data_ptr(),
         size_m, size_k, size_n, K, c_fp32, residual,
         (const half*) suh->data_ptr(), (half*) A_had->data_ptr(), (const half*) svh->data_ptr(),
@@ -277,6 +326,7 @@ bool exl3_gemv_int8
         return MAX((size_t) rows_per * 16 * 4 * (residual ? 2 : 1) + stage, (size_t) 8 * 128 * 4);
     };
 
+#if !defined(USE_ROCM)
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
         // Upper bound over all shapes: smem_rows_max * 64 B
@@ -289,6 +339,7 @@ bool exl3_gemv_int8
         gemv_attr_set[device].insert(fn);
         cuda_check(cudaPeekAtLastError());
     }
+#endif
 
     size_t smem_guess = smem_for_grid(6 * num_sms);
     int maxb;
@@ -345,11 +396,16 @@ bool exl3_gemv_int8
         }
     };
 
+    if (exl3_gemv_int8_trace())
+        fprintf(stderr, "[exl3_gemv_int8] coop kernel: m=%d k=%d n=%d K=%d residual=%d grid=%d smem=%zu\n",
+                size_m, size_k, size_n, K, (int) residual, grid, smem);
     cudaError_t err = cudaLaunchCooperativeKernel(fn, grid, NUM_THREADS, kernelArgs, smem, stream);
     if (err != cudaSuccess)
     {
         // e.g. cooperative launch unsupported or co-residency violated: fall back to the regular kernel
         // (which records its own graph parameter sites)
+        if (exl3_gemv_int8_trace())
+            fprintf(stderr, "[exl3_gemv_int8] coop launch FAILED: %s\n", cudaGetErrorString(err));
         cudaGetLastError();
         return false;
     }

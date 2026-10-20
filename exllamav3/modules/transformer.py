@@ -1,11 +1,14 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 from ..util.tensor import to2
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from .hyperconnections import HyperConnection
+from . import ablit_runtime
 from ..util import profile_opt
+from . import moe_fused
 
 class TransformerBlock(Module):
 
@@ -40,6 +43,10 @@ class TransformerBlock(Module):
         self.mlp_post_norm = mlp_post_norm
         self.attn_hc = attn_hc
         self.mlp_hc = mlp_hc
+        # EXL3_MOE_FUSED=1: fused MoE half-layer for R <= 4 rows (moe_fused.py). Attribute so a harness can toggle it per block.
+        self._moe_fused_on = moe_fused.enabled_by_env()
+        self._moe_fused = None
+        self._moe_fused_tried = False
         self.qbits_key = qbits_key
         self.out_dtype = out_dtype
 
@@ -50,6 +57,7 @@ class TransformerBlock(Module):
         self.layer_scalar_f = None
         self.attn_resid_scalar = None
         self.mlp_resid_scalar = None
+        self.ablit = None  # EXL3_ABLIT_RUNTIME: (w_attn, w_mlp, r_fp32, r_fp16), set in load()
 
         # Hyperconnection sites (mHC): the block's residual is (bsz, seq, hc_mult, hidden)
         # fp32 streams, mixed at each sublayer site instead of the plain residual add
@@ -82,6 +90,7 @@ class TransformerBlock(Module):
 
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
+        ablit_runtime.prepare(self, device)
         if self.key_layer_scalar:
             self.layer_scalar_t = self.config.stc.get_tensor(
                 self.key + "." + self.key_layer_scalar,
@@ -133,6 +142,92 @@ class TransformerBlock(Module):
             (self.mlp_resid_scalar.numel() if self.mlp_resid_scalar is not None else 0)
         )
 
+    def _forward_mlp(self, x: torch.Tensor, y_resid: torch.Tensor | None, params: dict,
+                     hc_pending = None, hc_defer: bool = False) -> torch.Tensor:
+        """MLP half of forward (norm, MLP, residual/hc apply). `y_resid` is a pending attention
+        output whose residual add is folded into the MLP input norm. Returns the new residual."""
+        if self.mlp:
+            if self.mlp_hc and self._moe_fused_on:
+                fused_x = moe_fused.maybe_apply(self, x, params, hc_pending)
+                if fused_x is not None:
+                    return fused_x
+            if self.mlp_hc:
+                gr_pend = hc_pending is not None and hc_pending[3] is None and not self.mlp_norm
+                if hc_pending is not None and not self.mlp_norm and not gr_pend:
+                    HyperConnection.flush_pending(x, hc_pending)
+                    hc_pending = None
+                params["hc_pad_ok"] = "mlp"         # MLP site: GEMMs and the MoE gather take a row-padded input
+                try:
+                    fused = self.mlp_hc.mix_norm(x, params, self.mlp_norm, hc_pending) if self.mlp_norm else None
+                finally:
+                    params.pop("hc_pad_ok", None)
+                if fused is not None:
+                    hc_post, hc_comb, y = fused
+                else:
+                    hc_post, hc_comb, y = self.mlp_hc.mix(x, params, pending = hc_pending) if gr_pend \
+                        else self.mlp_hc.mix(x, params)
+                    y = y.half()
+                    if self.mlp_norm:
+                        y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
+            else:
+                params["residual"] = x
+                if y_resid is not None:
+                    # Decode (batch-1 or DFlash verify, R<=MOE_R_MAX): the MLP may fuse this
+                    # pre-norm into its router launch(es) -- dec_norm_route_r loops the real
+                    # batch-1 kernel per row for R>1, so it's bit-exact by construction (see its
+                    # docstring); it also covers R==1 (self.mlp.dec_norm_route's own path).
+                    fused_r = getattr(self.mlp, "dec_norm_route_r", None)
+                    y = None
+                    if fused_r is not None:
+                        try:
+                            xa_r = y_resid.view(-1, self.mlp.hidden_size)
+                            r_r = x.view(-1, self.mlp.hidden_size)
+                        except RuntimeError:
+                            xa_r = r_r = None
+                        if xa_r is not None:
+                            y = fused_r(self.mlp_norm, xa_r, r_r, params)
+                            if y is not None:
+                                y = y.view(y_resid.shape)
+                    if y is None:
+                        y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
+                elif self.mlp_norm:
+                    y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
+                else:
+                    y = x.half()
+                # Attention modules that return flattened (rows, dim) output (MLA decode) hand a
+                # 2D y_resid to the fused residual norm; the MLP (shared experts) expects x's shape
+                if y.shape != x.shape and y.numel() == x.numel():
+                    y = y.view(x.shape)
+            # Plain residual add after the MLP: offer the residual so a fused MLP kernel can add
+            # into it directly (it then sets mlp_residual_done and y is not added again)
+            plain_add = self.mlp_resid_scalar is None and not self.mlp_hc and not self.mlp_post_norm \
+                and not self.ablit
+            if plain_add:
+                params["mlp_residual_out"] = x
+            y = self.mlp.forward(y, params)
+            if plain_add:
+                params.pop("mlp_residual_out", None)
+            if self.ablit:
+                ablit_runtime.project(y, self.ablit[1], *self.ablit[2:])
+            if self.mlp_resid_scalar is not None:
+                y *= self.mlp_resid_scalar
+            if self.mlp_hc:
+                # EXL3_PF_HC_FUSE: defer into the next block's attn mix_norm (see pf_can_defer)
+                if hc_defer and HyperConnection.pf_can_defer(x, y, hc_post, hc_comb, params):
+                    params["hc_pending"] = (x, y, hc_post, hc_comb)
+                elif hc_defer and hc_comb is None and hasattr(self.mlp_hc, "gr_can_defer") and self.mlp_hc.gr_can_defer(x, y, hc_post, params):
+                    params["hc_pending"] = (x, y, hc_post, None)
+                else:
+                    x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
+            elif self.mlp_post_norm:
+                self.mlp_post_norm.forward(y, params, residual = x)
+            elif params.pop("mlp_residual_done", False):
+                pass
+            else:
+                x += y
+        return x
+
+
     @override
     def forward(
         self,
@@ -140,29 +235,87 @@ class TransformerBlock(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+        # Opt-in per-block HIP graph capture (EXL3_BLOCK_GRAPH, ROCm decode only). Declines
+        # return None and fall through to the eager path below.
+        # EXL3_PF_HC_FUSE: a residual apply deferred by the previous block (prefill only, so
+        # never combined with the decode block graph)
+        hc_pending = params.pop("hc_pending", None)
+        if hc_pending is None:
+            from .block_graph import maybe_graph_forward
+            y_graph = maybe_graph_forward(self, x, params)
+            if y_graph is not None:
+                return y_graph
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
+        gr_pend = hc_pending is not None and hc_pending[3] is None and bool(self.attn and self.attn_hc) \
+            and not self.attn_norm
+        if hc_pending is not None and not gr_pend and not (self.attn and self.attn_hc and self.attn_norm):
+            HyperConnection.flush_pending(x, hc_pending)
+            hc_pending = None
+        hc_defer = not export_state and self.layer_scalar_f is None
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
+        mlp_pending = None
 
         if self.attn:
             if self.attn_hc:
-                hc_post, hc_comb, y = self.attn_hc.mix(x, params)
-                y = y.half()
-                if self.attn_norm:
-                    y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+                params["hc_pad_ok"] = True          # the attention site accepts a row-padded block input
+                try:
+                    fused = self.attn_hc.mix_norm(x, params, self.attn_norm, hc_pending) if self.attn_norm else None
+                finally:
+                    params.pop("hc_pad_ok", None)
+                if fused is not None:
+                    hc_post, hc_comb, y = fused
+                else:
+                    params["hc_pad_ok"] = True      # the attention site accepts a row-padded block input
+                    try:
+                        hc_post, hc_comb, y = self.attn_hc.mix(x, params, pending = hc_pending) if gr_pend \
+                            else self.attn_hc.mix(x, params)
+                    finally:
+                        params.pop("hc_pad_ok", None)
+                    y = y.half()
+                    if self.attn_norm:
+                        y = self.attn_norm.forward(y, params, out_dtype = torch.half)
             elif self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
-            y = self.attn.forward(y, params)
+            # EXL3_PFE_OPROJ: this site's residual apply (hc_apply) reads fp16 or fp32 y alike, so the
+            # attention output projection may skip its fp32 widen (see GatedDeltaNet / Attention.project_o)
+            # EXL3_NC2_ABLIT_F16: an ablit block widens + projects the fp16 output in one exact pass (project_widen)
+            pfe_half = bool(self.attn_hc) and self.attn_resid_scalar is None \
+                and not export_state and "pfe_y_half" not in params and \
+                (not self.ablit or os.environ.get("EXL3_NC2_ABLIT_F16", "0") == "1")
+            if pfe_half:
+                params["pfe_y_half"] = True
+            try:
+                y = self.attn.forward(y, params)
+            finally:
+                if pfe_half:
+                    params.pop("pfe_y_half", None)
+            if y is None:
+                # EXL3_PF_SKIP: kv_only -- attention wrote its K/V (and indexer) rows and the
+                # caller discards this block's output, so nothing below has an input to read
+                return None
             if params.get("prefill") and not export_state:
                 return x
+            if self.ablit:
+                if pfe_half and y.dtype == torch.half and self.ablit[0] != 0.0:
+                    y = ablit_runtime.project_widen(y, self.ablit[0], *self.ablit[2:])
+                else:
+                    ablit_runtime.project(y, self.ablit[0], *self.ablit[2:])
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
             if self.attn_hc:
-                x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
+                if self.mlp and self.mlp_hc and self.mlp_norm \
+                        and HyperConnection.pf_can_defer(x, y, hc_post, hc_comb, params):
+                    mlp_pending = (x, y, hc_post, hc_comb)
+                elif self.mlp and self.mlp_hc and not self.mlp_norm and hc_comb is None \
+                        and hasattr(self.mlp_hc, "gr_can_defer") and self.mlp_hc.gr_can_defer(x, y, hc_post, params):
+                    mlp_pending = (x, y, hc_post, None)
+                else:
+                    x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
             elif self.mlp is not None and self.mlp_norm is not None and self.mlp_norm.can_fuse_residual(x, y):
@@ -170,29 +323,7 @@ class TransformerBlock(Module):
             else:
                 x += y
 
-        if self.mlp:
-            if self.mlp_hc:
-                hc_post, hc_comb, y = self.mlp_hc.mix(x, params)
-                y = y.half()
-                if self.mlp_norm:
-                    y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
-            else:
-                params["residual"] = x
-                if y_resid is not None:
-                    y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
-                elif self.mlp_norm:
-                    y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
-                else:
-                    y = x.half()
-            y = self.mlp.forward(y, params)
-            if self.mlp_resid_scalar is not None:
-                y *= self.mlp_resid_scalar
-            if self.mlp_hc:
-                x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
-            elif self.mlp_post_norm:
-                self.mlp_post_norm.forward(y, params, residual = x)
-            else:
-                x += y
+        x = self._forward_mlp(x, y_resid, params, mlp_pending, hc_defer)
 
         if export_state:
             s = params.get("export_states")

@@ -9,6 +9,7 @@ from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
 from ..cache.recurrent_util import advance_recurrent_states
+import os
 
 class Model(Model_TPMixin, Model_LSMixin):
 
@@ -380,7 +381,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                 "Cannot specify reserve_per_device or use_per_device when loading to single device."
             assert not tensor_p, \
                 "Cannot use tensor_p when loading to single device."
-            self._load_single(progressbar, device, self.config, self.modules, verbose)
+            self._load_single(progressbar, device, self.config, self.modules, verbose, callback)
             self.output_device = self.modules[-1].device
 
         # Use/reserve
@@ -476,6 +477,19 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         free_mem()
 
+        # Drop the shards' clean pages from the OS page cache. On a unified-memory host (GB10)
+        # the page cache and the model weights are the *same* physical pool, so after an 87 GiB
+        # load the box is carrying that 87 GiB twice and torch.cuda.mem_get_info() -- which
+        # reports MemFree, not MemAvailable -- cannot see it. See
+        # SafetensorsCollection.drop_page_cache(). EXL3_KEEP_PAGE_CACHE=1 disables.
+        if os.environ.get("EXL3_KEEP_PAGE_CACHE", "0") != "1":
+            try:
+                n = self.config.stc.drop_page_cache()
+                if verbose and n:
+                    print(f" -- Released {n / 1024 ** 3:.1f} GiB of shard page cache")
+            except Exception as e:
+                print(f" !! Could not drop shard page cache: {e}")
+
         # Release all global shared tensors (refs still held by modules until model is unloaded)
         g_tensor_cache.drop_all()
 
@@ -495,6 +509,12 @@ class Model(Model_TPMixin, Model_LSMixin):
         kwargs["generator"] = False
         f = self.load_gen(*args, **kwargs)
         for _ in f: pass
+        try:
+            from ..modules import moe_fused
+            moe_fused.report(self)
+        except Exception as e:                                            # noqa: BLE001  (diagnostics must never break a load)
+            import sys
+            print(f"[moe_fused] WARNING fused-status report failed: {e!r}", file = sys.stderr)
 
         # CPU-offloaded MoE experts: make sure the worker processes are up before the first
         # forward (spawned during module loading when the offload count is exact, so the child's

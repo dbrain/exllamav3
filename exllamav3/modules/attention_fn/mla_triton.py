@@ -592,6 +592,60 @@ def _mla_absorb_kernel(
 
 
 @triton.jit(do_not_specialize = ["R"])
+def _mla_absorb_kc_kernel(
+    q,                  # (R, H, QK_DIM) fp16 token-major
+    w_uk_flat,          # (D_c, H * D_nope) fp16
+    out,                # (H, R, D_c) fp16 head-major
+    R,                  # runtime
+    n_q_heads: tl.constexpr,
+    QK_DIM: tl.constexpr,
+    Q_STRIDE: tl.constexpr,
+    D_nope: tl.constexpr,
+    D_nope_pad: tl.constexpr,   # next pow2 of D_nope
+    D_c: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DC: tl.constexpr,           # QK reduction chunk, divides D_nope_pad
+    TRANS: tl.constexpr,        # 1: weight tile (BLOCK_N, DC), k-contiguous, transposed
+                                #     in-register (the natural mfma B layout)
+                                # 0: weight tile (DC, BLOCK_N), n-contiguous
+):
+    """Same product as _mla_absorb_kernel with the QK reduction chunked over DC.
+
+    The one-shot dot holds a whole (BLOCK_M, D_nope_pad) q tile and a (BLOCK_N, D_nope_pad)
+    weight tile live at once; at the prefill row counts that is 64x256 + 128x256 fp16 on 128
+    threads (192 VGPR) on top of a 64x128 fp32 accumulator, which is how the legacy tile ended
+    up 8-12x under its byte floor. Chunking K keeps the weight tile at DC x BLOCK_N and lets q
+    be re-read from L1/L2 per chunk instead. The accumulator is fp32 either way, so the result
+    differs from the one-shot dot only by the k-summation order (0-1 fp16 ulp)."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    head = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    valid_m = offs_m < R
+    offs_d = tl.arange(0, DC)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    qb = q + offs_m[:, None] * Q_STRIDE + head * QK_DIM
+    wb = w_uk_flat + head * D_nope
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for d0 in tl.range(0, D_nope_pad, DC, num_stages = 1):
+        dk = d0 + offs_d
+        dok = dk < D_nope
+        q_t = tl.load(qb + dk[None, :], mask = valid_m[:, None] & dok[None, :], other = 0.0)
+        if TRANS:
+            w_t = tl.trans(tl.load(wb + offs_n[:, None] * (n_q_heads * D_nope) + dk[None, :],
+                                   mask = dok[None, :], other = 0.0))
+        else:
+            w_t = tl.load(wb + dk[:, None] * (n_q_heads * D_nope) + offs_n[None, :],
+                          mask = dok[:, None], other = 0.0)
+        acc = tl.dot(q_t, w_t, acc = acc)
+    tl.store(out + (head * R + offs_m[:, None]) * D_c + offs_n[None, :],
+             acc.to(tl.float16), mask = valid_m[:, None])
+
+
+@triton.jit(do_not_specialize = ["R"])
 def _mla_unfold_kernel(
     o_lat,              # (H, R, D_c) fp16 head-major latent attention output
     w_uv_flat,          # (D_c, H * D_v) fp16
@@ -602,25 +656,33 @@ def _mla_unfold_kernel(
     D_v: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,     # D_v tile (grid axis 2); D_v itself = one tile per head
+    OUT_PITCH: tl.constexpr = 0,   # nc2 S1-rest: row pitch of out in elements (0 = dense H * D_v)
 ):
     """Per-head unfold o_h = o_lat_h @ W_UV_h from the flat layout, emitting token-major
-    output so o_proj consumes it without a permute."""
+    output so o_proj consumes it without a permute. The V columns are split over grid axis 2
+    so a 256-wide v head keeps a full k tile inside 64 KB of LDS (gfx1151)."""
     pid_m = tl.program_id(0)
     head = tl.program_id(1)
+    pid_n = tl.program_id(2)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     valid_m = offs_m < R
-    offs_v = tl.arange(0, D_v)
+    offs_v = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    acc = tl.zeros((BLOCK_M, D_v), tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for k0 in range(0, D_c, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         o_t = tl.load(o_lat + (head * R + offs_m[:, None]) * D_c + offs_k[None, :],
                       mask = valid_m[:, None], other = 0.0)
         w_t = tl.load(w_uv_flat + offs_k[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :])
         acc = tl.dot(o_t, w_t, acc = acc)
-    tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
-             acc.to(tl.float16), mask = valid_m[:, None])
+    if OUT_PITCH:
+        tl.store(out + offs_m[:, None] * OUT_PITCH + head * D_v + offs_v[None, :],
+                 acc.to(tl.float16), mask = valid_m[:, None])
+    else:
+        tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
+                 acc.to(tl.float16), mask = valid_m[:, None])
 
 
 @triton.jit
@@ -773,11 +835,148 @@ def _mla_prefill_mha_kernel(
         tl.store(state_acc + sb[:, None] * D_v + offs_v[None, :], acc, mask = valid_m[:, None])
 
 
+@triton.jit(do_not_specialize = [
+    "q_row0", "s_len", "tile_start", "tile_len", "past0",
+    "tile_init", "tile_final", "zero",
+])
+def _mla_prefill_mha2_kernel(
+    q, k_nope, v, k_pe, state_m, state_l, state_acc, out,
+    q_row0, s_len, tile_start, tile_len, past0, tile_init, tile_final,
+    zero,               # runtime 0: keeps the per-chunk q loads inside the key loop
+    n_q_heads: tl.constexpr,
+    QK_DIM: tl.constexpr,
+    D_nope: tl.constexpr,
+    D_nope_pad: tl.constexpr,
+    D_r: tl.constexpr,
+    D_v: tl.constexpr,
+    scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DC: tl.constexpr,          # QK reduction chunk (divides D_nope_pad)
+    DV: tl.constexpr,          # output columns per program (divides D_v)
+    NS: tl.constexpr = 1,      # key-loop software pipelining depth
+    KROW: tl.constexpr = 0,    # 1 = load K tiles key-major (BN, DC) and transpose in-register
+):
+    """Same math and state protocol as _mla_prefill_mha_kernel, rebuilt for gfx1151:
+    - the QK dot runs over DC-wide chunks with q re-read from L1/L2 per key tile; the old
+      kernel hoists the whole (BLOCK_M, 256) q as a WMMA A operand next to a (BLOCK_M, 256)
+      fp32 accumulator and spills;
+    - each program owns DV output columns, so the accumulator is (BLOCK_M, DV);
+      QK is recomputed per column block;
+    - the key loop stops at the causal edge of the q block (the old kernel walked the whole
+      tile and masked, ~2x work on the diagonal tile) and only the diagonal key blocks pay
+      for the causal mask;
+    - q blocks are issued heaviest-first for a better tail."""
+    # 1D grid, column block fastest: the D_v // DV programs of one (q block, head) share the
+    # same q and K tiles and run side by side, so the QK recompute mostly hits L2
+    num_m = tl.cdiv(s_len, BLOCK_M)
+    NDV: tl.constexpr = D_v // DV
+    pid = tl.program_id(0)
+    v0 = (pid % NDV) * DV
+    rest = pid // NDV
+    pid_m = num_m - 1 - rest % num_m
+    head = rest // num_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    valid_m = offs_m < s_len
+    q_abs = past0 + offs_m
+    offs_d = tl.arange(0, DC)
+    offs_r = tl.arange(0, D_r if D_r > 0 else 1)
+    offs_v = v0 + tl.arange(0, DV)
+
+    qb = q + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * QK_DIM
+    sb = head * s_len + offs_m
+    if tile_init != 0:
+        m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+        l = tl.full((BLOCK_M,), 0.0, tl.float32)
+        acc = tl.zeros((BLOCK_M, DV), tl.float32)
+    else:
+        m = tl.load(state_m + sb, mask = valid_m, other = -float("inf"))
+        l = tl.load(state_l + sb, mask = valid_m, other = 0.0)
+        acc = tl.load(state_acc + sb[:, None] * D_v + offs_v[None, :],
+                      mask = valid_m[:, None], other = 0.0)
+
+    # Keys [0, n_full) are visible to every row of the block; [n_full, n_end) need the mask
+    q_first = past0 + pid_m * BLOCK_M
+    q_last = past0 + tl.minimum(pid_m * BLOCK_M + BLOCK_M, s_len) - 1
+    n_end = tl.minimum(tile_len, q_last - tile_start + 1)
+    n_full = tl.minimum(tl.maximum(q_first - tile_start + 1, 0), n_end)
+    n_full = (n_full // BLOCK_N) * BLOCK_N
+
+    kh = k_nope + head * D_nope
+    vh = v + head * D_v
+    for n0 in tl.range(0, n_end, BLOCK_N, num_stages = NS):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        in_r = offs_n < n_end
+        scores = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+        for d0 in tl.static_range(0, D_nope_pad, DC):
+            dk = d0 + offs_d
+            dok = dk < D_nope
+            qd = tl.load(qb + (dk + n0 * zero)[None, :], mask = valid_m[:, None] & dok[None, :], other = 0.0)
+            if KROW:
+                kd = tl.trans(tl.load(kh + offs_n[:, None] * (n_q_heads * D_nope) + dk[None, :],
+                                      mask = in_r[:, None] & dok[None, :], other = 0.0))
+            else:
+                kd = tl.load(kh + offs_n[None, :] * (n_q_heads * D_nope) + dk[:, None],
+                             mask = in_r[None, :] & dok[:, None], other = 0.0)
+            scores = tl.dot(qd, kd, acc = scores)
+        if D_r > 0:
+            qp = tl.load(qb + (D_nope + n0 * zero) + offs_r[None, :], mask = valid_m[:, None], other = 0.0)
+            kp = tl.load(k_pe + offs_n[None, :] * D_r + offs_r[:, None], mask = in_r[None, :], other = 0.0)
+            scores = tl.dot(qp, kp, acc = scores)
+        scores = scores * scale
+        if n0 >= n_full:
+            valid = valid_m[:, None] & in_r[None, :] & ((tile_start + offs_n)[None, :] <= q_abs[:, None])
+            scores = tl.where(valid, scores, -float("inf"))
+        m_new = tl.maximum(m, tl.max(scores, axis = 1))
+        m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+        p = tl.exp(scores - m_exp[:, None])
+        alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+        l = l * alpha + tl.sum(p, axis = 1)
+        vt = tl.load(vh + offs_n[:, None] * (n_q_heads * D_v) + offs_v[None, :],
+                     mask = in_r[:, None], other = 0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(vt.dtype), vt)
+        m = m_new
+
+    if tile_final != 0:
+        out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
+        ob = out + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * D_v
+        tl.store(ob + offs_v[None, :], out_tile, mask = valid_m[:, None])
+    else:
+        tl.store(state_m + sb, m, mask = valid_m)
+        tl.store(state_l + sb, l, mask = valid_m)
+        tl.store(state_acc + sb[:, None] * D_v + offs_v[None, :], acc, mask = valid_m[:, None])
+
+
+def _mha2_cfg(D_nope_pad: int, D_v: int):
+    """EXL3_MLA_MHA (read per call): 1 = _mla_prefill_mha2_kernel (4.2x faster, same fp32 error,
+    NOT bit-exact: greedy smoke 0 flips at token 79; default since mla-prefill step 3: PPL -0.01 %,
+    KL ~3.5e-3 vs old, smoke ref logs-r35/both.json), 0 = the old one-shot kernel (bit-exact with
+    logs-r28), "BM:BN:NW:DC:DV:NS[:KROW]" = sweep a mha2 tile config. None = old."""
+    f = os.environ.get("EXL3_MLA_MHA", "1")
+    if f == "0":
+        return None
+    if ":" in f:
+        bm, bn, nw, dc, dv, ns, *kr = (int(x) for x in f.split(":"))
+        kr = kr[0] if kr else 0
+    else:
+        # mlapf1 swept 50 mha2 tiles at the prefill call shape (S 2048, one tile) and the shipped
+        # one came first (19.55 vs 20.19 for the runner-up), so there is nothing to freeze here;
+        # the flag deliberately leaves mha2 on the shipped tile
+        bm, bn, nw, dc, dv, ns, kr = 64, 32, 8, 64, 256, 1, 0
+    dc = min(dc, D_nope_pad)
+    dv = min(dv, D_v)
+    if D_v % dv or D_nope_pad % dc:
+        return None
+    return bm, bn, nw, dc, dv, ns, kr
+
+
 _sm_count = {}
 
 # Largest MHA-prefill q tile that fits in shared memory, probed per (device, dims); see
 # mla_attn_triton_prefill_mha
 _mha_block_m = {}
+_unfold_block_k = {}
 
 
 def _get_sm_count(device: torch.device) -> int:
@@ -1019,36 +1218,189 @@ def mla_attn_triton_decode(
     return out
 
 
+def _absorb_cfg():
+    f = os.environ.get("EXL3_MLA_ABSORB_CFG", "")
+    if not f or f == "legacy":
+        return 128, 4, 2
+    v = [int(t) for t in f.split(",")]
+    return v[0], v[1], (v[2] if len(v) > 2 else 2)
+
+
+def _pf_fast() -> bool:
+    return os.environ.get("EXL3_MLA_PF_FAST", "0") != "0"
+
+
+def _row_bucket(R: int) -> str:
+    """Row-count bucket for the frozen prefill tiles. The model only ever asks for a handful of
+    row counts (255 / 1792 / 2048 / 3840 / 4096 at GLM dims), but the buckets keep an unseen
+    shape on a sane tile instead of on the swept one."""
+    if R <= 512:
+        return "small"
+    if R <= 2560:
+        return "mid"
+    return "big"
+
+
+# EXL3_MLA_PF_FAST (default 0): frozen per-row-bucket tiles for the prefill MLA kernels,
+# swept offline at the GLM prefill row counts (mlapf1: scratch/mlapf1/mb_mla_pf.py, ~250 tile
+# configs, log scratch/mlapf1/mb_all.log). Absorb: (BLOCK_M, BLOCK_N, warps, stages, DC, TRANS)
+# with DC > 0 selecting the chunked-reduction kernel. Unfold: (BLOCK_M, BLOCK_K, BLOCK_N, stages,
+# warps). mha2: unchanged -- a 50-config sweep left the shipped tile first, so it is not listed.
+# Every frozen tile is BITWISE against the legacy kernel (max-abs 0.0), so the flag carries no
+# numerics change at all; what it removes is spills (absorb 85, unfold 327 VGPRs) and one q
+# re-read (absorb BLOCK_N 512 = the whole latent width = one n block, so q is read once).
+# "small" (R <= 512) is the legacy tile for both kernels, deliberately: those rows are the
+# decode / verify / MTP / 255-row-tail shapes, they run on the served path, and round2 already
+# swept the decode tiles. The prefill lever must not touch them.
+_PF_ABSORB = {
+    "small": (64, 128, 4, 2, 0, 0),
+    "mid": (64, 512, 16, 1, 64, 1),
+    "big": (64, 512, 16, 1, 64, 1),
+}
+_PF_UNFOLD = {
+    "small": (64, 128, 256, 2, 4),
+    "mid": (64, 32, 256, 2, 4),
+    "big": (64, 32, 256, 2, 4),
+}
+
+
+def _mla_ext():
+    from ...ext import exllamav3_ext
+    return exllamav3_ext
+
+
+_DEC_VALU_WARNED = False
+
+
+def _dec_valu_on() -> bool:
+    """Decode / verify rows (R <= 8) of the MLA absorb and unfold run on the VALU dot2-chain kernels (ext.mla_absorb_dec /
+    mla_unfold_dec), bit-identical to the Triton WMMA kernels. On by default (HIP); EXL3_MLA_DEC_VALU=0 turns it off (read per
+    call). An extension build without the kernels falls back to the Triton path with one log line."""
+    global _DEC_VALU_WARNED
+    if os.environ.get("EXL3_MLA_DEC_VALU", "1") == "0" or torch.version.hip is None:
+        return False
+    ext = _mla_ext()
+    if not (hasattr(ext, "mla_absorb_dec") and hasattr(ext, "mla_unfold_dec")):
+        if not _DEC_VALU_WARNED:
+            _DEC_VALU_WARNED = True
+            print(" -- MLA VALU decode kernels not in this extension build: using the Triton path (rebuild the extension to enable them)")
+        return False
+    return True
+
+
+def _dec_valu_ok(R, w_uk_flat, H, qk_nope, qk_dim, q) -> bool:
+    if R > 8 or not _dec_valu_on() or not hasattr(_mla_ext(), "mla_absorb_dec"):
+        return False
+    return (qk_nope == 256 and w_uk_flat.dtype == torch.half and w_uk_flat.is_contiguous() and w_uk_flat.shape[1] == H * 256 and
+            w_uk_flat.shape[0] % 32 == 0 and q.dtype == torch.half and q.stride(2) == 1 and q.stride(1) == qk_dim and
+            qk_dim % 8 == 0 and q.stride(0) % 8 == 0 and q.data_ptr() % 16 == 0 and w_uk_flat.data_ptr() % 16 == 0)
+
+
+def _dec_valu_unfold_ok(R, o_lat, w_uv_flat, H, v_head_dim) -> bool:
+    if R > 8 or not _dec_valu_on() or not hasattr(_mla_ext(), "mla_unfold_dec"):
+        return False
+    return (v_head_dim == 256 and o_lat.dtype == torch.half and w_uv_flat.dtype == torch.half and o_lat.is_contiguous() and
+            w_uv_flat.is_contiguous() and tuple(w_uv_flat.shape) == (o_lat.shape[2], H * 256) and o_lat.shape[2] % 8 == 0 and
+            o_lat.data_ptr() % 4 == 0 and w_uv_flat.data_ptr() % 4 == 0)
+
+
 def mla_absorb(q: torch.Tensor, w_uk_flat: torch.Tensor, n_q_heads: int, qk_nope_head_dim: int):
     """(R, H, qk_head_dim) token-major queries -> (H, R, kv_lora_rank) head-major absorbed
     queries, W_UK read from the flat layout."""
     R, H, qk_dim = q.shape
     D_c = w_uk_flat.shape[0]
     out = torch.empty((H, R, D_c), dtype = torch.half, device = q.device)
+    if _dec_valu_ok(R, w_uk_flat, H, qk_nope_head_dim, qk_dim, q):
+        _mla_ext().mla_absorb_dec(q, w_uk_flat, out)      # VALU dot2 chain, bitwise equal to the Triton dot
+        return out
     block_m = min(64, triton.next_power_of_2(max(R, 16)))
+    # EXL3_MLA_ABSORB_CFG="bn,warps[,stages]" (read per call, default "128,4,2" = legacy): the N tile
+    # only splits output columns, the K reduction stays one dot over D_nope
+    bn, nw, ns = _absorb_cfg()
+    # EXL3_MLA_PF_FAST=1: frozen tile per row bucket, unless ABSORB_CFG was set explicitly
+    if _pf_fast() and "EXL3_MLA_ABSORB_CFG" not in os.environ:
+        block_m, bn, nw, ns, dc, tr = _PF_ABSORB[_row_bucket(R)]
+        if dc and bn <= D_c and D_c % bn == 0:
+            try:
+                with torch.cuda.device(q.device):
+                    _mla_absorb_kc_kernel[(triton.cdiv(R, block_m), D_c // bn, H)](
+                        q, w_uk_flat, out, R,
+                        H, qk_dim, H * qk_dim, qk_nope_head_dim,
+                        triton.next_power_of_2(qk_nope_head_dim), D_c,
+                        block_m, bn, dc, tr,
+                        num_warps = nw, num_stages = 1,
+                    )
+                _dbg_sync("mla_absorb_kc", q.device)
+                return out
+            except triton.runtime.errors.OutOfResources:
+                # Launch refused before running anything (tile too big for this device's LDS at
+                # these dims): fall through to the legacy one-shot dot
+                block_m = min(64, triton.next_power_of_2(max(R, 16)))
+                bn, nw, ns = 128, 4, 2
     with torch.cuda.device(q.device):
-        _mla_absorb_kernel[(triton.cdiv(R, block_m), D_c // 128, H)](
+        _mla_absorb_kernel[(triton.cdiv(R, block_m), D_c // bn, H)](
             q, w_uk_flat, out, R,
             H, qk_dim, H * qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim), D_c,
-            block_m, 128,
-            num_warps = 4, num_stages = 2,
+            block_m, bn,
+            num_warps = nw, num_stages = ns,
         )
     _dbg_sync("mla_absorb", q.device)
     return out
 
 
-def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int):
-    """(H, R, kv_lora_rank) head-major latent output -> (R, H, v_head_dim) token-major."""
-    H, R, D_c = o_lat.shape
-    out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = o_lat.device)
+def _unfold_cfg(R: int, v_head_dim: int):
+    """(block_m, block_k, block_n, num_stages, num_warps) for mla_unfold. EXL3_MLA_UNFOLD_CFG=
+    "bk,bn,stages,warps[,bm]" forces one (A/B); EXL3_MLA_PF_FAST=1 takes the frozen per-row-bucket
+    tile when UNFOLD_CFG is unset; "legacy" or unset = the default below."""
     block_m = min(64, triton.next_power_of_2(max(R, 16)))
+    f = os.environ.get("EXL3_MLA_UNFOLD_CFG", "")
+    if f and f != "legacy":
+        bk, bn, st, nw, *bm = (int(t) for t in f.split(","))
+        return (min(bm[0], block_m) if bm else block_m), bk, min(bn, v_head_dim), st, nw
+    if _pf_fast():
+        bm, bk, bn, st, nw = _PF_UNFOLD[_row_bucket(R)]
+        return min(bm, block_m), bk, min(bn, v_head_dim), st, nw
+    # Default = one V tile, 2 stages, k tile halved until it fits. Split-V restores the
+    # full 128 k tile at D_v 256 but measured 1.6-1.9x slower; the best decode tile ("64,256,1,8",
+    # 99 vs 116 us/call, bit-exact) moved full-model decode by -0.2% (noise), so it is not default
+    return block_m, 128, v_head_dim, 2, 4
+
+
+def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int, out: torch.Tensor = None):
+    """(H, R, kv_lora_rank) head-major latent output -> (R, H, v_head_dim) token-major.
+    out (nc2 S1-rest): optional (R, H * v_head_dim) fp16 row view with unit column stride and any row pitch."""
+    H, R, D_c = o_lat.shape
+    out_pitch = 0
+    if out is not None:
+        assert out.dtype == torch.half and out.dim() == 2 and out.shape == (R, H * v_head_dim) and out.stride(1) == 1 \
+            and out.stride(0) >= H * v_head_dim
+        out_pitch = out.stride(0) if out.stride(0) != H * v_head_dim else 0
+    else:
+        out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = o_lat.device)
+    if out_pitch == 0 and _dec_valu_unfold_ok(R, o_lat, w_uv_flat, H, v_head_dim):
+        _mla_ext().mla_unfold_dec(o_lat, w_uv_flat, out)    # see mla_absorb_dec
+        return out
+    block_m, block_k, block_n, stages, warps = _unfold_cfg(R, v_head_dim)
+    # A forced/default tile that does not fit in shared memory halves its k tile (probed once
+    # per (device, dims, tile) and remembered)
+    fb_key = (o_lat.device.index, D_c, v_head_dim, block_m, block_n, stages, warps)
+    block_k = _unfold_block_k.get(fb_key, block_k or 128)
+    grid = (triton.cdiv(R, block_m), H, triton.cdiv(v_head_dim, block_n))
     with torch.cuda.device(o_lat.device):
-        _mla_unfold_kernel[(triton.cdiv(R, block_m), H)](
-            o_lat, w_uv_flat, out, R,
-            H, D_c, v_head_dim,
-            block_m, 128,
-            num_warps = 4, num_stages = 2,
-        )
+        while True:
+            try:
+                _mla_unfold_kernel[grid](
+                    o_lat, w_uv_flat, out, R,
+                    H, D_c, v_head_dim,
+                    block_m, block_k, block_n, out_pitch,
+                    num_warps = warps, num_stages = stages,
+                )
+                _unfold_block_k[fb_key] = block_k
+                break
+            except triton.runtime.errors.OutOfResources:
+                # Launch failed before running anything; a narrower k tile is safe
+                assert block_k > 16, "MLA unfold kernel does not fit in shared memory"
+                block_k //= 2
     _dbg_sync("mla_unfold", o_lat.device)
     return out
 
@@ -1140,6 +1492,20 @@ def mla_attn_triton_prefill_mha(
                 # Up-projection as two plain contiguous GEMMs (never the strided-batched form)
                 torch.mm(ckv_t[:tl_len], w_uk_flat, out = k_nope_t[:tl_len])
                 torch.mm(ckv_t[:tl_len], w_uv_flat, out = v_t[:tl_len])
+                cfg2 = _mha2_cfg(triton.next_power_of_2(qk_nope_head_dim), v_head_dim)
+                if cfg2 is not None:
+                    bm2, bn2, nw2, dc2, dv2, ns2, kr2 = cfg2
+                    _mla_prefill_mha2_kernel[(triton.cdiv(q_len, bm2) * H * (v_head_dim // dv2),)](
+                        q, k_nope_t, v_t, kpe_t,
+                        state_m, state_l, state_acc, out,
+                        b * q_len, q_len, a, tl_len, past0,
+                        int(ti == 0), int(ti == len(tiles) - 1), 0,
+                        H, qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim),
+                        D_r, v_head_dim, float(softmax_scale),
+                        bm2, bn2, dc2, dv2, ns2, kr2,
+                        num_warps = nw2, num_stages = 1,
+                    )
+                    continue
                 while True:
                     try:
                         _mla_prefill_mha_kernel[(triton.cdiv(q_len, block_m), H)](

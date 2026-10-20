@@ -7,6 +7,7 @@ from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
+from .quant.exl3 import MAX_BSZN_GEMV_R, row_pad_pitch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
@@ -16,6 +17,7 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+_QKV_IG_MULTI = os.environ.get("EXL3_ATTN_QKV_IG_MULTI", "1") != "0"   # (q|gate, k, v one launch)
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -144,6 +146,34 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
             raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
 
+def dec_project_o_strided(o_proj, o: torch.Tensor, bsz: int, seqlen: int, num_heads: int, head_dim: int,
+                          v_head_dim: int, params: dict):
+    """Batch-1 decode o_proj over the first v_head_dim (= 128) lanes of each head_dim-wide head,
+    read in place by exl3_dec (no slice copy). None when the fast path does not apply."""
+    if (
+        bsz * seqlen != 1 or v_head_dim != 128 or head_dim % 8 != 0 or not o.is_contiguous() or
+        o.dtype != torch.half or o.numel() != num_heads * head_dim or
+        not hasattr(ext, "exl3_dec_gemv_strided") or os.environ.get("EXL3_DEC_OSTRIDE", "1") == "0" or
+        "ovr" in params or "capture" in params or o_proj.quant_type != "exl3"
+    ):
+        return None
+    inner = o_proj.inner
+    if (
+        not getattr(inner, "dec_ok", False) or o_proj.lora_a_tensors or o_proj.pre_scale != 1.0 or
+        o_proj.post_scale != 1.0 or o_proj.softcap != 0.0 or inner.bias is not None or
+        o_proj.in_features != num_heads * v_head_dim or o_proj.out_features != o_proj.out_features_unpadded
+    ):
+        return None
+    from .quant.exl3 import dec_workspace
+    scratch, counters = dec_workspace(o.device)
+    y = torch.empty((bsz, seqlen, o_proj.out_features), dtype = inner.default_out_dtype, device = o.device)
+    ext.exl3_dec_gemv_strided(o.view(1, -1), inner.trellis, inner.suh, inner.svh, y.view(1, -1),
+                              scratch, counters, float(inner.K), num_heads * v_head_dim, head_dim)
+    return y
+
+
+_kv_only_skip = os.environ.get("EXL3_PF_KV_ONLY_ATTN", "1") == "1"
+
 class Attention(Module):
 
     def __init__(
@@ -156,6 +186,7 @@ class Attention(Module):
         num_q_heads: int,
         num_kv_heads: int,
         rope_settings: RopeSettings | None,
+        v_head_dim: int | None = None,
         sm_scale: float | None = None,
         key_q: str | None = None,
         key_k: str | None = None,
@@ -167,6 +198,7 @@ class Attention(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
+        window_right: int = 0,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -194,6 +226,13 @@ class Attention(Module):
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.head_dim = head_dim
+        # Asymmetric V head dim (MiMo-V2: QK 192, V 128). The cache, the attention kernels and
+        # AttnArgs all carry a single head dim, so V rides along at head_dim with the top
+        # head_dim - v_head_dim lanes zero-filled by the loader, and the attention output is
+        # trimmed back to v_head_dim before o_proj (which is sized on v_head_dim, so no
+        # quantization waste there -- only the V half of the cache is oversized)
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        assert self.v_head_dim <= head_dim, "Attn: v_head_dim > head_dim is not supported"
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa = (num_q_heads != num_kv_heads)
@@ -204,6 +243,13 @@ class Attention(Module):
         self.register_submodule(qsa_indexer)
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
+        # Right half of the attention window, in keys *after* the query position. 0 is the
+        # normal (causal-shaped) sliding window. A positive value lets a block of queries
+        # submitted in one forward pass attend to each other bidirectionally while still
+        # being bounded on the left -- what a DFlash drafter with `is_causal: false` and a
+        # sliding window needs, since `causal = False` alone is cancelled by the implied
+        # right bound of 0. See attention_fn/common.py::AttnArgs.get_window_size.
+        self.window_right = window_right
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.use_cu_seqlens = use_cu_seqlens
@@ -299,7 +345,7 @@ class Attention(Module):
             self.o_proj = Linear(
                 config,
                 f"{key}.{key_o}",
-                num_q_heads * head_dim,
+                num_q_heads * self.v_head_dim,
                 hidden_size,
                 qmap =  qmap + ".o" if qmap is not None else None,
                 out_dtype = out_dtype,
@@ -558,6 +604,7 @@ class Attention(Module):
 
     @override
     def unload(self):
+        self._dec_qkv = False
         super().unload()
 
         self.bc_attn = {}
@@ -615,11 +662,131 @@ class Attention(Module):
             if self.tp_reduce:
                 params["backend"].all_reduce(x)
 
+        if x is None:
+            return None                          # kv_only, see decode_flash_attn
+        # EXL3_NC2_ATTN_F16 (default off): the block asked for fp16 y (pfe_y_half) and o_proj returned it; keep it
+        # instead of the fp32 widen to self.out_dtype (the residual apply / ablit project_widen widen in-kernel)
+        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+            return x
         return to2(x, out_dtype, self.out_dtype)
 
 
+    def _dec_qkv_linears(self):
+        """q/k/v Linears when one exl3_dec_gemv_multi launch can replace their three forwards."""
+        lins = getattr(self, "_dec_qkv", False)
+        if lins is not False:
+            return lins
+        lins = None
+        cand = [self.q_proj, self.k_proj] + ([] if self.use_k_as_v else [self.v_proj])
+        if (
+            hasattr(ext, "exl3_dec_gemv_multi") and os.environ.get("EXL3_DEC_QKV", "1") != "0" and
+            not self.interleaved_gate and self.g_proj is None and all(l is not None for l in cand) and
+            all(
+                l.quant_type == "exl3" and getattr(l.inner, "dec_ok", False) and not l.lora_a_tensors and
+                l.pre_scale == 1.0 and l.post_scale == 1.0 and l.softcap == 0.0 and l.inner.bias is None and
+                l.out_features == l.out_features_unpadded and l.in_features == cand[0].in_features and
+                l.inner.K == cand[0].inner.K and l.inner.default_out_dtype in (torch.half, torch.float)
+                for l in cand
+            )
+        ):
+            lins = cand
+        self._dec_qkv = lins
+        return lins
+
+    def _dec_qkv_ig_linears(self):
+        """q (interleaved q|gate per head) / k / v Linears when one exl3_dec_gemv_multi launch can replace their
+        three forwards, else None."""
+        lins = getattr(self, "_dec_qkv_ig", False)
+        if lins is False:
+            from .mla_attn import dec_proj_ok, dec_proj_shapes
+            lins = None
+            cand = [self.q_proj, self.k_proj] + ([] if self.use_k_as_v else [self.v_proj])
+            if self.interleaved_gate and self.g_proj is None and all(l is not None for l in cand) and \
+                    all(dec_proj_ok(l) for l in cand) and dec_proj_shapes(cand):
+                lins = cand
+            self._dec_qkv_ig = lins
+        return lins
+
+    def _project_qkv_ig_dec(self, x: torch.Tensor, params: dict, bsz: int, q_len: int):
+        rows = bsz * q_len
+        if rows > MAX_BSZN_GEMV_R or x.dtype != torch.half or x.shape[-1] != self.q_proj.in_features or \
+                not x.is_contiguous() or "capture" in params or "ovr" in params:
+            return None
+        if rows > 1 and not (params.get("dflash_verify") and hasattr(ext, "exl3_dec_gemv_r_multi") and
+                             os.environ.get("EXL3_VERIFY_GEMV_R", os.environ.get("EXL3_DEC_MOE_UNION", "0")) != "0"):
+            return None
+        lins = self._dec_qkv_ig_linears()
+        if lins is None:
+            return None
+        from .mla_attn import dec_proj_multi
+        outs = dec_proj_multi(lins, x, rows)
+        qg = outs[0].view(bsz, q_len, -1)
+        k = outs[1].view(bsz, q_len, -1)
+        v = outs[2].view(bsz, q_len, -1) if len(outs) > 2 else k
+        if self.head_dim % 8 == 0 and qg.dtype == torch.half:
+            q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
+            g = torch.empty((bsz, q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = qg.device)
+            ext.deinterleave_qg(qg, q, g, self.head_dim)
+        else:
+            q, g = torch.chunk(qg.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
+            g = g.reshape(bsz, q_len, -1)
+        return self.finish_qkv(q, k, v, g, bsz, q_len, params)
+
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
+
+        if _QKV_IG_MULTI and self.interleaved_gate:
+            r = self._project_qkv_ig_dec(x, params, bsz, q_len)
+            if r is not None:
+                return r
+
+        # Batch-1 decode: q, k and v in one exl3_dec launch (both Hadamard stages fused)
+        if bsz * q_len == 1 and x.dtype == torch.half and dim == self.q_proj.in_features and \
+                "capture" not in params and "ovr" not in params:
+            lins = self._dec_qkv_linears()
+            if lins is not None:
+                from .quant.exl3 import dec_workspace
+                scratch, counters = dec_workspace(x.device)
+                outs = [torch.empty((bsz, q_len, l.out_features), dtype = l.inner.default_out_dtype, device = x.device)
+                        for l in lins]
+                ext.exl3_dec_gemv_multi(
+                    x.view(1, dim).contiguous(),
+                    [l.inner.trellis for l in lins], [l.inner.suh for l in lins], [l.inner.svh for l in lins],
+                    [o.view(1, -1) for o in outs], scratch, counters, [float(l.inner.K) for l in lins])
+                q, k = outs[0], outs[1]
+                v = outs[2] if len(outs) > 2 else k
+                return self.finish_qkv(q, k, v, None, bsz, q_len, params)
+
+        # DFlash verify (R rows): same fused launch as the bsz==1 case above,
+        # generalized to R rows via exl3_dec_gemv_r_multi -- see sliding_attn.py's identical
+        # branch for why the fused multi-matrix call (not per-Linear dec_gemv_r) is required for
+        # bit-exactness (shared strips_total -> shared ktw/kbs with the batch-1 launch). This is
+        # the Attention (global/full-attention layer) counterpart of that fix -- MiMo has both
+        # SlidingAttention and Attention layers, and only the former had this branch until now.
+        if (
+            1 < bsz * q_len <= MAX_BSZN_GEMV_R and x.dtype == torch.half and
+            dim == self.q_proj.in_features and x.is_contiguous() and
+            "capture" not in params and "ovr" not in params and
+            os.environ.get("EXL3_VERIFY_GEMV_R", os.environ.get("EXL3_DEC_MOE_UNION", "0")) != "0" and
+            params.get("dflash_verify") and
+            hasattr(ext, "exl3_dec_gemv_r_multi")
+        ):
+            lins = self._dec_qkv_linears()
+            if lins is not None:
+                from .quant.exl3 import dec_workspace
+                R = bsz * q_len
+                scratch, counters = dec_workspace(x.device)
+                outs = [torch.empty((R, l.out_features), dtype = l.inner.default_out_dtype, device = x.device)
+                        for l in lins]
+                ext.exl3_dec_gemv_r_multi(
+                    x.view(R, dim).contiguous(),
+                    [l.inner.trellis for l in lins], [l.inner.suh for l in lins], [l.inner.svh for l in lins],
+                    outs, scratch, counters, [float(l.inner.K) for l in lins])
+                outs = [o.view(bsz, q_len, -1) for o in outs]
+                q, k = outs[0], outs[1]
+                v = outs[2] if len(outs) > 2 else k
+                return self.finish_qkv(q, k, v, None, bsz, q_len, params)
 
         if self.multi_qkv is not None and bsz * q_len <= 32:
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
@@ -779,7 +946,26 @@ class Attention(Module):
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
         # o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
-        x = self.o_proj.forward(o, params)
+        if self.v_head_dim != self.head_dim:
+            y = dec_project_o_strided(self.o_proj, o, bsz, seqlen, self.num_q_heads, self.head_dim, self.v_head_dim, params)
+            if y is not None:
+                return y
+            # Drop the zero lanes V was padded into so o_proj sees num_q_heads * v_head_dim
+            o = o.view(bsz, seqlen, self.num_q_heads, self.head_dim)[..., : self.v_head_dim]
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.v_head_dim).contiguous()
+        o_dt = None
+        if params.get("pfe_y_half") and os.environ.get("EXL3_PFE_OPROJ", "1") == "1" and \
+                "capture" not in params and "quant_preserve" not in params:
+            from .quant import exl3 as _exl3
+            m = self.o_proj
+            rows = o.numel() // o.shape[-1]
+            if _exl3._f32_via_f16 and rows > max(_exl3.AUTO_RECONSTRUCT_THRESHOLD, _exl3._f32_via_f16_min_rows - 1) \
+                    and type(m.inner).__name__ == "LinearEXL3" and m.inner.bias is None \
+                    and not self.config.infer_params.no_reconstruct and not params.get("reconstruct") \
+                    and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 \
+                    and m.softcap == 0.0 and m.out_features == m.out_features_unpadded:
+                o_dt = torch.half
+        x = self.o_proj.forward(o, params, o_dt)
         return x
 
 
@@ -912,10 +1098,11 @@ class Attention(Module):
                 max_seqlen = max_seqlen,
                 causal = causal,
                 sm_scale = self.sm_scale,
-                window_size = self.sliding_window,
+                window_size = self.window_arg(),
                 softcap = self.logit_softcapping,
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
+                v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
             )
 
         if self.headwise_gate:
@@ -1108,38 +1295,91 @@ class Attention(Module):
 
         if qsa_sparse:
             qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
-            o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
+            if params.get("kv_only") and _kv_only_skip:
+                # EXL3_PF_SKIP kv_only (the MTP draft prompt prefill): K/V and the indexer planes are written, the block's
+                # output is discarded by the caller, so the selection, the sparse attention and everything after it are skipped.
+                # EXL3_PF_KV_ONLY_ATTN=0 runs them again (same cache contents either way).
+                return None
+            o = self.qsa_indexer.sparse_attend_verify(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
         else:
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
             # quantized-cache prefill size its staging to the window instead of the job's pages
             max_kv_len = int(qsa_seqlens_cpu.max().item()) if qsa_seqlens_cpu is not None else None
-            o = attn_dispatch(
-                q = q,
-                k = k,
-                v = v,
-                cache = cache,
-                cache_idx = self.layer_idx,
-                cache_instance = params.get("layer_instance"),
-                block_table = block_table,
-                cache_seqlens = cache_seqlens,
-                causal = causal,
-                sm_scale = self.sm_scale,
-                window_size = self.sliding_window,
-                softcap = self.logit_softcapping,
-                non_causal_spans = non_causal_spans,
-                sinks = self.sinks,
-                dispatch_cache = self.dispatch_cache,
-                max_kv_len = max_kv_len,
-            )
+            if (
+                1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and
+                os.environ.get("EXL3_VERIFY_ATTN_LOOP", "0") != "0"
+            ):
+                # Row-invariant verify: the R-row paged decode tiles the KV span from the batch's single
+                # cache_seqlens/q_len, a different float order than R batch-1 calls. Run the exact
+                # batch-1 call per row (each appends its own K/V at cache_seqlens + i and attends i + 1 keys).
+                # a one-row slice is only contiguous at batch 1; the paged kernels need contiguous rows
+                o = torch.cat([attn_dispatch(
+                    q = q[:, i:i + 1].contiguous(),
+                    k = k[:, i:i + 1].contiguous(),
+                    v = v[:, i:i + 1].contiguous(),
+                    cache = cache,
+                    cache_idx = self.layer_idx,
+                    cache_instance = params.get("layer_instance"),
+                    block_table = block_table,
+                    cache_seqlens = cache_seqlens + i,
+                    causal = causal,
+                    sm_scale = self.sm_scale,
+                    window_size = self.window_arg(),
+                    softcap = self.logit_softcapping,
+                    non_causal_spans = None,
+                    sinks = self.sinks,
+                    dispatch_cache = self.dispatch_cache,
+                    max_kv_len = max_kv_len,
+                    v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                ) for i in range(seqlen)], dim = 1)
+            else:
+                o = attn_dispatch(
+                    q = q,
+                    k = k,
+                    v = v,
+                    cache = cache,
+                    cache_idx = self.layer_idx,
+                    cache_instance = params.get("layer_instance"),
+                    block_table = block_table,
+                    cache_seqlens = cache_seqlens,
+                    causal = causal,
+                    sm_scale = self.sm_scale,
+                    window_size = self.window_arg(),
+                    softcap = self.logit_softcapping,
+                    non_causal_spans = non_causal_spans,
+                    sinks = self.sinks,
+                    dispatch_cache = self.dispatch_cache,
+                    max_kv_len = max_kv_len,
+                    v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                )
 
         if self.headwise_gate:
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        pitch = 0
+        if (self.full_gate or self.interleaved_gate) and self.v_head_dim == self.head_dim and not self.headwise_gate and \
+                o.dtype == torch.half and g.dtype == torch.half and o.is_contiguous() and g.is_contiguous() and \
+                getattr(ext, "mul_sigmoid_pad", None) is not None:
+            pitch = row_pad_pitch(self.o_proj, o.shape[-1], o.numel() // o.shape[-1], params)
+        if pitch:
+            # same fp16 product as mul_sigmoid_, written at a padded row pitch (o_proj reads it at full rate)
+            o2 = torch.empty((o.numel() // o.shape[-1], pitch), dtype = torch.half, device = o.device)[:, :o.shape[-1]].view(o.shape)
+            ext.mul_sigmoid_pad(o, g, o2, pitch)
+            o = o2
+        elif self.full_gate or self.interleaved_gate:
+            ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    def window_arg(self):
+        """window_size argument for attn_dispatch: an int (left window, right bound 0) or an
+        explicit (left, right) pair when window_right is set."""
+        if self.window_right:
+            return (self.sliding_window, self.window_right)
+        return self.sliding_window
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:

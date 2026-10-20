@@ -16,7 +16,7 @@ from exllamav3.generator.sampler.presets import DefaultSampler, CategoricalSampl
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 150)
 
-device = "cuda:2"
+device = "cuda:0"
 dims = [
     (1, 16),
     (9, 16),
@@ -667,6 +667,7 @@ def test_gumbel(dim: tuple):
 
 @pytest.mark.parametrize("dim", dims)
 @torch.inference_mode()
+@pytest.mark.skipif(not hasattr(ext, "fused_sampler"), reason = "fused sampler absent from this build")
 def test_fused_eager_parity(dim: tuple):
     """
     For temperature/min-P chains the collapsed path draws the same Gumbel noise per token as

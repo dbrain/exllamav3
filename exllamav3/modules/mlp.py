@@ -7,10 +7,18 @@ from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
+from .. import ext as _ext_mod
+
+def _rocm_silu_lim() -> bool:
+    # ext.silu_mul on ROCm runs fused_silu_mul with the clamp (GLM swiglu_limit) while this knob is on (ext.py ROCM_KNOBS)
+    return bool(getattr(_ext_mod, "ROCM_KNOBS", {}).get("silu_lim"))
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
+from .quant.exl3 import VERIFY_FUSE, MAX_BSZN_GEMV_R, dec_workspace
+from .quant.exl3 import row_pad_pitch as _row_pad_pitch
+import os
 
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
@@ -435,6 +443,17 @@ class MLP(Module):
         return module
 
 
+def _vf_plain_exl3(l, dim: int) -> bool:
+    """a Linear whose forward is exactly inner.forward (no pad/trim/lora/scales/bias)
+    and whose inner LinearEXL3 can run exl3_dec_gemv_r."""
+    return (
+        getattr(l, "quant_type", None) == "exl3" and getattr(l.inner, "dec_ok", False) and
+        l.inner.bias is None and not l.lora_a_tensors and l.in_features == dim and
+        l.pre_scale == 1.0 and l.softcap == 0.0 and l.post_scale == 1.0 and
+        not (l.trim_padded_out and l.out_features != l.out_features_unpadded)
+    )
+
+
 class GatedMLP(Module):
 
     def __init__(
@@ -725,6 +744,8 @@ class GatedMLP(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
         bsz, q_len, dim = x.shape
+        # EXL3_NC2_SHARED_FUSE: the MoE reduce widens and adds the down GEMM's fp16 output itself
+        nc2_half = bool(params.get("nc2_down_half")) and self.num_slices == 1 and not self.tp_reduce
 
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
@@ -737,6 +758,33 @@ class GatedMLP(Module):
 
             for s in r:
 
+                # R-row verify, gate+up in ONE exl3_dec_gemv_r_multi launch (Hadamards
+                # inside) instead of 2 x (had_in + exl3_gemv + had_out); down goes to gemv_r via
+                # LinearEXL3.forward. Same activation call as the unfused branch below.
+                if (
+                    VERIFY_FUSE["on"] and 1 < bsz * q_len <= MAX_BSZN_GEMV_R and
+                    params.get("dflash_verify") and x.dtype == torch.half and x.is_contiguous() and
+                    hasattr(ext, "exl3_dec_gemv_r_multi") and
+                    _vf_plain_exl3(self.gates[s], dim) and _vf_plain_exl3(self.ups[s], dim) and
+                    self.gates[s].inner.K == self.ups[s].inner.K and
+                    self.gates[s].out_features == self.ups[s].out_features
+                ):
+                    gi, ui = self.gates[s].inner, self.ups[s].inner
+                    rows = bsz * q_len
+                    g = torch.empty((bsz, q_len, gi.out_features), dtype = gi.default_out_dtype, device = x.device)
+                    u = torch.empty_like(g, dtype = ui.default_out_dtype)
+                    scratch, counters = dec_workspace(x.device)
+                    ext.exl3_dec_gemv_r_multi(
+                        x.view(rows, dim), [gi.trellis, ui.trellis], [gi.suh, ui.suh], [gi.svh, ui.svh],
+                        [g.view(rows, -1), u.view(rows, -1)], scratch, counters, [gi.K, ui.K], False)
+                    a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                    self.activation_fn_call(g, u, a, self.act_limit)
+                    d_ = self.downs[s].forward(a, params, torch.half if nc2_half else None)
+                    if d is None: d = d_
+                    else: d += d_
+                    del d_
+                    continue
+
                 if self.bc is not None and bsz * q_len <= MAX_BSZN:
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
@@ -745,9 +793,25 @@ class GatedMLP(Module):
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
-                    a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
-                    self.activation_fn_call(g, u, a, self.act_limit)
-                    d_ = self.downs[s].forward(a, params)
+                    # nc2 S1-rest (EXL3_NC2_SILU_PAD, default off): silu_mul writes its rows at the down projection's
+                    # padded pitch, so the down GEMM skips its pad_copy_in (same values, bit-exact)
+                    a_pitch = 0
+                    # (only where ext.silu_mul itself runs fused_silu_mul, the kernel the pitched variant shares: ext.py)
+                    if os.environ.get("EXL3_NC2_SILU_PAD", "0") == "1" and self.activation_fn_call is ext.silu_mul and \
+                            hasattr(ext, "silu_mul_pitched") and os.environ.get("EXL3_FUSE_SILU", "1") != "0" and \
+                            (not self.act_limit or _rocm_silu_lim()) and g.dtype == u.dtype and g.dtype in (torch.half, torch.float) and \
+                            g.shape == u.shape and g.is_contiguous() and u.is_contiguous():
+                        ik = u.shape[-1]
+                        a_pitch = _row_pad_pitch(self.downs[s], ik, u.numel() // ik, params)
+                    if a_pitch:
+                        rows_ = u.numel() // ik
+                        a = torch.empty((rows_, a_pitch), dtype = torch.half, device = u.device)[:, :ik]
+                        ext.silu_mul_pitched(g, u, a, float(self.act_limit or 0.0))
+                        a = a.view(*u.shape)
+                    else:
+                        a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                        self.activation_fn_call(g, u, a, self.act_limit)
+                    d_ = self.downs[s].forward(a, params, torch.half if nc2_half else None)
 
                     if d is None: d = d_
                     else: d += d_
@@ -779,7 +843,7 @@ class GatedMLP(Module):
 
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
                     self.activation_fn_call(g, u, a, self.act_limit)
-                    d_ = self.downs[s].forward(a, params)
+                    d_ = self.downs[s].forward(a, params, torch.half if nc2_half else None)
 
                     if d is None: d = d_
                     else: d += d_
@@ -788,6 +852,8 @@ class GatedMLP(Module):
             if self.tp_reduce:
                 params["backend"].all_reduce(d)
 
+        if nc2_half and d.dtype == torch.half:
+            return d
         return to2(d, out_dtype, self.out_dtype)
 
 

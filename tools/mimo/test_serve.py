@@ -1,0 +1,732 @@
+#!/usr/bin/env python3
+"""msrv unit tests: model-free, fake engines only (no GPU, no exllamav3 import)."""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import serve
+
+
+class FakeEngine:
+    def __init__(self, output: str):
+        self.output = output
+        self.prompts = []
+        self.resets = 0
+        self.reset_gate_per_request = False
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+
+    def reset_gate(self) -> None:
+        self.resets += 1
+
+    def gate_stats(self):
+        return {"n_spec": 3, "n_plain": 1}
+
+    async def generate(self, prompt: str, **kwargs):
+        self.prompts.append(prompt)
+        if kwargs.get("reset_gate"):
+            self.reset_gate()
+        self.last_stats = {"cached_tokens": 8, "new_tokens": 4, "prompt_tokens": 20,
+                           "time_prefill": 0.5, "time_generate": 1.0,
+                           "accepted_draft_tokens": 6, "rejected_draft_tokens": 6}
+        self.last_rounds = 5
+        for i in range(0, len(self.output), 3):  # small chunks cut tags in half
+            yield self.output[i:i + 3]
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def metrics_samples(text: str) -> dict:
+    return {line.split()[0]: float(line.split()[1]) for line in text.splitlines()
+            if line and not line.startswith("#")}
+
+
+TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>"
+            "{% endfor %}{% if tools %}TOOLS={{ tools|length }}{% endif %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
+
+
+class ServeTests(unittest.TestCase):
+
+
+
+    def test_prompt_longer_than_the_context_is_a_clear_400(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Small(FakeEngine):
+            ctx = 256
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Small("x"), "m", TEMPLATE)))
+            await client.start_server()
+            out = []
+            for stream in (False, True):
+                r = await client.post("/v1/chat/completions", json={
+                    "model": "m", "stream": stream, "messages": [{"role": "user", "content": "word " * 400}]})
+                out.append((r.status, await r.json()))
+            await client.close()
+            return out
+
+        for status, body in run(check()):
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"]["type"], "invalid_request_error")
+            self.assertIn("context length exceeded: prompt is", body["error"]["message"])
+            self.assertIn("the server context is 256", body["error"]["message"])
+
+    def test_unknown_path_and_wrong_method_answer_404_405_in_json(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(FakeEngine("x"), "m", TEMPLATE)))
+            await client.start_server()
+            out = []
+            for method, path in (("GET", "/nope"), ("POST", "/nope"), ("POST", "/health"), ("GET", "/v1/chat/completions")):
+                r = await client.request(method, path)
+                out.append((r.status, r.headers["Content-Type"], await r.json()))
+            await client.close()
+            return out
+
+        for (status, ctype, body), want in zip(run(check()), (404, 404, 405, 405)):
+            self.assertEqual(status, want)
+            self.assertTrue(ctype.startswith("application/json"))
+            self.assertEqual((body["error"]["code"], body["error"]["type"]), (want, "invalid_request_error"))
+            self.assertTrue(body["error"]["message"])
+
+    def test_reply_budget_is_clamped_to_the_context_room(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Spy(FakeEngine):
+            ctx = 256 + 20   # the page table holds 256 tokens here: the 20 extra do not count
+            num_draft = 1
+
+            async def generate(self, prompt: str, **kwargs):
+                self.kwargs = kwargs
+                async for piece in super().generate(prompt, **kwargs):
+                    yield piece
+
+        engine = Spy("one two")
+
+        async def post(content, **extra):
+            client = TestClient(TestServer(serve.create_app(engine, "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "messages": [{"role": "user", "content": content}], **extra})
+            status = r.status
+            await r.read()
+            await client.close()
+            return status
+
+        # room = whole pages of ctx - prompt - 1 slot - 1 draft token
+        self.assertEqual(run(post("a b c d", max_completion_tokens=32768)), 200)
+        used = engine.count_tokens(engine.prompts[-1])
+        self.assertEqual(engine.kwargs["max_tokens"], 256 - used - 1 - 1)
+        self.assertEqual(run(post("a b c d", max_tokens=3)), 200)
+        self.assertEqual(engine.kwargs["max_tokens"], 3)
+        engine.kwargs = None
+        self.assertEqual(run(post(" ".join("w" * 300))), 400)
+        self.assertIsNone(engine.kwargs)
+
+    def test_template_rendering(self):
+        out = serve.render_prompt(TEMPLATE, [{"role": "user", "content": "hi"}],
+                                  [{"type": "function"}])
+        self.assertEqual(out, "<|im_start|>user\nhi<|im_end|>TOOLS=1<|im_start|>assistant\n")
+
+    def test_developer_role_renders_as_system(self):
+        dev = serve.render_prompt(TEMPLATE, [{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        sys_ = serve.render_prompt(TEMPLATE, [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        self.assertEqual(dev, sys_)
+
+    def test_tool_call_arguments_string_is_normalized(self):
+        # OpenAI sends arguments as a JSON string; the template must not double-encode it.
+        out = serve.render_prompt(
+            "{% for m in messages %}{{ m.tool_calls[0].function.arguments | tojson }}"
+            "{% endfor %}",
+            [{"role": "assistant", "content": "",
+              "tool_calls": [{"function": {"name": "f", "arguments": '{"a": 1}'}}]}], None)
+        self.assertEqual(json.loads(out), {"a": 1})
+
+    def test_parse_thinking_and_tool_calls(self):
+        text = ('<think>reasoning with\nlines</think>Visible '
+                '<tool_call><function=weather>{"name": "Paris",\n"x": 1}'
+                '</function></tool_call>'
+                '<tool_call><function=time>{"tz": "UTC"}</function></tool_call>')
+        result = serve.parse_completion(text)
+        self.assertEqual(result["reasoning_content"], "reasoning with\nlines")
+        self.assertEqual(result["content"], "Visible ")
+        self.assertEqual(result["finish_reason"], "tool_calls")
+        self.assertEqual(result["tool_calls"][0]["function"]["name"], "weather")
+        self.assertEqual(json.loads(result["tool_calls"][0]["function"]["arguments"]),
+                         {"name": "Paris", "x": 1})
+        self.assertEqual(result["tool_calls"][1]["function"]["name"], "time")
+        self.assertEqual(json.loads(result["tool_calls"][1]["function"]["arguments"]),
+                         {"tz": "UTC"})
+
+    def test_parse_plain_text_has_no_tool_calls(self):
+        result = serve.parse_completion("just an answer mentioning <tool_call> inline")
+        self.assertNotIn("tool_calls", result)
+        self.assertEqual(result["content"], "just an answer mentioning <tool_call> inline")
+
+    def test_stop_strings(self):
+        self.assertEqual(serve.stop_text("hello STOP world", ["STOP"]), ("hello ", "STOP"))
+        self.assertEqual(serve.stop_text("hello", ["STOP"]), ("hello", None))
+
+    def test_sse_framing(self):
+        self.assertEqual(serve.sse({"hello": "world"}), b'data: {"hello":"world"}\n\n')
+
+    def test_config_max_position_handles_text_config(self):
+        class C:
+            config_dict: dict = {"text_config": {"max_position_embeddings": 65536}}
+        self.assertEqual(serve.config_max_position(C), 65536)
+        C.config_dict = {"max_position_embeddings": 4096}
+        self.assertEqual(serve.config_max_position(C), 4096)
+        C.config_dict = {}
+        self.assertEqual(serve.config_max_position(C), 32768)
+
+    def test_endpoints_models_health_and_usage_without_model(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        engine = FakeEngine('<think>why</think>hello')
+        app = serve.create_app(engine, "test-model", TEMPLATE)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            models = await (await client.get("/v1/models")).json()
+            self.assertEqual(models["data"][0]["id"], "test-model")
+            health = await (await client.get("/health")).json()
+            self.assertEqual(health["status"], "ok")
+            self.assertEqual(health["spec_gate"]["n_spec"], 3)
+            response = await client.post("/v1/chat/completions", json={
+                "model": "test-model", "messages": [{"role": "user", "content": "hi"}]})
+            body = await response.json()
+            self.assertEqual(body["choices"][0]["message"]["content"], "hello")
+            self.assertEqual(body["choices"][0]["message"]["reasoning_content"], "why")
+            self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+            self.assertIn("usage", body)
+            await client.close()
+
+        run(check())
+
+    def test_bad_requests(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def post(body):
+            app = serve.create_app(FakeEngine("x"), "m", TEMPLATE)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json=body)
+            await client.close()
+            return r.status
+
+        msgs = [{"role": "user", "content": "x"}]
+        self.assertEqual(run(post({"model": "other", "messages": msgs})), 400)
+        self.assertEqual(run(post({"model": "m", "messages": []})), 400)
+        self.assertEqual(run(post({"model": "m", "messages": msgs, "stream": "yes"})), 400)
+
+    def test_stream_thinking_and_tool_call(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        engine = FakeEngine('<think>plan it</think>Sure.<tool_call><function=get_weather>'
+                            '{"city": "Paris"}</function></tool_call>')
+        app = serve.create_app(engine, "m", TEMPLATE)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            response = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            raw = (await response.read()).decode()
+            await client.close()
+            return raw
+
+        raw = run(check())
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"))
+        chunks = [json.loads(line[6:]) for line in raw.split("\n") if line.startswith("data: {")]
+        deltas = [c["choices"][0]["delta"] for c in chunks]
+        self.assertEqual("".join(d.get("reasoning_content", "") for d in deltas), "plan it")
+        self.assertEqual("".join(d.get("content", "") for d in deltas), "Sure.")
+        self.assertGreater(sum("reasoning_content" in d for d in deltas), 1)  # incremental
+        calls = [d["tool_calls"] for d in deltas if "tool_calls" in d]
+        self.assertEqual(calls[0][0]["function"]["name"], "get_weather")
+        self.assertEqual(calls[0][0]["index"], 0)
+        self.assertEqual([c["choices"][0]["finish_reason"] for c in chunks][-1], "tool_calls")
+        self.assertTrue(all(c["choices"][0]["finish_reason"] is None for c in chunks[:-1]))
+        self.assertIn("usage", chunks[-1])
+
+    def test_stream_parallel_tool_calls_one_message_each(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        call = '<tool_call><function=get_weather>{"city": "Paris"}</function></tool_call>'
+        app = serve.create_app(FakeEngine("Sure." + call * 3), "m", TEMPLATE)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            response = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            raw = (await response.read()).decode()
+            await client.close()
+            return raw
+        chunks = [json.loads(l[6:]) for l in run(check()).split("\n") if l.startswith("data: {")]
+        msgs = [c["choices"][0]["delta"]["tool_calls"] for c in chunks if "tool_calls" in c["choices"][0]["delta"]]
+        self.assertEqual([len(m) for m in msgs], [1, 1, 1])
+        self.assertEqual([m[0]["index"] for m in msgs], [0, 1, 2])
+
+    def test_stream_and_parse_agree_on_bare_think_close(self):
+        """No implicit think turn: a bare </think> is literal content in both paths."""
+        from aiohttp.test_utils import TestClient, TestServer
+        engine = FakeEngine("</think>answer")
+        app = serve.create_app(engine, "m", TEMPLATE)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            raw = (await r.read()).decode()
+            await client.close()
+            return raw
+
+        self.assertEqual(serve.parse_completion("</think>answer")["content"], "</think>answer")
+        chunks = [json.loads(l[6:]) for l in run(check()).split("\n") if l.startswith("data: {")]
+        deltas = [c["choices"][0]["delta"] for c in chunks]
+        self.assertEqual("".join(d.get("reasoning_content", "") for d in deltas), "")
+        self.assertEqual("".join(d.get("content", "") for d in deltas), "</think>answer")
+
+    def test_finish_reason_length_at_max_tokens(self):
+        """A reply cut by max_tokens reports "length", streaming and not; a short reply stays "stop"."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def call(output, max_tokens, stream):
+            app = serve.create_app(FakeEngine(output), "m", TEMPLATE)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": stream, "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "hi"}]})
+            if stream:
+                raw = (await r.read()).decode()
+                out = [json.loads(l[6:]) for l in raw.split("\n") if l.startswith("data: {")][-1]
+            else:
+                out = await r.json()
+            await client.close()
+            return out["choices"][0]["finish_reason"]
+
+        for stream in (False, True):
+            self.assertEqual(run(call("one two three four", 4, stream)), "length")
+            self.assertEqual(run(call("one two", 4, stream)), "stop")
+
+    def test_stream_engine_error_still_ends_with_finish_reason(self):
+        """An engine failure mid-stream ends with an error frame, finish_reason and [DONE], not a dropped connection."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Boom(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                yield "partial "
+                raise RuntimeError("kaput")
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Boom("x"), "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            raw = (await r.read()).decode()
+            await client.close()
+            return raw
+
+        raw = run(check())
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"))
+        chunks = [json.loads(l[6:]) for l in raw.split("\n") if l.startswith("data: {")]
+        self.assertTrue(any("kaput" in c.get("error", {}).get("message", "") for c in chunks))
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "error")
+
+    def test_max_completion_tokens_is_honored(self):
+        """The newer OpenAI field sets the budget (and the "length" verdict) like max_tokens."""
+        self.assertEqual(serve.token_limit({"max_completion_tokens": 7, "max_tokens": 9}), 7)
+        self.assertEqual(serve.token_limit({"max_tokens": 9}), 9)
+        self.assertEqual(serve.token_limit({"max_tokens": None}), 32768)
+        self.assertEqual(serve.token_limit({}), 32768)
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Spy(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                self.kwargs = kwargs
+                async for piece in super().generate(prompt, **kwargs):
+                    yield piece
+
+        engine = Spy("one two three four")
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(engine, "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "max_completion_tokens": 4, "messages": [{"role": "user", "content": "hi"}]})
+            body = await r.json()
+            await client.close()
+            return body
+
+        body = run(check())
+        self.assertEqual(engine.kwargs["max_tokens"], 4)
+        self.assertEqual(body["choices"][0]["finish_reason"], "length")
+
+    def test_stop_string_cuts_stream(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        engine = FakeEngine("alpha STOP beta")
+        app = serve.create_app(engine, "m", TEMPLATE)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stop": "STOP", "messages": [{"role": "user", "content": "hi"}]})
+            body = await r.json()
+            await client.close()
+            return body
+
+        self.assertEqual(run(check())["choices"][0]["message"]["content"], "alpha ")
+
+    def test_gate_reset_flag_is_forwarded(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        engine = FakeEngine("x")
+        engine.reset_gate_per_request = True
+        app = serve.create_app(engine, "m", TEMPLATE)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            await client.post("/v1/chat/completions",
+                              json={"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+            await client.close()
+
+        run(check())
+        self.assertEqual(engine.resets, 1)
+
+
+    def test_client_disconnect_cancels_the_job(self):
+        """Stream and non-stream drops stop generation within a few steps, a job cancelled while queued
+        never runs, and the request after them is served."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class SlowEngine(FakeEngine):
+            steps = 0
+            stopped = None
+
+            async def generate(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                cancel = kwargs.get("cancel")
+                if "slow" not in prompt:
+                    yield "ok"
+                    return
+                self.stopped = None
+                for _ in range(1000):
+                    if cancel is not None and cancel.is_set():
+                        self.stopped = "cancelled"
+                        return
+                    self.steps += 1
+                    await asyncio.sleep(0.01)
+                    yield "t "
+                self.stopped = "finished"
+
+        def body(text, stream):
+            return {"model": "m", "stream": stream, "messages": [{"role": "user", "content": text}]}
+
+        async def settle(engine, want_steps_at_most):
+            for _ in range(200):
+                if engine.stopped is not None:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertEqual(engine.stopped, "cancelled")
+            self.assertLess(engine.steps, want_steps_at_most)
+
+        async def check():
+            engine = SlowEngine("x")
+            client = TestClient(TestServer(serve.create_app(engine, "m", TEMPLATE)))
+            await client.start_server()
+            # 1. streaming drop mid-stream
+            response = await client.post("/v1/chat/completions", json=body("slow a", True))
+            await response.content.readany()
+            await asyncio.sleep(0.15)
+            response.close()
+            await settle(engine, 100)
+            # 2. a following request is served at once
+            ok = await asyncio.wait_for(client.post("/v1/chat/completions", json=body("hi", False)), 5)
+            self.assertEqual(ok.status, 200)
+            self.assertEqual((await ok.json())["choices"][0]["message"]["content"], "ok")
+            # 3. non-streaming drop
+            engine.steps = 0
+            try:
+                await asyncio.wait_for(client.post("/v1/chat/completions", json=body("slow b", False)), 0.3)
+            except asyncio.TimeoutError:
+                pass
+            await settle(engine, 100)
+            # 4. a job cancelled while queued never reaches the engine
+            engine.steps, engine.prompts = 0, []
+            first = await client.post("/v1/chat/completions", json=body("slow c", True))
+            await first.content.readany()
+            try:
+                await asyncio.wait_for(client.post("/v1/chat/completions", json=body("slow queued", False)), 0.3)
+            except asyncio.TimeoutError:
+                pass
+            first.close()
+            ok = await asyncio.wait_for(client.post("/v1/chat/completions", json=body("hi again", False)), 5)
+            self.assertEqual(ok.status, 200)
+            self.assertFalse(any("slow queued" in p for p in engine.prompts))
+            await client.close()
+
+        run(check())
+
+    def test_metrics_endpoint(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        import serve_metrics
+        engine = FakeEngine('hello there')
+        app = serve.create_app(engine, "m", TEMPLATE)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            await client.post("/v1/chat/completions", json={
+                "model": "m", "messages": [{"role": "user", "content": "one two three four"}]})
+            resp = await client.get("/metrics")
+            text = await resp.text()
+            await client.close()
+            return resp, text
+
+        resp, text = run(check())
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(resp.headers["Content-Type"].startswith("text/plain"))
+        for name, mtype, _ in serve_metrics.METRICS:
+            self.assertIn(f"# HELP {name} ", text)
+            self.assertIn(f"# TYPE {name} {mtype}", text)
+        v = metrics_samples(text)
+        st = engine.last_stats
+        prompt_tokens = engine.count_tokens(engine.prompts[-1])
+        serve_metrics.assert_reported(
+            v, self, prompt_tokens=prompt_tokens, cached=st["cached_tokens"],
+            predicted=st["new_tokens"], prefill_s=st["time_prefill"], generate_s=st["time_generate"],
+            drafts=engine.last_rounds,
+            draft_tokens=st["accepted_draft_tokens"] + st["rejected_draft_tokens"],
+            accepted=st["accepted_draft_tokens"])
+        self.assertEqual(v["llamacpp:requests_processing"], 0)
+        self.assertEqual(v["llamacpp:requests_deferred"], 0)
+        self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0)  # fake engine: no get_cache_stats
+
+    def test_two_queued_requests_are_both_counted(self):
+        """Back-to-back requests each get their own timings handed over by the worker, so both are
+        counted in full even though engine.last_stats is a single shared attr reset per job."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class QueuedEngine(FakeEngine):
+            def __init__(self):
+                super().__init__("")
+                self.calls = 0
+
+            async def generate(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                self.calls += 1
+                n = 3 * self.calls  # distinct per request: 3 then 6
+                self.last_stats = {"cached_tokens": self.calls, "new_tokens": n,
+                                   "prompt_tokens": 20, "time_prefill": 0.5, "time_generate": 1.0,
+                                   "accepted_draft_tokens": 2, "rejected_draft_tokens": 2}
+                self.last_rounds = self.calls
+                await asyncio.sleep(0)  # let the second request sit queued behind this one
+                yield f"reply {self.calls}"
+
+        async def check():
+            engine = QueuedEngine()
+            client = TestClient(TestServer(serve.create_app(engine, "m", TEMPLATE)))
+            await client.start_server()
+            bodies = [
+                {"model": "m", "messages": [{"role": "user", "content": "one two three four"}]},
+                {"model": "m", "messages": [{"role": "user", "content": "five six seven eight nine"}]},
+            ]
+            responses = await asyncio.gather(*(client.post("/v1/chat/completions", json=b) for b in bodies))
+            for r in responses:
+                self.assertEqual(r.status, 200)
+            # each reply reports its own generation, not the shared attr's last value (which would be 6 for both)
+            payloads = await asyncio.gather(*(r.json() for r in responses))
+            predicted = sorted(p["timings"]["predicted_n"] for p in payloads)
+            self.assertEqual(predicted, [3, 6])
+            resp = await client.get("/metrics")
+            text = await resp.text()
+            await client.close()
+            return engine, text
+
+        engine, text = run(check())
+        v = metrics_samples(text)
+        # both generations counted in full: predicted = 3 + 6, not a prompt-only first request
+        self.assertEqual(v["llamacpp:tokens_predicted_total"], 9.0)
+        self.assertEqual(v["llamacpp:prompt_tokens_total"], float(sum(engine.count_tokens(p) for p in engine.prompts)))
+
+
+    def test_image_request_without_a_tower_is_a_clear_400_never_dropped(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        tpl = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{% for p in m.content %}"
+               "{% if p.type == 'image_url' %}<|vision_start|><|image_pad|><|vision_end|>{% else %}{{ p.text }}{% endif %}"
+               "{% endfor %}<|im_end|>{% endfor %}<|im_start|>assistant\n")
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "what is this"},
+                                             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
+
+        async def check():
+            eng = FakeEngine("x")                       # no supports_vision attribute: a text-only server
+            client = TestClient(TestServer(serve.create_app(eng, "m", tpl)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={"model": "m", "messages": msgs})
+            out = (r.status, await r.json(), eng.prompts)
+            await client.close()
+            return out
+
+        status, body, prompts = run(check())
+        self.assertEqual(status, 400)
+        self.assertIn("without the vision tower", body["error"]["message"])
+        self.assertEqual(prompts, [])
+
+    def test_video_and_audio_parts_are_refused(self):
+        for kind in ("video_url", "input_audio"):
+            with self.assertRaises(Exception):
+                serve.extract_images([{"role": "user", "content": [{"type": kind, kind: {"url": "x"}}]}])
+
+    def test_extract_images_keeps_prompt_order(self):
+        msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "a"}}, {"type": "text", "text": "t"}]},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": [{"type": "image_url", "image_url": "b"}]}]
+        self.assertEqual(serve.extract_images(msgs), ["a", "b"])
+
+
+
+class ImageEmbeddingReuseTests(unittest.TestCase):
+    """The same picture must come back as the same embedding object, so the prompt keeps its token ids."""
+
+    def make_engine(self):
+        import itertools
+        import torch
+        from image_cache import ImageEmbeddingCache
+        ids, calls = itertools.count(1_000_000_000, 100), []
+
+        class Emb:
+            def __init__(self):
+                self.first_index = next(ids)
+                self.text_alias = f"<$EMB_{self.first_index}$>"
+                self.mm_length = 3
+                self.embeddings = torch.zeros(3, 4, dtype=torch.half)
+                self.deepstack_embeddings = None
+
+        class Tower:
+            def get_image_embeddings(self, *args, **kw):
+                calls.append(1)
+                return Emb()
+
+        eng = object.__new__(serve.ResidentEngine)
+        eng.emb_cache, eng.vision, eng.tokenizer = ImageEmbeddingCache(), Tower(), None
+        return eng, calls
+
+    def test_embed_reuses_ids_and_encodes_once(self):
+        from PIL import Image
+        eng, calls = self.make_engine()
+        img = Image.new("RGB", (64, 64))
+        a = eng._embed([(img, "k1")])
+        b = eng._embed([(img, "k1"), (img, "k2")])
+        self.assertIs(a[0], b[0])
+        self.assertNotEqual(b[0].first_index, b[1].first_index)
+        self.assertEqual(len(calls), 2)
+
+
+class SSEKeepAliveTests(unittest.TestCase):
+    """KYOJIN_SSE_PING_S: a stream that has nothing to send yet writes a ':' comment (off by default)."""
+
+    def setUp(self):
+        os.environ.pop("KYOJIN_SSE_PING_S", None)
+        self.addCleanup(os.environ.pop, "KYOJIN_SSE_PING_S", None)
+
+    def test_a_ping_reaches_the_client_before_the_first_token(self):
+        os.environ["KYOJIN_SSE_PING_S"] = "0.2"
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.9)          # a prefill the client has to sit through
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            chunks = []
+            while True:
+                try:
+                    data = await asyncio.wait_for(r.content.readany(), 5)
+                except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+            await client.close()
+            return b"".join(chunks)
+
+        body = run(check())
+        pings = [line for line in body.split(b"\n") if line.startswith(b":")]
+        self.assertTrue(pings, body[:400])
+        self.assertLess(body.index(b": waiting"), body.index(b"hello"))   # before the first token
+        self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))          # the stream still ends the OpenAI way
+
+    def test_a_streaming_reply_does_not_cost_the_client_its_connection(self):
+        """The streaming route logs its summary while the reply is being closed: a name that is not
+        bound there raises after the body is complete, and the client loses the connection it was
+        reusing (the next request on it dies with ServerDisconnectedError, and the server logs a
+        traceback per stream). Three streams on one client session must all succeed."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.3)
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            dropped = 0
+            for _ in range(3):
+                try:
+                    response = await client.post("/v1/chat/completions", json={
+                        "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+                    await response.read()
+                except Exception:                                     # noqa: BLE001  the bug drops the socket
+                    dropped += 1
+            await client.close()
+            return dropped
+
+        self.assertEqual(run(check()), 0)
+
+    def test_nothing_is_written_when_the_switch_is_off(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.5)
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            body = await r.read()
+            await client.close()
+            return body
+
+        body = run(check())
+        self.assertEqual([line for line in body.split(b"\n") if line.startswith(b":")], [])
+        self.assertIn(b"hello", body)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -6,9 +6,10 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
+from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_decode_rows, paged_attn_triton_prefill
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 from .multilinear import MultiLinear, SlicedMultiLinear
+from .quant.exl3 import MAX_BSZN_GEMV_R
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache
 from ..cache.recurrent import (
@@ -242,6 +243,8 @@ class SWALayerState:
 
 class SlidingAttention(Module):
 
+    _seqlens_last = None
+
     def __init__(
         self,
         config: Config | None,
@@ -252,10 +255,12 @@ class SlidingAttention(Module):
         num_q_heads: int,
         num_kv_heads: int,
         rope_settings: RopeSettings | None,
+        v_head_dim: int | None = None,
         sm_scale: float | None = None,
         key_q: str | None = None,
         key_k: str | None = None,
         key_v: str | None = None,
+        key_fused_qkv: str | None = None,
         key_o: str | None = None,
         key_g: str | None = None,
         key_sinks: str | None = None,
@@ -274,7 +279,9 @@ class SlidingAttention(Module):
         g_proj: Linear | Module | None = None,
         full_gate: bool = False,
         gate_softplus: bool = False,
+        transpose_qkv: bool = True,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits",
     ):
         super().__init__(config, key, None)
         assert sliding_window > 0
@@ -285,6 +292,12 @@ class SlidingAttention(Module):
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.head_dim = head_dim
+        # Asymmetric V head dim (MiMo-V2: QK 192, V 128), mirroring Attention. The window ring,
+        # the paged-attention kernels and the block tables all carry a single head dim, so V is
+        # stored at head_dim with its top head_dim - v_head_dim lanes zero-filled by the loader
+        # and trimmed back off in project_o, which keeps o_proj sized on v_head_dim.
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        assert self.v_head_dim <= head_dim, "SlidingAttention: v_head_dim > head_dim is not supported"
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa = (num_q_heads != num_kv_heads)
@@ -332,13 +345,21 @@ class SlidingAttention(Module):
             return
 
         # Create q, k, v projections
-        fkey, frange_q, frange_k, frange_v = None, None, None, None
+        if key_fused_qkv:
+            assert not (q_proj is not None or k_proj is not None or v_proj is not None), \
+                "SlidingAttention: fused QKV tensor is not supported with pre-made projections"
+            fkey = f"{key}.{key_fused_qkv}"
+            frange_q = (0, num_q_heads * head_dim)
+            frange_k = (frange_q[1], frange_q[1] + num_kv_heads * head_dim)
+            frange_v = (frange_k[1], frange_k[1] + num_kv_heads * head_dim)
+        else:
+            fkey, frange_q, frange_k, frange_v = None, None, None, None
 
         if key_q or frange_q:
             f = 1
             self.q_proj = Linear(
                 config,
-                f"{key}.{key_q}",
+                f"{key}.{key_q}" if key_q else f"{key}.q_proj",
                 hidden_size,
                 num_q_heads * head_dim * f,
                 qmap = qmap + ".input" if qmap is not None else None,
@@ -346,7 +367,9 @@ class SlidingAttention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -357,7 +380,7 @@ class SlidingAttention(Module):
         if key_k or frange_k:
             self.k_proj = Linear(
                 config,
-                f"{key}.{key_k}",
+                f"{key}.{key_k}" if key_k else f"{key}.k_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -365,11 +388,13 @@ class SlidingAttention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.v_proj = Linear(
                 config,
-                f"{key}.{key_v}",
+                f"{key}.{key_v}" if key_v else f"{key}.v_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -377,7 +402,9 @@ class SlidingAttention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -393,7 +420,7 @@ class SlidingAttention(Module):
             self.o_proj = Linear(
                 config,
                 f"{key}.{key_o}",
-                num_q_heads * head_dim,
+                num_q_heads * self.v_head_dim,
                 hidden_size,
                 qmap =  qmap + ".o" if qmap is not None else None,
                 out_dtype = out_dtype,
@@ -598,6 +625,7 @@ class SlidingAttention(Module):
 
     @override
     def unload(self):
+        self._dec_qkv = False
         super().unload()
 
         for rl in self.recurrent_layers:
@@ -666,8 +694,75 @@ class SlidingAttention(Module):
         return to2(x, out_dtype, self.out_dtype)
 
 
+    def _dec_qkv_linears(self):
+        """q/k/v (+g) Linears when one exl3_dec_gemv_multi launch can replace their forwards."""
+        lins = getattr(self, "_dec_qkv", False)
+        if lins is not False:
+            return lins
+        lins = None
+        cand = [self.q_proj, self.k_proj, self.v_proj] + ([self.g_proj] if self.g_proj is not None else [])
+        if (
+            hasattr(ext, "exl3_dec_gemv_multi") and os.environ.get("EXL3_DEC_QKV", "1") != "0" and
+            all(l is not None for l in cand) and
+            all(
+                l.quant_type == "exl3" and getattr(l.inner, "dec_ok", False) and not l.lora_a_tensors and
+                l.pre_scale == 1.0 and l.post_scale == 1.0 and l.softcap == 0.0 and l.inner.bias is None and
+                l.out_features == l.out_features_unpadded and l.in_features == cand[0].in_features and
+                l.inner.K == cand[0].inner.K and l.inner.default_out_dtype in (torch.half, torch.float)
+                for l in cand
+            )
+        ):
+            lins = cand
+        self._dec_qkv = lins
+        return lins
+
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
+
+        # Batch-1 decode: q, k, v (and g) in one exl3_dec launch (both Hadamard stages fused)
+        if bsz * q_len == 1 and x.dtype == torch.half and dim == self.q_proj.in_features and \
+                "capture" not in params and "ovr" not in params:
+            lins = self._dec_qkv_linears()
+            if lins is not None:
+                from .quant.exl3 import dec_workspace
+                scratch, counters = dec_workspace(x.device)
+                outs = [torch.empty((bsz, q_len, l.out_features), dtype = l.inner.default_out_dtype, device = x.device)
+                        for l in lins]
+                ext.exl3_dec_gemv_multi(
+                    x.view(1, dim).contiguous(),
+                    [l.inner.trellis for l in lins], [l.inner.suh for l in lins], [l.inner.svh for l in lins],
+                    [o.view(1, -1) for o in outs], scratch, counters, [float(l.inner.K) for l in lins])
+                g = outs[3] if len(outs) > 3 else None
+                return self.finish_qkv(outs[0], outs[1], outs[2], g, bsz, q_len, params)
+
+        # DFlash verify (R rows): same fused launch as the bsz==1 case above, generalized
+        # to R rows via exl3_dec_gemv_r_multi -- same trellis/suh/svh/K list and order as
+        # exl3_dec_gemv_multi, so pick_ktw/kbs_of see the same strips_total and pick the identical
+        # ktw/kbs the batch-1 launch uses. That's required for the block-reduce partition (and so the
+        # rounding) to match batch-1 bitwise; calling per-Linear dec_gemv_r separately for q/k/v/g
+        # does NOT give this, since each single-matrix call sums a different strips_total.
+        if (
+            1 < bsz * q_len <= MAX_BSZN_GEMV_R and x.dtype == torch.half and
+            dim == self.q_proj.in_features and x.is_contiguous() and
+            "capture" not in params and "ovr" not in params and
+            os.environ.get("EXL3_VERIFY_GEMV_R", os.environ.get("EXL3_DEC_MOE_UNION", "0")) != "0" and
+            params.get("dflash_verify") and
+            hasattr(ext, "exl3_dec_gemv_r_multi")
+        ):
+            lins = self._dec_qkv_linears()
+            if lins is not None:
+                from .quant.exl3 import dec_workspace
+                R = bsz * q_len
+                scratch, counters = dec_workspace(x.device)
+                outs = [torch.empty((R, l.out_features), dtype = l.inner.default_out_dtype, device = x.device)
+                        for l in lins]
+                ext.exl3_dec_gemv_r_multi(
+                    x.view(R, dim).contiguous(),
+                    [l.inner.trellis for l in lins], [l.inner.suh for l in lins], [l.inner.svh for l in lins],
+                    outs, scratch, counters, [float(l.inner.K) for l in lins])
+                outs = [o.view(bsz, q_len, -1) for o in outs]
+                g = outs[3] if len(outs) > 3 else None
+                return self.finish_qkv(outs[0], outs[1], outs[2], g, bsz, q_len, params)
 
         if self.multi_qkv is not None and bsz * q_len <= 32:
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
@@ -808,7 +903,16 @@ class SlidingAttention(Module):
 
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
-        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
+        if self.v_head_dim != self.head_dim:
+            from .attn import dec_project_o_strided
+            y = dec_project_o_strided(self.o_proj, o, bsz, seqlen, self.num_q_heads, self.head_dim, self.v_head_dim, params)
+            if y is not None:
+                return y
+            # Drop the zero lanes V was padded into so o_proj sees num_q_heads * v_head_dim
+            o = o.view(bsz, seqlen, self.num_q_heads, self.head_dim)[..., : self.v_head_dim]
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.v_head_dim).contiguous()
+        else:
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         x = self.o_proj.forward(o, params)
         return x
 
@@ -839,7 +943,14 @@ class SlidingAttention(Module):
                 dtype = torch.int32, device = self.device
             )
             self.bt_cache[slots] = bt
+        # Every sliding layer of a decode step has the same in-state lengths: one upload per step
+        # instead of one per layer (read-only downstream)
+        key = (self.device, tuple(positions_l))
+        c = SlidingAttention._seqlens_last
+        if c is not None and c[0] == key:
+            return bt, c[1]
         cache_seqlens = torch.tensor(positions_l, dtype = torch.int32).to(self.device, non_blocking = True)
+        SlidingAttention._seqlens_last = (key, cache_seqlens)
         return bt, cache_seqlens
 
 
@@ -914,6 +1025,7 @@ class SlidingAttention(Module):
             sinks = self.sinks,
             k_new = k,
             v_new = v,
+            v_dim = self.v_head_dim,
         )
 
         if self.headwise_gate:
@@ -997,15 +1109,57 @@ class SlidingAttention(Module):
             # window run reaches the end of the buffer) and attend over the pages
             bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
 
-            o = paged_attn_triton_decode(
-                q, k, v, k_pages, v_pages, bt, cache_seqlens,
-                causal = causal,
-                softmax_scale = self.sm_scale,
-                window_size = (sw, 0),
-                softcap = self.logit_softcapping,
-                sinks = self.sinks,
-                max_kv_len = S,
-            )
+            # DFlash verify (R rows): a single paged_attn_triton_decode call over all
+            # R rows at once tiles/splits the KV span from the batch's (single) cache_seqlens and
+            # q_len, which is not necessarily the same tiling a batch-1 call would use for each
+            # row's own (shorter) span -- unverified, and the one dimension this session's kernel
+            # probes never covered. Loop the exact batch-1 call per row instead: pre_appended_len
+            # defaults to 0, so each call appends row i's K/V at cache_seqlens+i and attends
+            # cache_seqlens+i+1 keys, identical to what R sequential single-token decode steps
+            # would do. `cache_seqlens + i` (not += i) since the tensor is cached across layers in
+            # `_seqlens_last`. rs.position/window_beg/wshift are untouched -- _decode_state_prep
+            # already ran once for the whole R-row block above, so the state-shift decision and
+            # the caller's later `window_beg += wshift` are unaffected by looping the attention
+            # call itself.
+            if (
+                1 < seqlen <= MAX_BSZN_GEMV_R and params.get("dflash_verify") and
+                os.environ.get("EXL3_VERIFY_ATTN_LOOP", os.environ.get("EXL3_DEC_MOE_UNION", "0")) != "0"
+            ):
+                if os.environ.get("EXL3_VERIFY_ATTN_ROWS", "1") != "0" and q.shape[0] == 1 and bt.shape[0] == 1:
+                    # one append + one attention launch, bitwise the R batch-1 calls below
+                    o = paged_attn_triton_decode_rows(
+                        q, k, v, k_pages, v_pages, bt, cache_seqlens,
+                        causal = causal,
+                        softmax_scale = self.sm_scale,
+                        window_size = (sw, 0),
+                        softcap = self.logit_softcapping,
+                        sinks = self.sinks,
+                        max_kv_len = S,
+                    )
+                else:
+                    outs = []
+                    for i in range(seqlen):
+                        outs.append(paged_attn_triton_decode(
+                            q[:, i:i + 1], k[:, i:i + 1], v[:, i:i + 1], k_pages, v_pages, bt,
+                            cache_seqlens + i,
+                            causal = causal,
+                            softmax_scale = self.sm_scale,
+                            window_size = (sw, 0),
+                            softcap = self.logit_softcapping,
+                            sinks = self.sinks,
+                            max_kv_len = S,
+                        ))
+                    o = torch.cat(outs, dim = 1)
+            else:
+                o = paged_attn_triton_decode(
+                    q, k, v, k_pages, v_pages, bt, cache_seqlens,
+                    causal = causal,
+                    softmax_scale = self.sm_scale,
+                    window_size = (sw, 0),
+                    softcap = self.logit_softcapping,
+                    sinks = self.sinks,
+                    max_kv_len = S,
+                )
 
         else:
             # Prefill: attend over [hot window of the state || new K/V], reading the new tokens
@@ -1034,6 +1188,7 @@ class SlidingAttention(Module):
                     sinks = self.sinks,
                     k_new = k,
                     v_new = v,
+                    v_dim = self.v_head_dim,
                 )
             else:
                 # Spans tile the chunk; each attends over the state plus the new tokens up to its
@@ -1054,6 +1209,7 @@ class SlidingAttention(Module):
                         sinks = self.sinks,
                         k_new = k[:, : b].contiguous(),
                         v_new = v[:, : b].contiguous(),
+                        v_dim = self.v_head_dim,
                     )
                     o.append(o_)
                 o = torch.cat(o, dim = 1)
@@ -1151,6 +1307,7 @@ class SlidingAttention(Module):
                 "layer_idx": self.layer_idx,
                 "hidden_size": self.hidden_size,
                 "head_dim": self.head_dim,
+                "v_head_dim": self.v_head_dim,
                 "rope_settings": self.rope_settings,
                 "sm_scale": self.sm_scale,
                 "out_dtype": self.out_dtype,

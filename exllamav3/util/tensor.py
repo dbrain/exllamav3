@@ -1,6 +1,17 @@
 from __future__ import annotations
+import os
 import torch
 from .device_copy import to_device
+
+
+def host_cuts() -> bool:
+    """EXL3_HOST_CUTS=1 (default off, and only reachable together with EXL3_HOST_LEAN=1):
+    host-side decode-overhead trims that remove per-call torch dispatches without touching a
+    single kernel's math -- one fused cast instead of cast+contiguous, memoized workspace
+    slices, dtype no-op early-outs, cached decode staging buffers. Read per call so one loaded
+    process can A/B arms at run time. Every path here is value-identical to the code it
+    replaces (same kernels, same arguments, same rounding)."""
+    return os.environ.get("EXL3_HOST_CUTS", "0") == "1" and os.environ.get("EXL3_HOST_LEAN", "0") == "1"
 
 class SeqTensor:
 
@@ -182,6 +193,14 @@ def to2(
     dtype1: torch.dtype | None,
     dtype2: torch.dtype | None = None
 ):
+    if host_cuts():
+        # Every module forward ends in to2(), and on the decode path the dtype almost always
+        # already matches: .to() then returns self, but only after a full dispatcher round trip
+        # (~143 per round in the served GLM-5.3 census). The dtype check is exactly what .to()
+        # does internally, so the returned tensor is the same object .to() would have returned.
+        dt = dtype1 if dtype1 is not None else dtype2
+        if dt is None or x.dtype == dt:
+            return x
     if dtype1 is not None:
         x = x.to(dtype1)
     elif dtype2 is not None:
@@ -214,6 +233,7 @@ def save_tensor_image(
 class GTensorCache:
     def __init__(self):
         self.cache = {}
+        self.slices = {}
 
     def make_key(self, device, shape, dtype, x):
         device = torch.device(device)
@@ -233,6 +253,18 @@ class GTensorCache:
         whose size is parameterized by a runtime shape (batch size, query length, split
         count): nearby sizes share one kept entry instead of ratcheting a new allocation per
         distinct size, and the total kept per tag is bounded by 2x the largest use."""
+        if host_cuts():
+            # The sliced view is a pure function of (backing key, numel), and on the decode
+            # path it is rebuilt hundreds of times per round (401 aten::slice calls per round
+            # in the served GLM-5.3 census, each a dispatcher round trip on top of the f-string
+            # key). Memoize it; the backing tensor is the same object get() would return, so
+            # every writer sees the same memory as before.
+            nb = 1 << max(numel - 1, 0).bit_length()
+            key = (self.make_key(device, (nb,), dtype, x), numel)
+            v = self.slices.get(key)
+            if v is None:
+                v = self.slices[key] = self.get(device, (nb,), dtype, x)[:numel]
+            return v
         nb = 1 << max(numel - 1, 0).bit_length()
         return self.get(device, (nb,), dtype, x)[:numel]
 

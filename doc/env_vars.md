@@ -101,6 +101,12 @@ Prefill strategy for MLA layers: `mha` up-projects past latent tiles from the co
 and attends in MHA form (~2.8× fewer FLOPs per query-past pair); `absorbed` restores the
 single-kernel absorbed-form prefill for A/B testing.
 
+### `EXL3_MLA_DEC_VALU` (default: `1` on HIP)
+
+Decode and verify rows (up to 8) of the MLA absorb and unfold run on the VALU dot2-chain kernels. The output is
+bitwise equal to the Triton path. `0` turns it off. If the extension build lacks the kernels, the Triton path is used and
+one log line says so.
+
 ### `EXL3_PREFER_FA2` (default: `0`)
 
 Put the flash-attn-2 backends ahead of the built-in Triton attention kernels in the dispatch
@@ -691,3 +697,328 @@ Forces the quantizer's dense trellis specializations (`quantize_tiles_optimized.
 off (`0`) regardless of the per-architecture dispatch (on for every K on sm_120; per K and codebook
 on Ada and Ampere where measured faster; the original kernels elsewhere). For experiments only: the
 choice also sizes the quantizer's scratch buffers.
+## Kyojin servers
+
+The switches below are Kyojin's own: the ROCm toolchain a gfx1151 machine needs, the escape
+hatches in the load path, the feature switches the three servers expose, and the measured speed
+defaults each server applies for you. Everything above this line comes from ExLlamaV3. Values
+follow the same rule as above: `0` and an empty value are off, anything else is on unless the
+entry says otherwise. Set them before you `source tools/strix_halo/env.sh` or before
+`exllamav3` is imported, because several are read once at import or on first use.
+
+### Toolchain and build
+
+#### `EXL3_ROCM_SDK` (default: unset)
+
+Root of the ROCm SDK devel tree, for example `export EXL3_ROCM_SDK=$(rocm-sdk path --root)`. It
+supplies the `hipcc` that builds every JIT HIP kernel and the `libhsa-runtime64.so.1` that
+`env.sh` preloads, and gfx1151 does not run without both. The SDK compiler builds the prefill
+kernels about 20 % faster than the system ROCm compiler. Unset, the engine looks for the
+`rocm-sdk` package beside the running interpreter, then `hipcc` on `PATH`, then `/opt/rocm`, and
+the servers print a `WARNING` line when they land on the slower one.
+
+#### `EXL3_ROCM_DEV_INCLUDE` (default: unset)
+
+An include directory for the extension build and, in build mode, for the JIT `hipcc` flags. Use
+it when your `hipsparse/` and `thrust/` headers are not in the tree `EXL3_ROCM_SDK` points at;
+`build.sh` takes the headers from either one.
+
+#### `EXL3_HIPCC` (default: unset)
+
+Full path of the `hipcc` binary that builds the JIT HIP kernels. It wins over
+`$EXL3_ROCM_SDK/bin/hipcc`, and with no `hipcc` anywhere the load stops and names this variable.
+The resolved path goes into the kernel cache key, so a kernel built by another compiler is never
+reused.
+
+#### `EXL3_HSA_LIB` (default: unset)
+
+Exact path of the `libhsa-runtime64.so.1` that `env.sh` puts in `LD_PRELOAD`, tried before
+`$EXL3_ROCM_SDK/lib`, `/opt/rocm/lib` and the system path. Without a preload torch dies with exit
+139 at the first GPU allocation, because the copy in the torch wheel segfaults on gfx1151.
+`env.sh` warns when none of the four exists.
+
+#### `EXL3_GCC_INSTALL_DIR` (default: from the local `gcc` in `env.sh`, `/usr/lib/gcc/x86_64-linux-gnu/13` in the JIT kernels)
+
+Directory passed to `hipcc` as `--gcc-install-dir`. It is only added when the directory exists, so
+a wrong value is ignored rather than fatal. Set it when `hipcc` cannot find your GCC's headers.
+
+#### `EXL3_HIP_DEFINES` (default: unset)
+
+Whitespace-separated preprocessor defines compiled into the extension, for example
+`EXL3_HIP_DEFINES="EXL3_HIP_PF_AFTER_STAGE EXL3_MUL1_DECODE_DOT4"`. Each token becomes one `-D`
+flag, so the names you pass are build-time kernel variants, not variables read at run time.
+
+#### `EXL3_VENV` (default: `<repo>/.venv`)
+
+The venv `env.sh` puts first on `PATH` and the one its `--check` looks for a Python in. Set it
+when the ROCm torch venv is not `<repo>/.venv`; `build.sh` reads it the same way.
+
+#### `EXL3_ROOT` (default: the checkout holding `env.sh`)
+
+The engine root `env.sh` works from. `PYTHONPATH` is set to it, so `exllamav3` and the built
+`exllamav3_ext*.so` are importable, and the default venv and SDK path are resolved under it. Set
+it to serve from a checkout other than the one you sourced `env.sh` from.
+
+#### `EXL3_BUILD` (default: unset)
+
+Set to `1` to make `env.sh` take its build branch without the `build` argument. That branch
+exports `ROCM_HOME`, `ROCM_PATH`, `HIP_PATH`, `HIPCXX`, `PYTORCH_ROCM_ARCH` and `MAX_JOBS`. Leave
+it off while serving: the SDK ships its own HSA runtime, which wins over the preload and brings
+the segfault back.
+
+### Loading and memory
+
+#### `EXL3_LOAD_DEVICE` (default: unset)
+
+A device such as `cuda:0` that loads the model on one device instead of autosplitting it.
+Autosplit sizes each module from free memory rather than available memory, so on unified memory
+a growing page cache makes a model that comfortably fits look unloadable. Single device only,
+ignored under tensor parallel; both lane launchers set it.
+
+#### `EXL3_KEEP_PAGE_CACHE` (default: `0`)
+
+`1` keeps the shards' page cache after a load. By default the engine drops it and logs how much it
+released, because on unified memory the page cache and the weights are the same physical pool and
+keeping it leaves the box carrying a large pack twice.
+
+#### `EXL3_DENSE_GEMM_TUNE_FILE` (default: `$HOME/.cache/exllamav3/dense_gemm_tune.txt`)
+
+The file that holds the tuned dense GEMM solution per shape class. Point it at a seeded file to
+skip the autotune; the GLM lane copies `tools/lanes/assets/tune_seed.txt` to the path it sets.
+Without it the first GLM launch spends about ten minutes tuning before the port opens.
+
+#### `MIMO_IMAGE_MAX_PIXELS` (default: `2097152`)
+
+Pixel cap applied to an image the MiMo server preprocesses: the tower sees `min(cap, the pack's own
+limit)`, and the image is resized (aspect kept, multiples of 32) until it fits. The default is 2 097 152
+pixels — 8 192 patches, 2 048 text tokens — because the pack's config would allow 8 388 608 and one tower
+pass at that size needs far more attention memory than is worth it. Raise it for a pack with more
+headroom, lower it to make vision cheaper; raising it past the pack's limit changes nothing.
+
+#### `EXL3_MIMO_FP32_MLP_LAYERS` (default: `none`)
+
+Which MiMo layers build their MoE and MLP intermediates in fp32 instead of fp16. Syntax: `47`,
+`40-47`, `0,47`, `-1`, `all`, or `none` / `off` / `""`. Without it the value comes from
+`exl3_fp32_mlp_layers` in `config.json`. A named layer that does not exist is an error; an
+overridden layer loses the fused prefill tier.
+
+#### `EXL3_MIMO_FP32_MLP_FUSED` (default: `0`)
+
+`1` keeps the fused prefill tier on the layers `EXL3_MIMO_FP32_MLP_LAYERS` overrides. That kernel
+needs fp16 intermediates, so leaving it on brings back the fp16 range the override was for. A/B
+timing only.
+
+#### `EXL3_MIMO_MLP_ACT_LIMIT` (default: `0`, off)
+
+Clamp the activation and the up-projection input to plus or minus this value on the overridden
+layers, in every tier, including the decode kernel whose fp16 store does not saturate. Use 255 or
+less, because the square of the limit must stay under 65504.
+
+### Feature switches
+
+#### `EXL3_ABLIT_RUNTIME` (default: unset, the hook is off)
+
+Path of an edit spec that projects one fixed direction out of the residual stream at run time. It
+edits no weights. `off`, `0`, `false`, `no` and `none` force it off. An explicit path wins over the
+`uncensor_spec.json` that a model directory may carry, and a path that does not exist stops the
+load with an error naming the file. See [refusal_hook.md](refusal_hook.md).
+
+#### `EXL3_ABLIT_TORCH` (default: `0`)
+
+`1` uses the PyTorch projection instead of the Triton kernel. It has no effect when Triton is not
+importable, since the Triton path needs it.
+
+#### `EXL3_ROW_INV` (default: `1`)
+
+While on, a verify forward of up to 8 rows takes the per-row exact path in the MLA attention and in
+the MoE router, so each row is bit-equal to the same row decoded alone, which is two GLM jobs at
+draft depth 2. Only those two modules and only up to 8 rows: `0` drops the limit to 4, lets the
+faster batched paths take over, and a near-tied token can then change. Even with it on, more than
+one session does not guarantee greedy output equal to a solo run: the decode attention kernel picks
+how to split the cache from the batch it runs with, so a near-tie can change (see
+[tools/qwen/SERVE.md](../tools/qwen/SERVE.md)).
+
+#### `EXL3_MTP_EH_FP16` (default: unset, off)
+
+Path of a safetensors sidecar holding an unquantized copy of the MTP `eh_proj`, which raises
+draft acceptance without changing target token ids. `0` turns it off; a path that does not exist
+stops the load. The GLM server looks for the file itself in three places, listed in
+[tools/glm/SERVE.md](../tools/glm/SERVE.md).
+
+#### `EXL3_DRAFT2S` (default: `<model folder>/draft2s.st` when present and matching)
+
+Two-stage draft head for the MTP drafters: it finds the draft argmax in two steps instead of one pass over the full
+vocabulary. Every draft is still verified, so the output does not change. The GLM and Qwen servers pick up
+`draft2s.st` from the model folder when its header (vocabulary size, hidden width) matches `config.json`. A path in the
+variable wins; `0`, `off` or an empty value uses the full head. Sampled jobs always use the full head.
+
+#### `EXL3_MIMO_LOSSLESS` (default: `1`)
+
+`0` restores the fast MiMo verify that is not token-identical. With it on, speculative output
+equals plain greedy output, at about 5 % chat and 12 % code tok/s.
+
+#### `EXL3_LAZY_DKV` (default: `1`)
+
+Lazy drafter KV catch-up: a plain 1-row step parks the target hidden rows and the next drafting
+round writes them in one pass, instead of feeding the drafter cache every step. `0` turns it off.
+
+#### `EXL3_DRAFT_PRIOR` (default: `1`)
+
+`0` skips `draft_conf_prior.json` from the drafter directory, so the draft confidence threshold
+starts from the `--draft-confidence` flag instead of the offline table that seeds it.
+
+#### `EXL3_SPEC_GATE` (default: `0`)
+
+Cost-model gate that skips the drafter forward and the verify whenever the measured speculative
+rate would not beat plain decode. Opt-in, and only active when a draft model is loaded. The MiMo
+server copies its `--spec-gate` flag into this variable.
+
+#### `EXL3_SPEC_PROF` (default: unset)
+
+`1` records per-phase speculative timings. Every timed phase synchronizes the device, so it is a
+profiling switch rather than a tuning one.
+
+#### `EXL3_SERVE_WARMUP` (default: `1`)
+
+`0` skips the GLM server's warm-up request and drops that stage from `/health`. The first real
+request then pays the kernel warm-up.
+
+#### `EXL3_SERVE_DTUNE_PRIME_S` (default: `600`)
+
+Seconds the GLM server spends pre-tuning dense GEMM shapes before it opens the port. `0` skips the
+tuning and the matching `/health` stage. Read only with `EXL3_DENSE_GEMM_TUNE=1`: the GLM server sets
+`EXL3_DENSE_GEMM_TUNE=0` and `EXL3_CONV_GEMM=1` by default (see [EXL3_CONV_GEMM.md](EXL3_CONV_GEMM.md)).
+
+#### `EXL3_SERVE_EMPTY_CACHE` (default: `1`)
+
+`1` drops the allocator's inactive slack after the GLM warm-up. `0` keeps it.
+
+#### `EXL3_SERVE_MEMDIAG` (default: unset)
+
+`1` prints a memory line after the GLM warm-up.
+
+### Speed defaults the servers set
+
+Each server applies a measured configuration before the engine loads, so a bare `serve.py` runs
+the configuration its published numbers were measured with. They are applied with
+`os.environ.setdefault`, so a value in your own environment always wins and nothing is forced on
+you. Set any of them to `0`, or to the value named below, to go back. The Qwen server refuses to
+start if `exllamav3` was imported before they were applied, because the modules that read them
+latch the value at import.
+
+#### Qwen: `SERVE_ENV` in `tools/qwen/serve.py`
+
+| variable | value the server sets | what it does |
+|---|---|---|
+| `EXL3_HOST_LEAN` | `1` | Host-side decode trims: batched verify readback and reused staging buffers. Launches, draw order and numerics are unchanged. |
+| `EXL3_HOST_CUTS` | `1` | The rest of the host trims: cached staging buffers and early-outs on no-op work. Only active together with `EXL3_HOST_LEAN=1`. |
+| `EXL3_MOE_FUSED` | `1` | The fused MoE kernel. Ignored on a non-ROCm build. |
+| `EXL3_MOE_VALU` | `1` | Folds the gate-and-up GEMV into the grouped-MoE decode kernel. |
+| `EXL3_VERIFY_ATTN_LOOP` | `1` | Runs an R-row verify attention as the exact R single-row loop, which is what keeps a verify forward bit-identical. |
+| `EXL3_VERIFY_GEMV_R` | `1` | Runs the decode projections of an R-row verify as one multi-row GEMV instead of R single-row calls. |
+| `EXL3_GEMV_R_DEC1` | `1` | Decodes each weight pair once per verify forward and shares it across rows, instead of decoding it again per row. Bit-identical, and it needs `EXL3_GEMV_R_RM6`. |
+| `EXL3_MTP_FUSE_CATCHUP` | `0` | `0` runs a catch-up draft prefill after each accepted round, `1` folds those rows into the next draft forward, `2` does that on the union MoE path. Unset means auto. |
+| `EXL3_PLE_HIP` | `1` | Hands the post-projection PLE chain to the HIP kernels instead of the torch chain. |
+| `EXL3_DQ_HIP` | `1` | Deinterleaves the fused q/g tensor with a HIP kernel, for the aligned fp16 shapes it accepts. |
+| `EXL3_GR_HIP` | `1` | Hands the gated-residual prefill GEMMs to HIP, for large row counts on the Qwen shape. |
+| `EXL3_GDN_FUSE` | `1` | The fused HIP chain for the GDN chunk path, which is the only path that can side-write the mid-chunk state, so `EXL3_PF_NO_TAIL` needs it. |
+| `EXL3_PF_SKIP` | `1` | Skips the lm_head of a prefill chunk whose output is discarded anyway, since the first token comes from the next decode round. |
+| `EXL3_PREFILL_CHUNK` | `4096` | The prefill chunk size in tokens, overriding the model default. Above 65535 a forward is not supported and the load raises. |
+| `EXL3_PF_DEFER` | `0` | `1` runs the draft prefill after the first token instead of chunk by chunk with the target prefill. Needs a single session and no spec gate. |
+| `EXL3_PF_NO_TAIL` | `1` | Lets the last prefill chunk run to the end of the prompt instead of stopping at the last page, which saves a second pass over every expert. |
+| `EXL3_PF_TAIL_MERGE` | `1024` | How many rows past the chunk size a merged last chunk may take, so a short tail is merged rather than re-read. |
+| `EXL3_VERIFY_QSA_PROJ` | `0` | `1` runs the indexer q and k projection per row instead of batched. |
+| `EXL3_VERIFY_QSA_ATTN` | `0` | `1` or `all` runs sparse selection and attention per row, `sel` selection only, `att` attention only. |
+| `EXL3_QSA_ROWINV` | `1` | Computes the sparse-attention split plan as if the batch were a single row, so a batched verify reduces in the same order as plain decode. `0` restores the batch-dependent plan. |
+| `EXL3_ROLL_CKPT` | `1` | Makes every page boundary a recurrent checkpoint candidate while decoding, so a follow-up turn resumes at the last full page of the reply. |
+| `EXL3_PF_GR_FUSE` | `1` | Applies the gated-residual update inside the next site's norm pass on the prefill path. |
+| `EXL3_MPW_GLUE` | `1` | The v2 form of the MoE glue in the grouped prefill kernel, for a top-k of 1 to 32. |
+| `EXL3_VERIFY_ROW_SPLIT` | `2` | Lets a fused MoE call cover up to 8 rows instead of 4, split into sub-calls. Per-row arithmetic is unchanged. |
+| `EXL3_MOE_R8` | `1` | Runs rows 5 to 8 as one fused launch instead of split sub-calls, for the shapes where the wide kernel exists. |
+| `EXL3_GEMV_R_RM6` | `1` | Runs 5 or 6 rows in one launch of the 6-row decode GEMV instead of two chunks. Needs `EXL3_GEMV_R_DEC1=1`. |
+| `EXL3_GR_GS` | `1` | Group scales for the int8 gated-residual mixer instead of one scale per row. `2` keeps both resident, for a measurement harness. |
+| `EXL3_GR_GS_SIDECAR` | `<model_dir>/hc_gs_sidecar.safetensors`, set by the server | Optional group int8 codes re-derived with GPTQ-style rounding on the same group scales. Unset means plain rounding. The server uses the file only when its hash matches the published pack. |
+| `EXL3_MOE_CFG` | `2` | The k-split width of the grouped-MoE decode GEMV. `0` keeps the original wide shape, `1` and `2` narrow it. Read once per process. |
+| `EXL3_HIP_PREFILL_MIN_ROWS` | `2` | The row count from which the grouped prefill GEMM starts deduplicating experts. The engine default is 17, which would miss a small verify batch. |
+| `MPW_KERN` | `2` | Which grouped-MoE prefill GEMM kernel to use. |
+
+#### GLM: `SPEED_ENV` in `tools/glm/serve.py`
+
+| variable | value the server sets | what it does |
+|---|---|---|
+| `EXL3_MOE_CFG` | `2` | Same switch as above; the GLM verify batch is a matvec, not a prefill, so it needs the narrow k-split. |
+| `EXL3_HIP_PREFILL_MIN_ROWS` | `2` | Same switch as above. |
+| `EXL3_BLOCK_GRAPH` | `1` | Captures and replays the decode block as a graph, which takes the Python host time out of the step. Off by default in the engine. |
+| `EXL3_BLOCK_GRAPH_MLA` | `2` | Extends graph capture to MLA blocks. `0` leaves them eager, `1` covers the post-attention segment, `2` also the projections and norms. |
+| `EXL3_HC_FN_HALF_PF` | `1` | Reads the hyper-connection weights in fp16 at any row count, not only small ones, which halves the dominant traffic of that kernel. |
+| `EXL3_HC_1PASS_PF` | `1` | The one-pass prefill kernel for the hyper-connection mix and norm, above the decode row cap. |
+| `EXL3_DEC_DSA_FAST` | `1` | A tuned tile and split preset for the DSA decode kernel, for 2 or more rows. A list of numbers overrides the pieces. |
+| `EXL3_MIDCHUNK_CKPT` | `2` | A prefill chunk that crosses a recurrent checkpoint boundary also saves the recurrent state there, so the follow-up turn can resume from it. |
+| `EXL3_PREFILL_BIG_TAIL` | `1` | Allows the big-chunk tail path. Honored only with `EXL3_MIDCHUNK_CKPT=2`. |
+| `EXL3_BIG_TAIL_DENSE` | `1` | On a sparse single-session decode pass longer than the query-length cap, lets the tail attend densely instead of sparsely. |
+| `EXL3_PREFILL_BIG_CHUNK_MAXPOS` | `32768` | From this position on, prefill goes back to plain chunks, which lowers peak memory at very long context. `0` is off. |
+| `EXL3_MOE_UNION_V2` | `1` | The v2 union MoE table, which stays on the device instead of synchronizing to the host. Already the engine default; `0` disables it. |
+| `EXL3_VERIFY_ROW_SPLIT` | `2` | Same switch as in the Qwen table: a verify round of 5 to 8 rows (copy-lookup rounds) runs as fused sub-calls. Rows 4 and below are unchanged. |
+| `EXL3_MOE_R8` | `1` | Same switch as in the Qwen table: rows 5 to 8 run as one fused MoE launch. |
+| `EXL3_GEMV_R_RM6` | `1` | Same switch as in the Qwen table: 5 or 6 rows run in one launch of the 6-row dense GEMV. |
+| `EXL3_SPEC_SAMPLED` | `1` | See the speculative-decoding entries below. The engine default is `0`; the GLM server turns it on. |
+
+#### MiMo: the defaults in `tools/mimo/serve.py`
+
+| variable | value the server sets | what it does |
+|---|---|---|
+| `EXL3_DEC_MOE_UNION` | `1`, with `EXL3_MIMO_LOSSLESS=1` | Also the default of `EXL3_VERIFY_GEMV_R`, so the multi-row verify GEMV is available. |
+| `EXL3_VERIFY_WIDE_R` | `0` | The one-launch wide verify GEMV for the lm_head. On by default in the engine; off here because it costs about 7 % tok/s on this model. |
+| `EXL3_DEC_MOE_UNION_DEV` | `1` | Keeps the unique-expert table on the device through a speculative round. Without it a round costs more than a plain step and the spec gate stops speculating. |
+| `EXL3_SPEC_GATE` | `1` with `--spec-gate`, else `0` | Set from the flag rather than a default. See the feature-switch entry above. |
+
+#### MiMo lane: `tools/lanes/serve_mimo.sh`
+
+| variable | value the lane sets | what it does |
+|---|---|---|
+| `EXL3_PF_MSPLIT` | `2048` | Runs big prefill GEMMs as row blocks of this size, which is bit-exact and lowers peak memory. `0` is off. |
+| `EXL3_MPW2X` | `2` | Tries the grouped-MoE prefill candidate kernel. `0` is off. |
+
+The same lane also exports `EXL3_HOST_LEAN`, `EXL3_HOST_CUTS`, `EXL3_LOAD_DEVICE` and
+`EXL3_DENSE_GEMM_TUNE_FILE`, all covered above.
+
+#### Speculative decoding and start-up options of the GLM and Qwen servers
+
+| variable | default | what it does |
+|---|---|---|
+| `GLM_NGRAM` | `2,7,16,3` with one session, `off` with more | Copy lookup for the GLM server, as `gram,K,match[,cmin]`. When the last `match` tokens of the context appeared before, the next round verifies the `K` tokens that followed them, instead of the drafter's tokens. `cmin` cuts the copy where the two latest occurrences stop agreeing, and drops it if that leaves fewer than `cmin` tokens. The default copies 7 tokens after a 16-token match. It speeds up requests that copy or edit text; other requests are unchanged. It needs about 0.7 GiB of GPU memory more. It works only while one request is active. `off` (or `0`, `none`) turns it off, and so does `--num-draft 0`. A malformed value stops the server at start. With greedy decoding, a near-tie in a long answer can make the text differ from a run without lookup. |
+| `QWSPEC_NGRAM` | `2,7,16,3` | The same copy lookup for the Qwen server, in the same format. `2,3,5` gives the earlier setting (a 5-token match, 3 copied tokens). `off` turns it off. |
+| `QWSPEC_NGRAM_IDX` | `1` | Builds the lookup index when the request is queued, so its cost lands in the time to first token and not in the first decode round. `0` builds it lazily and also turns off the `cmin` check. |
+| `EXL3_SPEC_SAMPLED` | engine `0`; the GLM server sets `1` | For requests with temperature above 0 and an MTP drafter: the drafter draws its tokens from its own distribution, and the verify keeps each one with probability min(1, p/q), or resamples from the remainder. The output has the same distribution as plain sampling. Greedy requests are untouched. `0` goes back to taking the drafter's top token. The Qwen server does not set it. |
+| `EXL3_GLM_SLOTS` | `0` (one recurrent state slot per session) | Minimum number of recurrent state slots the GLM server allocates. The default sizes them to `--sessions`, which frees about 6 GiB of GPU memory at one session. `16` restores the earlier layout. |
+| `EXL3_GC_FREEZE` | Qwen server `1`, GLM server `0` | Moves the loaded model and tokenizer objects out of the Python garbage collector before the first generator is built. Without it, rebuilding the generator (for example after a `cache_salt` change) pays a collector pass of about 0.5 s inside the time to first token. `0` leaves them in the collector. |
+
+#### Image embedding cache (all three servers)
+
+| variable | default | what it does |
+|---|---|---|
+| `KYOJIN_IMAGE_CACHE_POLICY` | `head` | Which pictures a full image-embedding cache gives up. The cache is one shared module (`tools/strix_halo/image_cache.py`, with `image_cache.py` symlinks in `tools/glm`, `tools/qwen` and `tools/mimo`), so this switch reaches all three servers, and it is read when a server builds its cache at start-up. `head` is the plain LRU a server always had: the picture whose last use is oldest goes first, which for a client that re-sends its whole history every turn is the earliest picture of the prompt. `tail` follows the prompt instead — a picture no remembered prompt refers to goes first, then the last pictures of the remembered prompts, and the head of the prompt is the last thing given up — which lets a history that keeps being re-sent keep the start of its prompt, so its warm turns prefill less and reach the first token sooner. Decoding is unaffected. Any other value stops the server at start-up. |
+
+### Server state
+
+#### Request log (all three servers)
+
+| variable | default | what it does |
+|---|---|---|
+| `KYOJIN_REQLOG_DIR` | unset = off | Directory for the per-request lifecycle log, or `1`/`on`/`yes` for `~/.cache/kyojin`. A path that ends in a file name is read as that file's **directory** (`/var/log/kyojin/requests.log` means `/var/log/kyojin`), since that is what pointing it at a log means; the log file is always `requests-<run>.log` in that directory. Every run writes its own file, `requests-<run>.log` (so the default is `~/.cache/kyojin/requests-<run>.log`), and every line carries `run=<id>`, so one run can be read without filtering the others out; the oldest runs are removed at start-up, see `KYOJIN_REQLOG_KEEP` (`0`/`off`/`none`/`no`/`false` disable it). Numbers and event names only, never prompt or reply text; one line per event and a heartbeat (`alive`) while a job is queued, prefilling or decoding. The file is created `0600` whatever the umask is, and an existing file left wider is tightened on the next start; a directory this server has to create is `0700`, while one that already exists keeps its own mode; the shared folder `~/.cache/kyojin`, or wherever `KYOJIN_HEALTH_DIR` points, is created with the process umask instead, its missing parents included, because more than one process writes there. For a streaming reply the heartbeat also carries the **output accounting** (`out_events`, `out_chars`, `last_out_s`) and the request ends with one `sse_summary` line, which is what tells "the client was sent nothing" from "the client showed nothing"; the event tables, the shared/GLM-only split and how to read it are in [logging.md](logging.md). Served by all three servers from one module (`tools/strix_halo/serve_reqlog.py`, with `serve_reqlog.py` symlinks in `tools/glm`, `tools/qwen` and `tools/mimo`): the whole request lifecycle — the request table, the id on every line, the heartbeat and the route wrapper (`Lifecycle`) — is that module's, so the three servers emit one vocabulary, which `tools/test_serve_logging.py` checks against all three at once; each server's document only points back here and to [logging.md](logging.md). |
+| `KYOJIN_REQLOG_HEARTBEAT_S` | `10` | Seconds between `alive` lines; `0` disables the heartbeat (the log stays on). |
+| `KYOJIN_REQLOG_KEEP` | `20` | How many runs keep their log file. Checked once, at start-up: the run files of the oldest runs are removed, so the directory holds this many (this run included). It counts only files this module writes (`requests-<run>.log`); an archive or a file an earlier layout appended to is never deleted. `0` keeps every run. |
+
+#### SSE keep-alive (all three servers)
+
+| variable | default | what it does |
+|---|---|---|
+| `KYOJIN_SSE_PING_S` | `0` = off | Seconds a stream may go without a data event before the server writes one SSE comment line (`: waiting <n> s`), which keeps a client that only watches its socket from treating a long prefill — or a long decode nothing is being written for — as a dead server. The comment counts from the request's arrival, comes once per interval and only after that much silence: a stream that is producing text never gets one, and one that stops gets them again (a reply holding a `<tool_call>` back until its XML closes is decoded for minutes while the client hears nothing). The `role` chunk a client gets immediately does not count as output, so the whole prefill is covered. Shared by the three servers (`tools/strix_halo/serve_ping.py`, with `serve_ping.py` symlinks in `tools/glm`, `tools/qwen` and `tools/mimo`), read per request, reported on one start-up line. With the default nothing is written at all. Worth setting on any server that sees long prompts — an image conversation can prefill for minutes — together with a client-side timeout that is long enough; each comment is also an `sse_ping` line in the request log (`KYOJIN_REQLOG_DIR`) when that is on and the server's pinger is wired to it (GLM's is). See [logging.md](logging.md). |
+
+#### `KYOJIN_HEALTH_DIR` (default: `~/.cache/kyojin`)
+
+Where the three servers keep the per-model start-up timings they use to weight `/health` load
+progress and report `eta_s`: `startup-qwen.json`, `startup-glm.json` and `startup-mimo.json`. Set
+it to share one cache between several checkouts. The GLM server keeps two files there, one for
+starts with the dense GEMM tuning already cached and one without, so a cached start is not timed
+with the slow first one.
