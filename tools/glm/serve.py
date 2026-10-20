@@ -632,7 +632,7 @@ class ResidentEngine:
         ctx = min(max_position, max_ctx)
         self.ctx = ctx
         slots = max(sessions, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
-        # GLM_NGRAM = "gram,K,match[,cmin]": n-gram lookup of tools/qwen/spec_policy.install_lookup. When the
+        # GLM_NGRAM = "gram,K,match[,cmin]": n-gram lookup of exllamav3.generator.spec_policy.install_lookup. When the
         # last `match` tokens occurred before, the round verifies the K tokens that followed them instead of the drafter's
         # --num-draft tokens. K rows beyond the first need K history levels (138 MiB each per slot). Default 2,7,16,3 with
         # one session (copy / edit turns +26 %, +0.67 GiB; greedy text may change at an fp16 tie), off with more sessions
@@ -695,10 +695,7 @@ class ResidentEngine:
             record_draft_stats=True,
             dynamic_draft_tokens=self.dyn is not None, draft_confidence=self.dyn[1] if self.dyn else 0.6)
         if lookup:
-            qdir = str(Path(__file__).resolve().parent.parent / "qwen")
-            if qdir not in sys.path:
-                sys.path.append(qdir)
-            import spec_policy
+            from exllamav3.generator import spec_policy
             spec_policy.install_lookup(g, lookup, self.lookup_stats)
             g.num_draft_tokens = self.num_draft     # the drafter's own depth; lookup rounds bring their K tokens
         if os.environ.get("EXL3_ROUND_LOG"):   # opt-in per-round decode log (tools/glm/round_probe.py), off by default

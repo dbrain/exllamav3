@@ -1447,7 +1447,7 @@ class Generator:
             spec_prm = spec_sample.eligible(spec_job)
         spec_q = []
         if spec_prm is not None:
-            # Filled depth by depth: a draft policy that stops the loop early (tools/qwen/spec_policy StopDraft) verifies
+            # Filled depth by depth: a draft policy that stops the loop early (spec_policy StopDraft) verifies
             # a prefix of draft_ids_pinned, whose laws are all recorded by then
             self._spec_round = (spec_job, spec_prm, spec_q)
         for idx in range(window):

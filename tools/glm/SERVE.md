@@ -49,8 +49,7 @@ request body.
 
 Copy lookup (`GLM_NGRAM`), sampled drafts (`EXL3_SPEC_SAMPLED`), the recurrent slot count (`EXL3_GLM_SLOTS`) and the
 collector freeze (`EXL3_GC_FREEZE`) are described in [doc/env_vars.md](../../doc/env_vars.md).
-The lookup code is `tools/qwen/spec_policy.py`, which the GLM server finds through its own file path, so `tools/qwen`
-must ship next to `tools/glm`.
+The lookup code is `exllamav3/generator/spec_policy.py`.
 
 ### MTP sidecar (higher draft acceptance)
 

@@ -2,11 +2,10 @@
 #   python tools/qwen/test_ngram_index.py [--fuzz 10000] [--docs DIR]   (HIP_VISIBLE_DEVICES= CUDA_VISIBLE_DEVICES= nice -n 19)
 import os, sys, json, random, time, argparse
 os.environ.setdefault("HIP_VISIBLE_DEVICES", ""); os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import numpy as np, torch
 torch.set_num_threads(1)
-import spec_policy as sp
+from exllamav3.generator import spec_policy as sp
 from exllamav3.util.tensor import SeqTensor
 
 BR = {}

@@ -16,7 +16,7 @@ from exllamav3.generator.sampler import ArgmaxSampler
 from transformers import AutoTokenizer
 from prompts10 import PROMPTS
 from spec_prompts import EXTRA
-import spec_policy
+from exllamav3.generator import spec_policy
 from exllamav3.modules import moe_fused
 from exllamav3.modules.quant import exl3 as qexl3
 # arm plain0 = plain greedy with the previous engine config (mf7 MoE kernel, lm_head loop, no GEMV_R_DEC1), every other arm = current config

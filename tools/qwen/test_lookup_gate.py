@@ -1,9 +1,9 @@
-"""install_lookup gate: model-free, fake Generator (no GPU, no exllamav3 import)."""
+"""install_lookup gate: model-free, fake Generator (no GPU)."""
 import os, sys, unittest
 from pathlib import Path
 import torch
-sys.path.insert(0, str(Path(__file__).parent))
-import spec_policy
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from exllamav3.generator import spec_policy
 
 class Sid:
     def __init__(self, ids): self.ids = list(ids)

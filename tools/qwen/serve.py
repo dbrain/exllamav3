@@ -755,7 +755,7 @@ class QwenEngine:
         self.torch, self.Generator, self.Job = torch, Generator, Job
         self.sessions = sessions
         self.row_budget = 0   # drafter-free lookup row cap: this tree has no --row-budget plumbing (rows = 0 = one active request only)
-        import spec_policy  # tools/qwen/spec_policy.py
+        from exllamav3.generator import spec_policy
         pl = spec_policy.plain_lookup_from_env(self.row_budget)   # drafter-free lookup (plain rounds): its K needs the same history depth
         ndt = max(ndt, int(os.environ.get("QWSPEC_MAXD") or 0), int(os.environ.get("QWSPEC_FIXD") or 0), pl[1] if pl else 0)  # buffers fit the deepest draft
         self.model_path, self.ctx, self.ndt, self.draft_policy = model_path, ctx, ndt, draft_policy
@@ -843,7 +843,7 @@ class QwenEngine:
         self.torch.cuda.empty_cache()
         spec = spec and self.draft_model is not None
         kw = dict(model=self.model, cache=self.cache, tokenizer=self.tokenizer)
-        import spec_policy  # tools/qwen/spec_policy.py: dynamic length + n-gram lookup, the shipped rule
+        from exllamav3.generator import spec_policy
         pl = None if spec else spec_policy.plain_lookup_from_env(self.row_budget)
         if spec:
             kw.update(draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=self.ndt)

@@ -1,14 +1,14 @@
-# CPU tests of the depth rules in spec_policy.py (no GPU, no model).   python tools/qwen/test_spec_rule.py
+# CPU tests of the depth rules in exllamav3/generator/spec_policy.py (no GPU, no model).   python tools/qwen/test_spec_rule.py
 #  1. ProductRule == the pre-change inline rule (reference copy below) on random probability chains
 #  2. apply_rule (truncation form) == early-stop form, for every rule
 #  3. install() on a fake generator: early stop / fixed depth / log arm keep the same drafts; defaults are 0.6 / 0.3 / ndt
 #  4. OnlineRule: scale rises when drafts are accepted more than predicted, falls in the opposite case, stays clipped
 import os, sys, random, unittest
 os.environ.setdefault("HIP_VISIBLE_DEVICES", ""); os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
 import numpy as np
-import spec_policy as sp
+from exllamav3.generator import spec_policy as sp
 
 def ref_keep(ps, thf=0.6, thv=0.3, maxd=3):
     """the rule exactly as it was inlined in install() before the rule objects: returns (keep, drafted forwards)"""
