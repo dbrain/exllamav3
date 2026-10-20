@@ -340,6 +340,9 @@ class Generator:
         # Score-only jobs (Job(score_only = True)): FIFO, run at the head of iterate(), outside max_batch_size
         self.score_jobs = []
         self.score_trace = os.environ.get("EXL3_SCORE_TRACE", "0") != "0"
+        # Off by default: decision states are mostly one-off, so their checkpoints and pages would only evict
+        # chat state from the shared caches. Score jobs still read the shared caches either way
+        self.score_cache = os.environ.get("EXL3_SYSTEMONE_CACHE", "0") == "1"
         self.score_yielded = False
         self.deferred_jobs = []   # EXL3_REPLY_FIRST: finished jobs not yet released
 
@@ -2508,6 +2511,9 @@ class Generator:
         job.cached_pages += cached_pages
         job.total_pages += allocated
         job.non_sequential_pages += non_sequential
+        # What the lookup found holds someone else's K/V; only the pages this job fills itself are its own
+        job.score_hits = {id(p) for p in seq.allocated_pages if p.kv_position > 0}
+        job.score_fresh = {}
 
         if rc is not None:
             group = job.score_group
@@ -2529,7 +2535,7 @@ class Generator:
             if split is None or not 0 < split < L:
                 split = (L - 1) // PAGE_SIZE * PAGE_SIZE
             boundary = split // PAGE_SIZE * PAGE_SIZE
-            if start < boundary:
+            if start < boundary and self.score_cache:
                 plan.append((boundary, "checkpoint"))
             group = job.score_group
             if (group is not None and group.stash is None and group.pending > 1 and
@@ -2557,15 +2563,20 @@ class Generator:
     def score_group_resume(self, job, seq, group) -> bool:
         """
         Resume a group member at the group's split point: copy the shared partial page from the anchor and take
-        the group's stash. Only when this job's own resume point is exactly the page boundary below the split,
-        i.e. the shared prefix up to that boundary is cached and checkpointed, and the anchor still holds the
-        same tokens on the same chain.
+        the group's stash. Only when every page below the split's page boundary is complete with this job's own
+        content hash (found by hash, normally the anchor's pages: the shared recurrent cache need not hold a
+        checkpoint there, since the stash replaces it) and the anchor still holds the same tokens on the same
+        chain.
         """
         split = group.split_at
         boundary = split // PAGE_SIZE * PAGE_SIZE
         n = split - boundary
-        if n <= 0 or seq.kv_position != boundary or split >= len(seq.sequence_ids):
+        if n <= 0 or seq.kv_position > boundary or split >= len(seq.sequence_ids):
             return False
+        for li in range(boundary // PAGE_SIZE):
+            p = seq.allocated_pages[li]
+            if p.kv_position != PAGE_SIZE or li >= len(seq.page_hashes) or p.phash != seq.page_hashes[li]:
+                return False
         anchor = group.anchor
         if anchor is None or anchor is job:
             return False
@@ -2583,6 +2594,7 @@ class Generator:
             if src.kv_position < n or src.prev_hash != prev_hash or not torch.equal(src.sequence[:, :n], tail):
                 return False
             self.cache.copy_page(self.cache, src.page_index, dst.page_index, n)
+            self.score_own_page(job, dst)
             dst.prev_hash = prev_hash
             dst.sequence[:, :n].copy_(tail)
             dst.kv_position = n
@@ -2670,6 +2682,8 @@ class Generator:
             if pf_b > pf_a:
                 page.sequence[:, pf_a - li * PAGE_SIZE:pf_b - li * PAGE_SIZE].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
             page.can_revert = False
+            if pf_b > pf_a:
+                self.score_own_page(job, page)
         for li in range(p0, p2):
             page = pages[li]
             if page.kv_position == PAGE_SIZE and li < len(seq.page_hashes) and page.phash != seq.page_hashes[li]:
@@ -2682,6 +2696,33 @@ class Generator:
         """A state that describes exactly this sequence's prefix: at its position, with no unsettled pass."""
         position = getattr(state, "position", None)
         return (position is None or position == seq.kv_position) and getattr(state, "last_history", 0) == 0
+
+
+    def score_own_page(self, job, page):
+        """Note a page this job wrote that no lookup gave it, so a private release can clear it."""
+        if self.score_cache or id(page) in job.score_hits or id(page) in job.score_fresh:
+            return
+        job.score_fresh[id(page)] = page
+        # Keeps the disk tier's write-behind and idle flush off it while it carries a content hash
+        page.persistable = False
+
+
+    def score_release_pages(self, job):
+        """
+        Drop a score job's pages. By default the pages it wrote itself go back as empty pages, first in line for
+        eviction, so no later lookup can match them: a chat would otherwise reuse decision K/V written without
+        its draft cache, and the host and durable tiers would fill with one-off decision state. A page another
+        job holds by now is left to that job.
+        """
+        fresh = getattr(job, "score_fresh", None) or {}
+        job.score_fresh = {}
+        try:
+            job.deallocate_pages()
+        finally:
+            pt = self.pagetable
+            for page in fresh.values():
+                if page.ref_count == 0 and pt.unreferenced_pages.get(page.phash) is page:
+                    page.clear()
 
 
     def score_checkpoint(self, job, seq):
@@ -2762,7 +2803,7 @@ class Generator:
         if job.score_keep_pages:
             job.free_recurrent_state()
         else:
-            job.deallocate_pages()
+            self.score_release_pages(job)
         group = job.score_group
         if group is not None:
             group.pending -= 1
@@ -2782,7 +2823,7 @@ class Generator:
                 print(f" ## Warning: releasing a score group's stash failed ({e!r})")
         if anchor is not None:
             anchor.score_keep_pages = False
-            anchor.deallocate_pages()
+            self.score_release_pages(anchor)
 
 
     def reap_failed_job(self, job, error, results: list):
