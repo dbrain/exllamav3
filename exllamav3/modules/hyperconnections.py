@@ -1045,7 +1045,9 @@ class GatedResidual(Module):
             HyperConnection.flush_pending(streams, pending)
             pending = None
         post, mixed = self._mix(streams, params = params, pending = pending,
-                                pad_ok = bool(params.get("hc_pad_ok")) and "capture" not in params
+                                # attention site only (hc_pad_ok True): the MLP site ("mlp") feeds the router and
+                                # expert tiers, which read the block input as contiguous rows
+                                pad_ok = params.get("hc_pad_ok") is True and "capture" not in params
                                 and "quant_preserve" not in params and "ovr" not in params and "reconstruct" not in params)
         return post.view(b, s, self.hc_mult), None, mixed.view(b, s, self.hidden_size)
 

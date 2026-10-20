@@ -375,10 +375,13 @@ class PLELayer(Module):
         token_history: torch.Tensor,
         params: dict,
         conv_state: torch.Tensor | None = None,
+        taps: dict | None = None,
     ):
         """
         streams: (bsz, seq, hc_mult, hidden) fp32 residual stack;
         token_history: (bsz, (ngram_size - 1) + seq) token ids (eos-padded at sequence start).
+        taps: {row r: None}, filled with batch 0's conv window after row r, the full-stream columns
+        [r, r + conv_state_len), which may lie in any row slab (the mid-chunk checkpoints).
         Returns (delta (bsz, seq, hc_mult, hidden) fp32 to add to the streams, or None when the
         fast path has already added it into `streams` in place; full conv column
         stream — see _short_conv). The layer sits at the front of the forward pass and was
@@ -421,8 +424,20 @@ class PLELayer(Module):
                 )
                 streams[:, t0:t1].add_(delta)
                 cs = conv_stream[:, :, -self.conv_state_len:].contiguous()
+                self._fill_taps(taps, conv_stream, t0, t1)
             return None, conv_stream
-        return self.forward_streams_reference(streams, emb, params, conv_state)
+        delta, conv_stream = self.forward_streams_reference(streams, emb, params, conv_state)
+        self._fill_taps(taps, conv_stream, 0, seq)
+        return delta, conv_stream
+
+    def _fill_taps(self, taps, conv_stream, t0, t1):
+        # conv_stream holds the full-stream columns [t0, t1 + conv_state_len)
+        if not taps:
+            return
+        win = self.conv_state_len
+        for r in taps:
+            if t0 <= r <= t1 and taps[r] is None:
+                taps[r] = conv_stream[0, :, r - t0:r - t0 + win]
 
     def _streams_chain_hip(self, streams, key, value, conv_state):
         """ple_fn/ple_hip.hip chain; None when the shapes/dtypes are not the proved ones (caller keeps the torch chain)."""
@@ -563,7 +578,14 @@ class PLELayer(Module):
         if rsl is not None:
             conv_state, id_state = rsl.get_state_tensors()
             cs = torch.stack([conv_state[s, :, :win] for s in slots]).to(x.device)
-            delta, conv_stream = self.forward_streams(x, history, params, conv_state = cs)
+            # EXL3_PF_NO_TAIL: the state after row r of this chunk (what stash() would hold if the forward had ended there) =
+            # conv columns [r, r + win) of the full conv stream and ids [r, r + ctx) of the history; the job stashes them
+            # (Job.stash_midchunk, 3-tuple form: pinned host copy + event)
+            rows = params.get("checkpoint_rows")
+            taps = None
+            if rows and params.get("midchunk_mode") == 2 and not save_history and bsz == 1 and len(slots) == 1:
+                taps = {r: None for r in rows if 0 < r < seq}
+            delta, conv_stream = self.forward_streams(x, history, params, conv_state = cs, taps = taps)
             for i, s in enumerate(slots):
                 if save_history:
                     w = min(conv_state.shape[-1], conv_stream.shape[-1])
@@ -573,18 +595,12 @@ class PLELayer(Module):
                 else:
                     conv_state[s, :, :win].copy_(conv_stream[i, :, -win:])
                     id_state[s, :ctx].copy_(history[i, -ctx:])
-            # EXL3_PF_NO_TAIL: the state after row r of this chunk (what stash() would hold if the forward had ended there) =
-            # conv columns [r, r + win) of the full conv stream and ids [r, r + ctx) of the history; the job stashes them
-            # (Job.stash_midchunk, 3-tuple form: pinned host copy + event)
-            rows = params.get("checkpoint_rows")
-            if rows and params.get("midchunk_mode") == 2 and not save_history and bsz == 1 and len(slots) == 1:
+            if taps:
                 saved = params.setdefault("midchunk_states", {})
                 layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-                for r in rows:
-                    if not 0 < r < seq:
-                        continue
+                for r, window in taps.items():
                     hs = torch.empty((conv_stream.shape[1], win), dtype = conv_stream.dtype, pin_memory = True)
-                    hs.copy_(conv_stream[0, :, r:r + win], non_blocking = True)
+                    hs.copy_(window, non_blocking = True)
                     ev = torch.cuda.Event()
                     ev.record()
                     saved.setdefault(r, {})[layer_instance] = (hs, history[0, r:r + ctx].clone(), ev)
