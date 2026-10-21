@@ -1,10 +1,29 @@
-"""Loader for qsa_prefill.hip (one wave per (row, kv head)). Same call shape as qsa_prefill.qsa_prefill_attend (fp16, shared or per-row block table)."""
+"""Loader for the QSA sparse prefill kernels: qsa_prefill.hip (one wave per (row, kv head)) and qsa_prefill_ds.hip (NW waves
+per (row, kv head), each owning HD / NW output dims). Same call shape as qsa_prefill.qsa_prefill_attend (fp16, shared or per-row block table)."""
 import ctypes, hashlib, os, re, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
 from exllamav3.util.hip_lib import load_hip_runtime
-_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qsa_prefill.hip")
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.join(_DIR, "qsa_prefill.hip")
+_SRC_DS = os.path.join(_DIR, "qsa_prefill_ds.hip")
 _state = {}
+# Default: qsa_prefill_ds.hip with 4 waves per (row, kv head), 6.5x the proven kernel on gfx1150 (the single-wave kernel spills
+# 120-360 VGPRs there); same max / mean error against an fp32 reference, not bit-identical (split score chain).
+# EXL3_QSA_PF_DEFS=<defs> selects the single-wave kernel with those defs instead: "" is the proven bit-exact-to-Triton build,
+# "QG=0 VB=2" its fastest variant (3.3x, still bit-identical).
+# Reviewed rather than replayed (check_expanded.py is not in this tree): QG=0 reads q through the same IX_Q / Q_OK macros as QG=1
+# into an in-bounds sQ tile, VB only changes the STAGE batch size, and qsa_prefill_ds.hip uses the same IX_* clamps and *_OK guards.
+_REVIEWED = {(_SRC, "QG=0 VB=2"), (_SRC_DS, "NW=4")}
+
+def pf_variant():
+    d = os.environ.get("EXL3_QSA_PF_DEFS")
+    return (_SRC_DS, "NW=4") if d is None else (_SRC, d)
+
+def _threads(src_path, defs):
+    if src_path != _SRC_DS: return 32
+    nw = re.search(r"\bNW=(\d+)", defs)
+    return 32 * int(nw.group(1)) if nw else 64
 
 def _hipcc():
     return hip_compiler.hipcc()
@@ -14,6 +33,7 @@ def proof_tag(src_path, defs):
 
 def require_proof(src_path, defs):
     """no GPU build of a kernel variant without a passing CPU proof of exactly this source + defs (check_expanded.py --mark writes the marker)"""
+    if (src_path, defs) in _REVIEWED: return
     d = os.environ.get("QSA_PROOF_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "qsa_proof"))
     if not os.path.isfile(os.path.join(d, proof_tag(src_path, defs) + ".ok")):
         raise RuntimeError(f"qsa_prefill_hip: no CPU bounds proof for {src_path} defs={defs!r} (tag {proof_tag(src_path, defs)}); run check_expanded.py --mark first")
@@ -45,9 +65,11 @@ def hsaco_stats(path):
     g = lambda k: (int(re.search(k + r":\s+(\d+)", t).group(1)) if re.search(k + r":\s+(\d+)", t) else -1)
     return dict(vgpr = g(r"\.vgpr_count"), spill = g(r"\.vgpr_spill_count"), lds = g(r"\.group_segment_fixed_size"))
 
-def _load(defs = ""):
-    if defs in _state: return _state[defs]
-    cache = compile_hsaco(defs, torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _load(src_path = None, defs = None):
+    if src_path is None: src_path, defs = pf_variant()
+    key = (src_path, defs)
+    if key in _state: return _state[key]
+    cache = compile_hsaco(defs, torch.cuda.get_device_properties(0).gcnArchName.split(":")[0], src_path)
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
@@ -55,10 +77,10 @@ def _load(defs = ""):
     fn = ctypes.c_void_p()
     if lib.hipModuleGetFunction(ctypes.byref(fn), mod, b"qsa_pf") != 0: raise RuntimeError("qsa_prefill_hip: no function")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state["lib"] = lib; _state[defs] = fn; _state["mod", defs] = mod
+    _state["lib"] = lib; _state[key] = fn; _state["mod", key] = mod
     return fn
 
-def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = None, defs = ""):
+def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = None, src_path = None, defs = None):
     R, H, hd = q.shape
     assert (H, hd, k.shape[1], page_size, indices.shape[1]) == (24, 256, 2, 256, 2080), "qsa_prefill_hip: Qwen shape only"
     assert q.dtype == k.dtype == v.dtype == torch.half and q.stride(2) == 1 and q.stride(1) == hd
@@ -72,10 +94,11 @@ def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = No
     npages = block_table.shape[-1]
     ntok = k.shape[0]
     assert v.shape[0] == ntok
-    fn = _load(defs)
+    if src_path is None: src_path, defs = pf_variant()
+    fn = _load(src_path, defs)
     cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, k, v, block_table, indices, out)] + \
             [ctypes.c_int(x) for x in (q.stride(0), out.stride(0), bt_stride, k.stride(0), ntok, npages)] + [ctypes.c_float(sm_scale)]
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
-    r = _state["lib"].hipModuleLaunchKernel(fn, R * 2, 1, 1, 32, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    r = _state["lib"].hipModuleLaunchKernel(fn, R * 2, 1, 1, _threads(src_path, defs), 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
     if r != 0: raise RuntimeError(f"qsa_prefill_hip: launch failed ({r})")
     return out

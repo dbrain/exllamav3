@@ -31,7 +31,7 @@
 #define GRR_J4 1
 #endif
 #ifndef GRR_R4_OLD_DOTS
-#define GRR_R4_OLD_DOTS 1
+#define GRR_R4_OLD_DOTS 0   // 1 (one-row-per-block dots for RT = 4) only pays with the weights in a 32 MB MALL (gfx1151); gfx1150's 2 MB L2 re-reads them 4x
 #endif
 #ifndef GRR_DOTS_UNROLL
 #define GRR_DOTS_UNROLL 1
