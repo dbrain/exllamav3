@@ -620,6 +620,11 @@ class DiskPageCache:
             return False
         tokens_bytes = tokens.contiguous().numpy().tobytes()
         size = len(PAGE_MAGIC) + _HEADER.size + 256 + len(tokens_bytes) + self.image_size
+        with self._lock:
+            if not self._make_room(size):
+                self.metrics["skipped_no_room"] = self.metrics.get("skipped_no_room", 0) + 1
+                return False
+            self.total_size += size         # reserved; corrected to the file size once written
         markers = None
         if self.tp_groups:
             # The ranks write straight into the file, so it has to exist before they are told; the dispatch
@@ -629,6 +634,8 @@ class DiskPageCache:
             try:
                 data_offset = self._create_page_file(tmp, phash, prev_hash, tokens_bytes)
             except OSError as e:
+                with self._lock:
+                    self.total_size -= size
                 self._write_failed("page", None, e)
                 return False
             markers = []
@@ -636,8 +643,6 @@ class DiskPageCache:
                 model.tp_dispatch_all(mp_disk_write, (slot, tmp, data_offset))
                 markers += [f"{tmp}.d{dev}" for dev in devices]
         with self._lock:
-            self._make_room(size)
-            self.total_size += size         # reserved; corrected to the file size once written
             self.pending_pages.add(phash)
             self._enqueue(("page", phash, prev_hash, tokens_bytes, slot, events, size, markers))
         return True
@@ -712,7 +717,9 @@ class DiskPageCache:
         top, sides = self._sides(stashed)
         size = stashed["checkpoint_size"] + 4096
         with self._lock:
-            self._make_room(size)
+            if not self._make_room(size):
+                self.metrics["skipped_no_room"] = self.metrics.get("skipped_no_room", 0) + 1
+                return False
             self.total_size += size
             self.pending_states[phash] = stashed
         try:
@@ -1015,18 +1022,21 @@ class DiskPageCache:
             self._cv.notify()
 
 
-    def _make_room(self, nbytes: int):
-        # Lock held by the caller: the writer thread inserts into the mirrors while this walks them
-        while self.total_size + nbytes > self.max_size and (self.pages or self.states):
-            self._evict_one()
+    def _make_room(self, nbytes: int) -> bool:
+        # Lock held by the caller: the writer thread inserts into the mirrors while this walks them. A checkpoint
+        # whose page is still live in another tier is in no eviction order, so this can run out of candidates
+        while self.total_size + nbytes > self.max_size:
+            if not self._evict_one():
+                return False
+        return True
 
 
-    def _evict_one(self):
+    def _evict_one(self) -> bool:
         while True:
             if not self._order or self._order_pops >= self._order_rebuild:
                 self._build_order()
                 if not self._order:
-                    return
+                    return False
             kind, phash = self._order.popleft()
             self._order_pops += 1
             if kind == "page" and phash in self.pages:
@@ -1034,11 +1044,11 @@ class DiskPageCache:
                 if phash in self.states:
                     self._drop("state", phash)
                 self.metrics["evictions"] += 1
-                return
+                return True
             if kind == "state" and phash in self.states:
                 self._drop("state", phash)
                 self.metrics["evictions"] += 1
-                return
+                return True
 
 
     def _drop(self, kind: str, phash: bytes):

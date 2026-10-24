@@ -51,6 +51,11 @@ def make_generator(jobs, shared_chunk_size = 2048, prefill_cooldown = 0):
     g.prefill_cooldown = prefill_cooldown
     g.prefill_cooldown_left = 0
     g.prefill_rotation = 0
+    g.deferred_jobs = []
+    g.score_jobs = []
+    g.spec_gate = None
+    g.model = None
+    g.disk_cache_write_interval = 0
     g.iterate_start_jobs = lambda results: None
     def generate(results, draft_tokens = None):
         counts.gen += 1
@@ -156,6 +161,8 @@ def make_job(kv_position, prompt_len, last_checkpoint = None, cached_pages = 0, 
         ),
         last_recurrent_checkpoint_pos = last_checkpoint,
         cached_pages = cached_pages,
+        roll_ckpt = False,
+        ckpt_interval_pp = 0,
     )
 
 
@@ -189,3 +196,13 @@ def test_checkpoint_rule_uses_the_generation_interval_near_the_end_of_the_prompt
     assert not Job.is_checkpoint_boundary(make_job(4096, 100000, last_checkpoint = 2048))
     # An explicit interval is a plain grid test
     assert Job.is_checkpoint_boundary(make_job(4096, prompt, last_checkpoint = 3840), override_interval = PAGE_SIZE)
+
+
+def test_checkpoint_probes_inside_a_chunk_use_the_grid_from_the_cached_prefix():
+    # Kyojin's big-chunk / mid-chunk paths list every boundary of one chunk before stashing any, so the anchor
+    # cannot advance between probes; measured from it, every page past the first interval would qualify
+    job = make_job(0, 200000, last_checkpoint = 0)
+    hits = [p for p in range(256, 3 * 32768 + 1, 256) if Job.is_checkpoint_boundary(job, pos = p)]
+    assert hits == [32768, 65536, 98304]
+    job = make_job(0, 200000, cached_pages = 2)
+    assert Job.is_checkpoint_boundary(job, pos = 512 + 32768) and not Job.is_checkpoint_boundary(job, pos = 32768)

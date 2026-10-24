@@ -612,3 +612,44 @@ def test_prune_keeps_the_last_checkpoint_of_each_chain(device, tmp_path):
     assert disk.has_state(phash(41))
     disk.close()
     tier.close()
+
+
+def _returns_within(fn, seconds = 10):
+    import threading
+    result = []
+    t = threading.Thread(target = lambda: result.append(fn()), daemon = True)
+    t.start()
+    t.join(seconds)
+    assert not t.is_alive(), "write did not return: eviction found nothing to evict and kept looking"
+    return result[0]
+
+
+@pytest.mark.parametrize("second_write", ["page", "state"])
+def test_a_budget_held_by_a_sibling_does_not_hang_writes(device, tmp_path, second_write):
+    # A version bump opens a new fingerprint directory while the old one is still in use (so not reclaimable):
+    # this directory's share is then 0. A checkpoint whose page is evicted from disk but still lives in the
+    # CPU tier is in no eviction order, so making room for the next write must give up instead of spinning
+    tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
+    for tag in range(1, 5):
+        tier_a.store(page(tag, tag), serial = tag)
+    disk_a.flush(); disk_a.close(); tier_a.close()
+    size_a = DiskPageCache._dir_size(disk_a.dir)
+    tier, disk, _ = build(8, device, tmp_path, disk_size = size_a, fingerprint = "bbbb")
+    assert disk.max_size == 0
+    disk.max_size = 1 << 30
+    tier.store(page(11, 1), serial = 11)
+    disk.flush()
+    assert disk.write_state(phash(11), {"position": 256, "checkpoint_size": 64, "x": torch.ones(8)})
+    disk.flush()
+    with disk._lock:
+        disk._drop("page", phash(11))
+    disk.flush()
+    assert phash(11) in tier and phash(11) not in disk.pages and phash(11) in disk.states
+    disk.max_size = 0
+    if second_write == "page":
+        assert not _returns_within(lambda: disk.write_page(phash(12), None, torch.zeros(PAGE_SIZE, dtype = torch.long), 0, []))
+    else:
+        assert not _returns_within(lambda: disk.write_state(phash(13), {"position": 512, "checkpoint_size": 64,
+                                                                        "x": torch.ones(8)}))
+    assert disk.total_size <= disk.max_size + DiskPageCache._dir_size(disk.states_dir)
+    disk.close(); tier.close()

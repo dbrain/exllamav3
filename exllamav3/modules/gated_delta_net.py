@@ -51,6 +51,17 @@ from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 from ..cache.recurrent import host_copy
 
+
+def _stash_copy(src: torch.Tensor, device: bool) -> torch.Tensor:
+    # A device copy is ~0.5 ms where the host round trip is ~15 ms on the x4 card, but it spends VRAM that a long
+    # prompt may need: on OOM, take the host path. Release needs no change, the host pool skips device tensors
+    if device:
+        try:
+            return src.clone()
+        except torch.OutOfMemoryError:
+            pass
+    return host_copy(src)
+
 # Fused KDA beta/g gate kernel (ROCm fused_elt_rocm.cu); read at import
 _FUSE_KDA_GATE = hasattr(ext, "kda_gate") and os.environ.get("EXL3_FUSE_KDA_GATE", "1") != "0"
 # Decode-graph KDA gate: keep dt_bias in fp32 (as prefill and the HF ForgetGate do) instead of a bf16
@@ -113,13 +124,14 @@ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, las
     _rewind_layers(layers, slot, last_history, num_tokens, spec_row, spec_shape, base_row, scratch_row)
 
 
-def mp_cache_recurrent_stash_gdn(local_context: dict, cache_id: int, cp_handle: int, slot: int, position: int, parity: int):
+def mp_cache_recurrent_stash_gdn(local_context: dict, cache_id: int, cp_handle: int, slot: int, position: int, parity: int,
+                                 device: bool = False):
     recurrent_modules = local_context["recurrent_modules"]
     recurrent_cache = local_context["recurrent_cache"]
     stashed = []
     for module in recurrent_modules:
         l = module.tp_recurrent_lookup[cache_id]
-        stashed.append(l.stash(slot, position, parity) if isinstance(l, GDNLayerState) else l.stash(slot, position))
+        stashed.append(l.stash(slot, position, parity, device) if isinstance(l, GDNLayerState) else l.stash(slot, position))
     recurrent_cache[cp_handle] = stashed
 
 
@@ -235,7 +247,7 @@ class GDNState:
         return 0
 
 
-    def stash(self, async_: bool = False, pin_pool: dict = None):
+    def stash(self, async_: bool = False, pin_pool: dict = None, device: bool = False):
         """async_ (EXL3_NC2_ASYNC_STASH, via RecurrentCache.stash_async only): non-blocking D2H into pinned host tensors on the
         current stream plus one event in stashed["_ev"]; the cache syncs it and moves the copies to pageable memory
         (RecurrentCache._finish, worker thread) before any reader sees the entry."""
@@ -256,12 +268,12 @@ class GDNState:
                 stashed["_ev"] = ev
                 return stashed
             for k, l in layers.items():
-                stashed[k] = l.stash(self.slot, self.position, self.parity) if isinstance(l, GDNLayerState) \
+                stashed[k] = l.stash(self.slot, self.position, self.parity, device) if isinstance(l, GDNLayerState) \
                     else l.stash(self.slot, self.position)
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash_gdn,
-                                             (id(self.cache), cp_handle, self.slot, self.position, self.parity))
+                                             (id(self.cache), cp_handle, self.slot, self.position, self.parity, device))
             stashed["tp_handle"] = cp_handle
         return stashed
 
@@ -499,12 +511,12 @@ class GDNLayerState:
         )
 
 
-    def stash(self, slot, position: int = 0, parity: int = 0):
+    def stash(self, slot, position: int = 0, parity: int = 0, device: bool = False):
         cdim = self.module.conv_kernel_size
         row = 2 * slot + parity
         return (
-            host_copy(self.recurrent_state[row : row + 1]),
-            host_copy(self.conv_state[slot, :, :cdim])
+            _stash_copy(self.recurrent_state[row : row + 1], device),
+            _stash_copy(self.conv_state[slot, :, :cdim], device)
         )
 
 

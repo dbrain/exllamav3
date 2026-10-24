@@ -10,6 +10,7 @@ except Exception:                                                    # noqa: BLE
 from ..model.model import Model
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
+from ..modules.gated_delta_net import GDNState
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
@@ -101,7 +102,7 @@ class Generator:
         max_batch_size: int = 256,
         max_chunk_size: int | None = None,
         shared_chunk_size: int | None = None,
-        prefill_cooldown: int = 4,
+        prefill_cooldown: int | None = None,
         max_q_size: int = 8,
         draft_model: Model | None = None,
         draft_cache: Cache | None = None,
@@ -353,6 +354,13 @@ class Generator:
         self.max_chunk_size = max_chunk_size
 
         # Prompt ingestion alongside generating jobs, see iterate()
+        # Env overrides for callers that predate these arguments (TabbyAPI passes neither). The old
+        # behaviour, full chunks on every iteration, is EXL3_SHARED_CHUNK_SIZE = max_chunk_size with
+        # EXL3_PREFILL_COOLDOWN = 0
+        if shared_chunk_size is None and os.environ.get("EXL3_SHARED_CHUNK_SIZE"):
+            shared_chunk_size = min(int(os.environ["EXL3_SHARED_CHUNK_SIZE"]), max_chunk_size)
+        if prefill_cooldown is None:
+            prefill_cooldown = int(os.environ.get("EXL3_PREFILL_COOLDOWN", "4"))
         if shared_chunk_size is None:
             shared_chunk_size = (max_chunk_size // 2 + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
         assert 0 < shared_chunk_size <= max_chunk_size and shared_chunk_size % PAGE_SIZE == 0, \
@@ -374,6 +382,8 @@ class Generator:
         # Off by default: decision states are mostly one-off, so their checkpoints and pages would only evict
         # chat state from the shared caches. Score jobs still read the shared caches either way
         self.score_cache = os.environ.get("EXL3_SYSTEMONE_CACHE", "0") == "1"
+        # A group's split-point stash lives in VRAM: it is restored once per question 2..N and freed with the group
+        self.score_group_device = os.environ.get("EXL3_SYSTEMONE_GROUP_DEVICE", "1") != "0"
         self.score_yielded = False
         self.deferred_jobs = []   # EXL3_REPLY_FIRST: finished jobs not yet released
 
@@ -2806,13 +2816,24 @@ class Generator:
             if (group is None or group.stash is not None or group.pending <= 1 or state is None or
                     seq.kv_position != group.split_at or not self.score_state_ok(seq, state)):
                 return
-            group.stash = state.stash()
+            group.stash = self.score_group_stash_state(state)
             group.anchor = job
             group.anchor_page = group.split_at // PAGE_SIZE
             job.score_keep_pages = True
         except Exception as e:
             print(f" ## Warning: score job {job.serial_number}: group stash failed ({e!r}); "
                   f"the other questions re-prefill from the last checkpoint")
+
+
+    def score_group_stash_state(self, state: PairedState) -> dict:
+        target = state.target
+        if not self.score_group_device or state.draft is not None or not isinstance(target, GDNState):
+            return state.stash()
+        return {
+            "position": state.position,
+            "checkpoint_size": state.checkpoint_size,
+            "target": target.stash(device = True),
+        }
 
 
     def score_finish(self, job, seq, logits, results: list):
