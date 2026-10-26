@@ -351,6 +351,7 @@ class Job:
         self.rq_prompt_tokens = rq_state.get("prompt_tokens")
         self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
+        self.sparse_head_seeded = False
         self.cached_pages = 0
         self.cached_tokens = 0
         self.is_finished = False
@@ -1809,7 +1810,8 @@ class Job:
                         params["checkpoint_rows"] = rows
                         # 1: split conv + KDA core (reference), 2: in-kernel S side-write + async D2H (the only GDN mode)
                         params["midchunk_mode"] = 2 if gdn_nt else int(os.environ["EXL3_MIDCHUNK_CKPT"])
-                if self.generator.mtp_draft:
+                dm = self.generator.draft_model
+                if self.generator.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache")):
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.
                     params["last_tokens_only"] = 1
@@ -1822,6 +1824,8 @@ class Job:
                     self.generator.model.forward(input_ids = prefill_ids, params = params)
                     _ttrace_end(f"target fwd rows={prefill_ids.shape[-1]} start={prefill_start}", _tt)
                 else:
+                    # (A drafter fed the last decoder layer's output takes the regular prefill, which runs
+                    # through that layer)
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
                 if self.generator.dflash_draft:

@@ -6,23 +6,12 @@ import numpy as np
 from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
+from .quant.exl3_lib.hessian_packed import accumulate_, packed_numel
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util.pinned_arena import PinnedArena
-import os
-import time as _time
-
-# EXL3_QUANT_PROFILE=1: host-wall accumulator for capture_H, printed per module by
-# convert_model (stage=capture_split). Wall time includes any device-sync stall that
-# happens inside the call; the counters themselves add no syncs or allocations.
-_CAP_PROFILE = os.environ.get("EXL3_QUANT_PROFILE") == "1"
-CAP_STAT = {"wall": 0.0, "calls": 0}
-FLUSH_STAT = {"wall": 0.0, "calls": 0}
-# EXL3_CAPTURE_LEGACY=1 restores the pre-batch path (per-call host sync on the finiteness
-# check, per-call fp32 copy, immediate addmm_). Default is the deferred batched flush.
-_CAP_LEGACY = os.environ.get("EXL3_CAPTURE_LEGACY") == "1"
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -117,6 +106,9 @@ class Linear(Module):
         self.qgroup = qgroup or key
         self.lora_a_tensors = {}
         self.lora_b_tensors = {}
+        # Optional frequency-selected column subset for drafting (see modules/sparse_head.py); the
+        # regular forward never consults it
+        self.sparse_head = None
 
         # in_features_unpadded < in_features is handled at runtime: inputs narrower than the
         # (padded) weight are zero-extended in forward(). allow_input_padding marks layers whose
@@ -542,11 +534,21 @@ class Linear(Module):
             self.inner.unload()
         self.device = None
         self.inner = None
+        self.sparse_head = None
         self.lora_a_tensors.clear()
         self.lora_b_tensors.clear()
 
 
     @override
+    def make_sparse_head(self, capacity: int, vocab_size: int | None = None, **kwargs):
+        """Attach a SparseHead mirroring this layer's columns (requires a loaded inner with column extraction)"""
+        from .sparse_head import SparseHead
+        assert self.inner is not None and hasattr(self.inner, "reconstruct_columns"), \
+            f"{self.key}: sparse head needs a loaded EXL3 or fp16 layer"
+        self.sparse_head = SparseHead(self, capacity, vocab_size or self.out_features_unpadded, **kwargs)
+        return self.sparse_head
+
+
     def get_tensors(self):
         if self.device:
             return self.inner.get_tensors(self.key)
@@ -611,8 +613,13 @@ class Linear(Module):
 
 
     def init_H_data(self, init_tensor: bool):
+        # The capture accumulates into the block-packed upper triangle (hessian_packed); the full matrix is
+        # reconstructed when the tensor is finalized. The uncalibrated placeholder stays a meta (in, in) matrix
         return {
-            "H": torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = self.device if init_tensor else "meta"),
+            "H": torch.zeros(packed_numel(self.in_features), dtype = torch.float32, device = self.device) if init_tensor else
+                 torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = "meta"),
+            "packed": init_tensor,
+            "n": self.in_features,
             "first_key": self.key,
             "count": 0,
             "finalized": False,
@@ -623,7 +630,6 @@ class Linear(Module):
 
 
     def capture_H(self, x: torch.Tensor, params: dict):
-        _cap_t0 = _time.perf_counter() if _CAP_PROFILE else None
         if self.qmap not in params["capture"]:
             params["capture"][self.qmap] = self.init_H_data(True)
 
@@ -631,38 +637,20 @@ class Linear(Module):
         ext.count_inf_nan(x, params["capture"][self.qmap]["inf_nan"])
 
         if params["capture"][self.qmap]["first_key"] == self.key:
-            if _CAP_LEGACY:
-                rows = np.prod(x.shape[:-1])
-                dim = x.shape[-1]
-                x = x.view((rows, dim)).to(torch.float, copy = True)  # TODO: Why copy here?
+            rows = np.prod(x.shape[:-1])
+            dim = x.shape[-1]
+            x = x.reshape((rows, dim))
 
-                # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
-                # accumulation, and no diagonal damping can repair non-finite entries afterwards.
-                # Drop the affected rows; the inf_nan counter above still reports them
-                finite = torch.isfinite(x).all(dim = 1)
-                if not finite.all():
-                    x = x[finite]
-                    rows = x.shape[0]
+            # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
+            # accumulation, and no diagonal damping can repair non-finite entries afterwards.
+            # Drop the affected rows; the inf_nan counter above still reports them
+            finite = torch.isfinite(x).all(dim = 1)
+            if not finite.all():
+                x = x[finite]
+                rows = x.shape[0]
 
-                params["capture"][self.qmap]["H"].addmm_(x.T, x)
-                params["capture"][self.qmap]["count"] += rows
-            else:
-                # Defer: queue the (viewed, uncast) activation and let flush_capture_H()
-                # filter non-finite rows device-side (zero-fill, no host sync) and
-                # accumulate this forward's entries through batched GEMMs. The finite-row
-                # count becomes a device scalar resolved once at finalize time.
-                rows = int(np.prod(x.shape[:-1]))
-                dim = x.shape[-1]
-                x = x.view((rows, dim))
-                pend = params.get("_cap_pending")
-                if pend is None:
-                    pend = []
-                    params["_cap_pending"] = pend
-                pend.append((params["capture"][self.qmap], x))
-
-        if _cap_t0 is not None:
-            CAP_STAT["wall"] += _time.perf_counter() - _cap_t0
-            CAP_STAT["calls"] += 1
+            accumulate_(params["capture"][self.qmap]["H"], x)
+            params["capture"][self.qmap]["count"] += rows
 
 
     @override
@@ -690,7 +678,11 @@ class Linear(Module):
             x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))
 
         if self.qmap and "capture" in params:
-            self.capture_H(x, params)
+            # A capture split into passes (convert_model.capture_passes) names the qmaps of the
+            # current pass; everything else runs without accumulating
+            pass_qmaps = params.get("capture_qmaps")
+            if pass_qmaps is None or self.qmap in pass_qmaps:
+                self.capture_H(x, params)
 
         if self.lora_a_tensors:
             lora_input = x
@@ -900,52 +892,6 @@ class Linear(Module):
         assert unit == "channels"
         split = (True, first, last) if first is not None else None
         return Linear.tp_import_split(local_context, exported, plan, split)
-
-
-def flush_capture_H(params: dict):
-    """Consume the activations queued by capture_H() for one forward pass.
-
-    Grouped by (rows, dim, dtype): every entry goes through one fp32 bmm per chunk, then a
-    single add_ into its own H. Non-finite rows are zero-filled on the device instead of
-    being dropped behind a host sync (their contribution to H is exactly zero, and the
-    finite-row count is accumulated into each entry's count_dev scalar), so H matches the
-    legacy per-call addmm_ path to fp32 rounding (batched vs. sequential accumulation
-    order) while the forward loop runs sync-free.
-    """
-    _t0 = _time.perf_counter() if _CAP_PROFILE else None
-    pending = params.pop("_cap_pending", None)
-    if not pending:
-        return
-    shape_groups: dict = {}
-    order = []
-    for hd, x in pending:
-        key = (x.shape, x.dtype, x.device)
-        if key not in shape_groups:
-            shape_groups[key] = []
-            order.append(key)
-        shape_groups[key].append((hd, x))
-    for key in order:
-        entries = shape_groups[key]
-        # Chunk to bound the transient fp32 stack (b x rows x dim) + bmm output
-        for s in range(0, len(entries), 64):
-            chunk = entries[s:s + 64]
-            xs = torch.stack([e[1] for e in chunk])
-            xf = xs.to(torch.float)
-            finite = torch.isfinite(xf).all(dim = 2)
-            xf = xf.masked_fill_(~finite.unsqueeze(2), 0.0)
-            P = torch.bmm(xf.transpose(1, 2), xf)
-            fs = finite.sum(dim = 1)
-            for j, (hd, _x) in enumerate(chunk):
-                hd["H"].add_(P[j])
-                cd = hd.get("count_dev")
-                if cd is None:
-                    cd = torch.zeros((), dtype = torch.long, device = hd["H"].device)
-                    hd["count_dev"] = cd
-                cd.add_(fs[j])
-            xs = xf = P = fs = None
-    if _t0 is not None:
-        FLUSH_STAT["wall"] += _time.perf_counter() - _t0
-        FLUSH_STAT["calls"] += 1
 
 
 def convert_exl3_group(

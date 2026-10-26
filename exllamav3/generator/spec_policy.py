@@ -399,7 +399,7 @@ def install_lookup(g, ngram, stats=None):
         st["n"] = n
         if not gate or st["ng"] >= st["dr"] or st["skip"] >= PROBE: return True
         return False
-    def wrapped(results):
+    def wrapped(results, window):
         cont = None; sid = None
         if len(g.active_jobs) == 1 and g.active_jobs[0].is_prefill_done() and len(g.active_jobs[0].sequences) == 1:
             sid = g.active_jobs[0].sequences[0].sequence_ids
@@ -416,11 +416,9 @@ def install_lookup(g, ngram, stats=None):
         if cont is None:
             if sid is not None:
                 st["kind"] = "dr"; st["skip"] += 1
-            return orig(results)
+            return orig(results, window)
         st["kind"] = "ng"; st["skip"] = 0
-        w = g.num_draft_tokens; g.num_draft_tokens = 1
-        try: out = orig(results)
-        finally: g.num_draft_tokens = w
+        out = orig(results, 1)
         # the verified tokens are the copy, not the drafter's: its confidence record (one column) must not label them
         g._draft_conf_round = None
         if out is None: return None
@@ -595,7 +593,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
                 st["stop"] = True; st["keep"] = st["i"]
         return ids
     win = log_depth if log is not None else (fixed if fixed is not None else maxd)
-    def wrapped(results):
+    def wrapped(results, window):
         st.update(i=0, stop=False, keep=None, mode="mtp", ps=[])
         job = next((j for j in g.active_jobs if j.is_prefill_done()), None)
         cont = None
@@ -628,21 +626,18 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
                         cont = c[:a] if a >= ngram[3] else None
                         if stats is not None: stats["ng_cut" if cont else "ng_skip"] = stats.get("ng_cut" if cont else "ng_skip", 0) + 1
         if cont is not None:
-            st["mode"] = "ng"; g.num_draft_tokens = 1
-            try: out = orig_draft(results)
-            finally: g.num_draft_tokens = win
+            st["mode"] = "ng"
+            out = orig_draft(results, 1)
             if out is None: return None
             if log is not None: log.append({"n": n, "ng": True, "cont": list(cont)})
             if stats is not None: stats["ng"] = stats.get("ng", 0) + 1; stats["rows"] = stats.get("rows", 0) + 1 + len(cont)
             return torch.tensor([cont], dtype=torch.long)
-        w = rule.choose() if hasattr(rule, "choose") else win
-        g.num_draft_tokens = w
+        # g.num_draft_tokens stays at the deepest window: Job.prepare / reply_room reserve against it
+        w = min(rule.choose() if hasattr(rule, "choose") else win, window)
         try:
-            out = orig_draft(results)
+            out = orig_draft(results, w)
         except StopDraft:
             out = g.draft_ids_pinned[:, :st["keep"]]
-        finally:
-            g.num_draft_tokens = win      # Job.prepare / reply_room reserve against this value: keep it at the deepest window
         if out is None: return None
         if fixed is not None:
             ps = torch.stack(st["ps"]).tolist()      # the one host read of the round

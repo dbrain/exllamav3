@@ -412,21 +412,37 @@ class Model(Model_TPMixin, Model_LSMixin):
                 params["draft_conf"] = conf
             return ids
         lm = self.modules[self.logit_layer_idx]
-        logits = lm.prepare_for_device(state, params)
-        lead = logits.shape[:-1]
+        x = lm.prepare_for_device(state, params)
+        lead = x.shape[:-1]
         if draft2s and lead.numel() == 1 and os.environ.get("EXL3_DRAFT2S") and not params.get("export_draft_logits"):
             from ..modules import draft2s as d2s_mod
             d2s = d2s_mod.head_for(lm, self.config.vocab_size)
             if d2s is not None:
-                ids, p, conf = d2s(logits)
+                ids, p, conf = d2s(x)
                 params["draft_p"] = p.clone()
                 if export:
                     params["draft_conf"] = conf.clone().view(lead)
                 return ids.clone().view(lead)
-        logits = lm.forward(logits, params)
+        # Draft-only sparse subset of the vocabulary, selected by the caller through params so the
+        # verification forward can never take it
+        sh = lm.sparse_head
+        flag = params.get("sparse_head") if sh is not None else None
+        if flag is True and sh.ready:
+            ids, conf, emb = sh.argmax(x, embedding = True)
+            if export:
+                params["draft_conf"] = conf
+            if emb is not None:
+                params["draft_embedding"] = emb
+            return ids
+        logits = lm.forward(x, params)
         logits = logits[..., :self.config.vocab_size]
         if params.get("export_draft_logits"):
             params["draft_logits"] = logits
+        if flag == "probe":
+            # Probe round: full head answers, the sparse pick is recorded alongside for the drift statistics
+            full_ids = torch.argmax(logits, dim = -1)
+            sparse_ids, _ = sh.argmax(x)
+            sh.record_probe(full_ids, sparse_ids)
         if export:
             conf, ids = torch.max(logits, dim = -1)
             params["draft_conf"] = conf
@@ -493,6 +509,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         max_batch_size: int = 1,
         tp_options: dict | None = None,
         autosplit_no_forward: bool = False,
+        draft_model: Model | None = None,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -582,6 +599,11 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param autosplit_no_forward:
             For debug purposes, skip reference forward pass during autosplit load.
+
+        :param draft_model:
+            (optional, autosplit only) Draft model that will verify against this model, loaded first. When it
+            taps hidden states of this model (DFlash), the copies of the tapped layers' states stay resident on
+            their devices for the whole forward, and the split budgets for them.
         """
 
         # The pass is there to hand back VRAM held by garbage from an earlier model. With nothing
@@ -601,6 +623,15 @@ class Model(Model_TPMixin, Model_LSMixin):
             # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
             # shares the config but loads after the main model's worker has already started)
             self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
+
+            # CPU-offloaded experts: start the worker process now, so its own startup (the
+            # interpreter, torch, the checkpoint index) overlaps the first modules' loading
+            # instead of holding up the first offloaded layer. It idles if no layer ends up
+            # offloaded; unload shuts it down either way
+            ip = self.config.infer_params
+            if int(getattr(ip, "moe_cpu_split", 0) or 0) or int(getattr(ip, "moe_cpu_offload", 0) or 0):
+                from .moe_cpu_host import MoeCpuHost
+                MoeCpuHost.for_config(self.config)._spawn()
 
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."
@@ -670,6 +701,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                         max_batch_size,
                         self.cache_weakrefs,
                         autosplit_no_forward,
+                        draft_model.draft_verifier_params.get("export_state_layers") if draft_model else None,
                     )
                     self.output_device = self.modules[-1].device
 

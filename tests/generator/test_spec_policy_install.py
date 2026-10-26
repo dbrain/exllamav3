@@ -75,18 +75,18 @@ class Gen:
     def enqueue(self, job):
         return None
 
-    def iterate_draftmodel_mtp_gen(self, results):
-        for idx in range(self.num_draft_tokens):
+    def iterate_draftmodel_mtp_gen(self, results, window):
+        for idx in range(window):
             state = self.draft_model.forward(None, {})
             self.model.modules[0].forward(state)
             self.draft_ids_pinned[:1, idx:idx + 1].copy_(self.draft_model.sample_from_state(state, {}))
-        return self.draft_ids_pinned[:, :self.num_draft_tokens]
+        return self.draft_ids_pinned[:, :window]
 
 
 def draft(ids, ps, **kw):
     g = Gen(ids, ps, **kw)
     uninstall = sp.install_draft_policy(g)
-    return g.iterate_draftmodel_mtp_gen([]), g, uninstall
+    return g.iterate_draftmodel_mtp_gen([], g.num_draft_tokens), g, uninstall
 
 
 ROW = list(range(1, 21))
@@ -129,7 +129,7 @@ def test_uninstall_restores_the_generator():
     uninstall = sp.install_draft_policy(g)
     uninstall()
     assert "iterate_draftmodel_mtp_gen" not in g.__dict__ and "enqueue" not in g.__dict__
-    assert g.iterate_draftmodel_mtp_gen([]).shape[-1] == 7
+    assert g.iterate_draftmodel_mtp_gen([], g.num_draft_tokens).shape[-1] == 7
 
 
 @pytest.mark.parametrize("attr, value", [("dynamic_draft", True), ("mtp_draft", False)])
@@ -144,12 +144,12 @@ def test_refuses_generators_it_cannot_drive(attr, value):
 def test_reinstall_on_a_new_generator_over_the_same_models(uninstall_old_after):
     old = Gen([1, 2, 3], [0.5, 0.4])
     uninstall_old = sp.install_draft_policy(old)
-    assert old.iterate_draftmodel_mtp_gen([]).shape[-1] == 1
+    assert old.iterate_draftmodel_mtp_gen([], old.num_draft_tokens).shape[-1] == 1
     new = Gen([1, 2, 3], [])
     new.draft_model, new.model = old.draft_model, old.model
     old.draft_model.ps, old.draft_model.k = [0.95, 0.95, 0.95, 0.9] + [0.5] * 4, 0
     sp.install_draft_policy(new)
     if uninstall_old_after:
         uninstall_old()
-    assert new.iterate_draftmodel_mtp_gen([]).tolist() == [[100, 101, 102]]
+    assert new.iterate_draftmodel_mtp_gen([], new.num_draft_tokens).tolist() == [[100, 101, 102]]
     assert old.draft_model.forwards == 1 + 3

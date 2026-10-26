@@ -143,7 +143,7 @@ class TransformerBlock(Module):
         )
 
     def _forward_mlp(self, x: torch.Tensor, y_resid: torch.Tensor | None, params: dict,
-                     hc_pending = None, hc_defer: bool = False) -> torch.Tensor:
+                     hc_pending = None, hc_defer: bool = False, resid_defer: bool = False) -> torch.Tensor:
         """MLP half of forward (norm, MLP, residual/hc apply). `y_resid` is a pending attention
         output whose residual add is folded into the MLP input norm. Returns the new residual."""
         if self.mlp:
@@ -214,6 +214,8 @@ class TransformerBlock(Module):
                 self.mlp_post_norm.forward(y, params, residual = x)
             elif params.pop("mlp_residual_done", False):
                 pass
+            elif resid_defer:
+                params["resid_pending"] = y
             else:
                 x += y
         return x
@@ -237,7 +239,7 @@ class TransformerBlock(Module):
         # EXL3_PF_HC_FUSE: a residual apply deferred by the previous block (prefill only, so
         # never combined with the decode block graph)
         hc_pending = params.pop("hc_pending", None)
-        if hc_pending is None:
+        if hc_pending is None and "resid_pending" not in params:
             from .block_graph import maybe_graph_forward
             y_graph = maybe_graph_forward(self, x, params)
             if y_graph is not None:
@@ -253,6 +255,16 @@ class TransformerBlock(Module):
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
         mlp_pending = None
 
+        # Previous block's MLP output whose residual add is folded into this block's input norm (forward_ls sets
+        # resid_defer when the next module is a TransformerBlock on the same device)
+        pending = params.pop("resid_pending", None)
+        fuse_in = (
+            pending is not None and self.attn is not None and not self.attn_hc and
+            isinstance(self.attn_norm, RMSNorm) and self.attn_norm.can_fuse_residual(x, pending)
+        )
+        if pending is not None and not fuse_in:
+            x += pending
+
         if self.attn:
             if self.attn_hc:
                 params["hc_pad_ok"] = True          # the attention site accepts a row-padded block input
@@ -263,6 +275,8 @@ class TransformerBlock(Module):
                 y = y.half()
                 if self.attn_norm and not normed:
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+            elif fuse_in:
+                y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x)
             elif self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
@@ -309,7 +323,11 @@ class TransformerBlock(Module):
             else:
                 x += y
 
-        x = self._forward_mlp(x, y_resid, params, mlp_pending, hc_defer)
+        resid_defer = (
+            bool(params.get("resid_defer")) and not export_state and self.layer_scalar_f is None and
+            (out_dtype or self.out_dtype) in (None, x.dtype)
+        )
+        x = self._forward_mlp(x, y_resid, params, mlp_pending, hc_defer, resid_defer)
 
         if export_state:
             s = params.get("export_states")

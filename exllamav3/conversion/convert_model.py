@@ -5,10 +5,10 @@ import time
 import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear, Embedding
-from ..modules.linear import flush_capture_H as _flush_capture_H
 from ..modules.linear import convert_exl3_group
 from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers, set_worker_stream, worker_stream
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
+from ..modules.quant.exl3_lib.hessian_packed import packed_numel
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
@@ -946,6 +946,103 @@ def run_row_workers(title, num_rows, workers, progress_count):
         raise errors[0]
 
 
+def capture_passes(module, devices, headroom_min = 1536 << 20, headroom_frac = 0.06):
+    """
+    Split a module's Hessian capture into passes whose block-packed fp32 Hessians fit beside the loaded weights on
+    every device: a block-sparse layer captures one Hessian per expert down projection, which for hundreds of wide
+    experts is several times the weights. Returns one qmap set per pass, or [None] for a single
+    unrestricted pass. Measured after the module (and its replicas) are loaded; the headroom covers the
+    activations of the forward pass and the allocator's rounding of the Hessians.
+    """
+    sizes = {}
+    for m in module:
+        if isinstance(m, Linear) and m.qmap and m.qmap not in sizes:
+            sizes[m.qmap] = packed_numel(m.in_features) * 4
+    total = sum(sizes.values())
+    budget = None
+    for dev in devices:
+        d = torch.device(dev)
+        if d.type != "cuda":
+            continue
+        free, capacity = torch.cuda.mem_get_info(d)
+        b = free - max(headroom_min, int(capacity * headroom_frac))
+        budget = b if budget is None else min(budget, b)
+    if budget is None or total <= budget:
+        return [None]
+    budget = max(budget, max(sizes.values()))
+    passes, current, current_bytes = [], set(), 0
+    for qmap, nbytes in sizes.items():
+        if current and current_bytes + nbytes > budget:
+            passes.append(current)
+            current, current_bytes = set(), 0
+        current.add(qmap)
+        current_bytes += nbytes
+    if current:
+        passes.append(current)
+    print(f" -- Capturing in {len(passes)} passes: {total / 2**30:.1f} GB of Hessians, {budget / 2**30:.1f} GB free")
+    return passes
+
+
+def capture_module_serial(
+    model,
+    module,
+    state,
+    original_input_ids,
+    get_preserve,
+    put_preserve,
+    slicing,
+    current_slice,
+    title,
+    bad_rows,
+    capture_qmaps = None,
+    ref_pass = True,
+):
+    """Single-device Hessian capture over all calibration rows; see capture_module_parallel"""
+    capture_H = {}
+    capture_sens = {}
+    ref_states = {}
+    with ProgressBar(title, len(state)) as progress:
+        for i in range(len(state)):
+            progress.update(i)
+            if i in bad_rows:
+                continue
+            params = {
+                "attn_mode": "flash_attn_nc",
+                "capture": capture_H,
+                "capture_sens": capture_sens,
+                "activate_all_experts": model.calibration_all_experts,
+                "input_ids": original_input_ids[i],
+            }
+            if capture_qmaps is not None:
+                params["capture_qmaps"] = capture_qmaps
+            if slicing:
+                 params["q_mlp_slice"] = current_slice
+            get_preserve(i, params)
+            rs = module.prepare_for_device(state[i], params)
+            rs = module.forward(rs, params)
+            put_preserve(i, params)
+            if ref_pass and i < num_ref_states:
+                if model.calibration_all_experts:
+                    # Do not activate all experts for reference state, for error measurement
+                    params = {
+                        "attn_mode": "flash_attn_nc",
+                        "input_ids": original_input_ids[i],
+                    }
+                    if slicing:
+                        params["q_mlp_slice"] = current_slice
+                    get_preserve(i, params)
+                    rs = module.prepare_for_device(state[i], params)
+                    rs = module.forward(rs, params)
+                    put_preserve(i, params)
+                if torch.isfinite(rs).all().item():
+                    ref_states[i] = rs.cpu()
+                else:
+                    bad_rows.add(i)
+                    print(f" !! Non-finite reference state in calibration row {i}, excluding row")
+            rs = None
+    return capture_H, capture_sens, ref_states
+
+
 def capture_module_parallel(
     model,
     modules,
@@ -959,12 +1056,15 @@ def capture_module_parallel(
     current_slice,
     title,
     bad_rows,
+    capture_qmaps = None,
+    ref_pass = True,
 ):
     """
     Run the Hessian-capture forward pass with calibration rows split across devices, each device forwarding its
     shard through its own replica of the module. Per-device capture dicts are merged by summing H (the proxy is
     a plain sum over token batches), counts and inf/nan counters onto the primary device. The output sensitivity
-    accumulators of the gated MLPs merge the same way.
+    accumulators of the gated MLPs merge the same way. capture_qmaps limits the pass to a subset of the module's
+    Hessians (see capture_passes); the reference states are collected on the first pass only.
     """
     shards = calibration_row_shards(len(state), devices, device_ratios)
     captures = [{} for _ in modules]
@@ -990,14 +1090,15 @@ def capture_module_parallel(
                     "activate_all_experts": model.calibration_all_experts,
                     "input_ids": original_input_ids[i],
                 }
+                if capture_qmaps is not None:
+                    params["capture_qmaps"] = capture_qmaps
                 if slicing:
                     params["q_mlp_slice"] = current_slice
                 get_preserve(i, params)
                 rs = module.prepare_for_device(state[i], params)
                 rs = module.forward(rs, params)
-                _flush_capture_H(params)
                 put_preserve(i, params)
-                if i < num_ref_states:
+                if ref_pass and i < num_ref_states:
                     if model.calibration_all_experts:
                         # Do not activate all experts for reference state, for error measurement
                         params = {
@@ -1041,11 +1142,6 @@ def capture_module_parallel(
                 m = capture_H[qmap]
                 m["H"] += hd["H"].to(device)
                 m["count"] += hd["count"]
-                if "count_dev" in hd:
-                    if "count_dev" in m:
-                        m["count_dev"] += hd["count_dev"].to(m["count_dev"].device)
-                    else:
-                        m["count_dev"] = hd["count_dev"].to(torch.device(m["device"]))
                 m["num_total"] += hd["num_total"]
                 m["inf_nan"] += hd["inf_nan"].to(device)
         cap.clear()
@@ -1400,121 +1496,68 @@ def main(args, job_state):
                 # Capture calibration input states during forward pass. For block-sparse models, all expert layers
                 # are activated to ensure all down projections capture at least some calibration data. When the
                 # state is advanced later, only selected experts will be used.
-                capture_profile_start = None
-                cap_fwd_wall = 0.0
-                cap_ref_wall = 0.0
                 if state is not None:
-                    if os.environ.get("EXL3_QUANT_PROFILE") == "1":
-                        torch.cuda.synchronize()
-                        capture_profile_start = time.perf_counter()
                     capture_replicas = None
                     if parallel_calib and not module.caps.get("prefer_cpu"):
                         capture_replicas = load_parallel_calib_modules(
                             replica_models, idx, devices, current_slice if slicing else None)
+                    # Hessians that will not fit beside the weights are captured in passes, each
+                    # swapped to system RAM before the next (see capture_passes)
+                    free_mem()
+                    passes = capture_passes(module, devices if capture_replicas is not None else [module.device])
+                    capture_H = {}
+                    capture_sens = {}
+                    ref_states = {}
+                    for pass_idx, pass_qmaps in enumerate(passes):
+                        pass_str = f" (pass {pass_idx + 1}/{len(passes)})" if len(passes) > 1 else ""
+                        title = f" -- Capturing: {module.key}" + slice_str + pass_str
+                        if capture_replicas is not None:
+                            pass_H, pass_sens, pass_ref = capture_module_parallel(
+                                model,
+                                [module] + capture_replicas,
+                                devices,
+                                eff_ratios("calib"),
+                                state,
+                                original_input_ids,
+                                get_preserve,
+                                put_preserve,
+                                slicing,
+                                current_slice,
+                                title,
+                                bad_rows,
+                                pass_qmaps,
+                                pass_idx == 0,
+                            )
+                        else:
+                            pass_H, pass_sens, pass_ref = capture_module_serial(
+                                model,
+                                module,
+                                state,
+                                original_input_ids,
+                                get_preserve,
+                                put_preserve,
+                                slicing,
+                                current_slice,
+                                title,
+                                bad_rows,
+                                pass_qmaps,
+                                pass_idx == 0,
+                            )
+                        # Swap captured H to system RAM
+                        for k, v in pass_H.items():
+                            v["H_swap_device"] = v["H"].device
+                            v["H"] = v["H"].cpu()
+                        capture_H.update(pass_H)
+                        merge_out_sensitivity(capture_sens, pass_sens)
+                        ref_states.update(pass_ref)
+                        pass_H = pass_sens = pass_ref = None
+                        if len(passes) > 1:
+                            free_mem()
                     if capture_replicas is not None:
-                        capture_H, capture_sens, ref_states = capture_module_parallel(
-                            model,
-                            [module] + capture_replicas,
-                            devices,
-                            eff_ratios("calib"),
-                            state,
-                            original_input_ids,
-                            get_preserve,
-                            put_preserve,
-                            slicing,
-                            current_slice,
-                            f" -- Capturing: {module.key}" + slice_str,
-                            bad_rows,
-                        )
                         for rep in capture_replicas:
                             rep.unload()
                         free_mem()
-                    else:
-                        with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
-                            capture_H = {}
-                            capture_sens = {}
-                            ref_states = {}
-                            cap_fwd_wall = 0.0
-                            cap_ref_wall = 0.0
-                            prof_rows = int(os.environ.get("EXL3_PROF_ROWS", "0"))
-                            for i in range(len(state)):
-                                progress.update(i)
-                                if i in bad_rows:
-                                    continue
-                                params = {
-                                    "attn_mode": "flash_attn_nc",
-                                    "capture": capture_H,
-                                    "capture_sens": capture_sens,
-                                    "activate_all_experts": model.calibration_all_experts,
-                                    "input_ids": original_input_ids[i],
-                                }
-                                if slicing:
-                                     params["q_mlp_slice"] = current_slice
-                                _t0 = time.perf_counter()
-                                get_preserve(i, params)
-                                rs = module.prepare_for_device(state[i], params)
-                                if i < prof_rows:
-                                    from torch.profiler import profile as _tprofile, ProfilerActivity as _PA
-                                    with _tprofile(activities = [_PA.CPU, _PA.CUDA]) as _prof:
-                                        rs = module.forward(rs, params)
-                                    for _sk in ("self_device_time_total", "self_cuda_time_total"):
-                                        try:
-                                            _tbl = _prof.key_averages().table(sort_by = _sk, row_limit = 30)
-                                            break
-                                        except Exception:
-                                            _tbl = None
-                                    print(f" -- TORCH_PROF module={module.key} row={i}\n{_tbl}", flush = True)
-                                    del _prof
-                                else:
-                                    rs = module.forward(rs, params)
-                                put_preserve(i, params)
-                                cap_fwd_wall += time.perf_counter() - _t0
-                                _flush_capture_H(params)
-                                if i < num_ref_states:
-                                    _t1 = time.perf_counter()
-                                    if model.calibration_all_experts:
-                                        # Do not activate all experts for reference state, for error measurement
-                                        params = {
-                                            "attn_mode": "flash_attn_nc",
-                                            "input_ids": original_input_ids[i],
-                                        }
-                                        if slicing:
-                                            params["q_mlp_slice"] = current_slice
-                                        get_preserve(i, params)
-                                        rs = module.prepare_for_device(state[i], params)
-                                        rs = module.forward(rs, params)
-                                        put_preserve(i, params)
-                                    if torch.isfinite(rs).all().item():
-                                        ref_states[i] = rs.cpu()
-                                    else:
-                                        bad_rows.add(i)
-                                        print(f" !! Non-finite reference state in calibration row {i}, excluding row")
-                                    cap_ref_wall += time.perf_counter() - _t1
-                                rs = None
                     print(f" -- Captured: {module.key}" + slice_str, flush = True)
-                    if capture_profile_start is not None:
-                        for device_idx in devices:
-                            torch.cuda.synchronize(torch.device(device_idx))
-                        capture_elapsed = time.perf_counter() - capture_profile_start
-                        print(
-                            f" -- QUANT_PROFILE stage=hessian_capture module={module.key} "
-                            f"seconds={capture_elapsed:.6f} rows={len(state) - len(bad_rows)}",
-                            flush=True,
-                        )
-                        from ..modules import linear as _linear_mod
-                        print(
-                            f" -- QUANT_PROFILE stage=capture_split module={module.key} "
-                            f"prepare_fwd={cap_fwd_wall:.6f} ref={cap_ref_wall:.6f} "
-                            f"capture_H_wall={_linear_mod.CAP_STAT['wall']:.6f} "
-                            f"capture_H_calls={_linear_mod.CAP_STAT['calls']} "
-                            f"flush_wall={_linear_mod.FLUSH_STAT['wall']:.6f} "
-                            f"flush_calls={_linear_mod.FLUSH_STAT['calls']}",
-                            flush=True,
-                        )
-                        _linear_mod.CAP_STAT["wall"] = 0.0
-                        _linear_mod.CAP_STAT["calls"] = 0
-                        _linear_mod.FLUSH_STAT["wall"] = 0.0
-                        _linear_mod.FLUSH_STAT["calls"] = 0
 
                     # More feedback
                     if len(capture_H):
@@ -1530,11 +1573,6 @@ def main(args, job_state):
                         if infs or nans:
                             numel = v["num_total"]
                             print(f" !! Warning: {k} state has {infs:,} inf values and {nans:,} NaN values (out of {numel:,})")
-
-                    # Swap captured H to system RAM
-                    for k, v in capture_H.items():
-                        v["H_swap_device"] = v["H"].device
-                        v["H"] = v["H"].cpu()
 
             # Get submodules to quantize
             linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
