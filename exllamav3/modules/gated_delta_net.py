@@ -9,7 +9,7 @@ from ..ext import exllamav3_ext as ext
 from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
-from .quant.exl3 import row_pad_pitch as _row_pad_pitch
+from .quant.exl3 import row_pad_pitch as _row_pad_pitch, MAX_BSZN_GEMV_R as _MAX_GEMV_R
 
 _MIDCKPT_STREAM = None  # EXL3_MIDCHUNK_CKPT=2 side stream for the checkpoint D2H
 from ..cache import Cache
@@ -1221,7 +1221,7 @@ class GatedDeltaNet(Module):
         """Decode qkv + z in ONE exl3_dec launch (both Hadamard stages inside): batch 1, or the R-row verify
         launch (dflash_verify). Returns (qkv, z) with the Linears' shapes and dtype, or None to fall back."""
         rows = bsz * seqlen
-        if rows > 8 or x.dtype != torch.half or "capture" in params or "ovr" in params or not x.is_contiguous():
+        if rows > _MAX_GEMV_R or x.dtype != torch.half or "capture" in params or "ovr" in params or not x.is_contiguous():
             return None
         if rows > 1 and not (params.get("dflash_verify") and os.environ.get("EXL3_VERIFY_GEMV_R", "0") != "0"
                              and hasattr(ext, "exl3_dec_gemv_r_multi")):

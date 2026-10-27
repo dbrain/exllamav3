@@ -140,6 +140,8 @@ SPEED_ENV = {
     "EXL3_VERIFY_ROW_SPLIT": "2",
     "EXL3_MOE_R8": "1",
     "EXL3_GEMV_R_RM6": "1",
+    # 7..8 rows (4 sessions x 2 draft rows): one decode pass of the dense GEMV instead of two 4-row chunks, bit-identical. 0 = off.
+    "EXL3_GEMV_R_WIDE8": "1",
     # 14/10: sampled requests (temperature > 0) draw the MTP drafts from the drafter's own law and keep them with the exact
     # min(1, p / q) rule (exllamav3/generator/spec_sample.py): same output distribution, greedy untouched. One load, T 1 top_p
     # 0.95, 15 prompts x 3 seeds: prose +5.2 % decode, no measured change on chat / code / structured. 0 = argmax drafts.

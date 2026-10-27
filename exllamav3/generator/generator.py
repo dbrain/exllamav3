@@ -17,6 +17,21 @@ from ..util import cuda_sync_active
 from ..ext import exllamav3_ext as ext
 
 logger = logging.getLogger(__name__)
+_PADDED_VOCAB_LOGGED = set()
+
+
+def _log_padded_vocab(model_vocab: int, piece_count: int):
+    """One start-up line per process and vocabulary shape: the head is wider than the tokenizer's table."""
+    if (model_vocab, piece_count) in _PADDED_VOCAB_LOGGED:
+        return
+    _PADDED_VOCAB_LOGGED.add((model_vocab, piece_count))
+    logger.warning(
+        "vocabulary: the model head has %d columns but the tokenizer defines %d pieces; ids %d..%d are padding. "
+        "They are masked at sampling and in the drafters; a padding id that still got through decodes to empty text",
+        model_vocab, piece_count, piece_count, model_vocab - 1
+    )
+
+
 from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
@@ -291,6 +306,16 @@ class Generator:
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
+        # Padded head: the logits (and the embedding table) can be wider than the vocabulary the tokenizer defines, and the
+        # ids in between have no piece. CustomSampler masks them, the drafters are bounded to vocab_limit (_bound_draft_ids)
+        # and Job.receive_sample decodes an unknown id to empty text (note_unknown_token logs the first one)
+        self.vocab_limit = None
+        self._unknown_token_seen = False
+        piece_count = getattr(tokenizer, "actual_vocab_size", None)
+        if isinstance(piece_count, int) and 0 < piece_count < cfg.vocab_size:
+            self.vocab_limit = piece_count
+            _log_padded_vocab(cfg.vocab_size, piece_count)
+
         # Paging
         self.pagetable = PageTable(self, cache)
         # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
@@ -302,6 +327,8 @@ class Generator:
         # Draft model
         self.draft_model = draft_model
         self.draft_cache = draft_cache
+        if draft_model is not None:
+            draft_model.vocab_limit = self.vocab_limit    # read by the MTP heads (sample_from_state); None = whole head
         if draft_model:
             assert not ngram_match_min, \
                 "Cannot use both draft model and n-gram draft."
@@ -1406,6 +1433,8 @@ class Generator:
         reach = None
         for idx in range(window):
             batch_logits = self.draft_model.forward(input_ids = batch_ids, params = draft_params(idx))
+            if self.vocab_limit is not None:
+                batch_logits = batch_logits[..., :self.vocab_limit]    # the draft head's padding columns have no piece
             if cal is not None:
                 conf, new_ids = torch.max(batch_logits, dim = -1)
             else:
@@ -1483,6 +1512,31 @@ class Generator:
         for j in pend:
             self._flush_mtp_defer(j, with_tail = j.mtp_defer_plain)
         return False
+
+
+    def _bound_draft_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        """
+        Draft proposals come from a head as wide as the embedding table, whose last columns are padding (no piece in the
+        tokenizer). Such a draft can never be accepted, because the sampler never returns a padding id, and fed back to
+        the drafter it reads a meaningless embedding row. Replace it by id 0: the round verifies that position as a
+        rejection exactly as it would have, and accepted tokens do not change. The drafters that know vocab_limit already
+        search the bounded head, so this only guards the rest. No host sync.
+        """
+        if self.vocab_limit is None:
+            return ids
+        return torch.where(ids < self.vocab_limit, ids, torch.zeros_like(ids))
+
+
+    def note_unknown_token(self, token_id: int, piece_count: int):
+        """A sampled id without a piece reached Job.receive_sample. It decodes to empty text; the first one is logged."""
+        if self._unknown_token_seen:
+            return
+        self._unknown_token_seen = True
+        logger.error(
+            "sampled token id %d has no piece (the tokenizer defines %d, the model head has %d columns); decoded as empty "
+            "text. Logged once per generator",
+            token_id, piece_count, self.model.config.vocab_size
+        )
 
 
     def iterate_draftmodel_mtp_gen(self, results: list, window: int):
@@ -1612,6 +1666,7 @@ class Generator:
                         q = spec_sample.law(dl[0, -1, :], spec_prm)
                         spec_q.append(q)
                         new_ids = spec_sample.draw(q, spec_job.rng.random()).view(1, 1)
+                new_ids = self._bound_draft_ids(new_ids)
                 draft_cols.append(new_ids)
                 draft_emb = params.get("draft_embedding")
                 # Without a row from the sparse head, the next step looks the token up in the embedding table,
@@ -1800,7 +1855,7 @@ class Generator:
                 return None
             window = w_used
 
-        self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+        self.draft_ids_pinned[:batch_size, :window].copy_(self._bound_draft_ids(new_ids[:batch_size, :window]))
         return self.draft_ids_pinned[:, :window]
 
 

@@ -175,4 +175,4 @@ class Qwen4ExpMTPModel(Model):
         stack = to_device(state, mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
         # The target's head, TP-aware; exports draft confidence when the generator asks
-        return self.attached_model().lm_head_argmax(state, params, draft2s = True)
+        return self.attached_model().lm_head_argmax(state, params, draft2s = True, vocab_limit = getattr(self, "vocab_limit", None))

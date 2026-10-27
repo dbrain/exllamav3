@@ -391,7 +391,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     @torch.inference_mode
-    def lm_head_argmax(self, state: torch.Tensor, params: dict, draft2s: bool = False) -> torch.Tensor:
+    def lm_head_argmax(self, state: torch.Tensor, params: dict, draft2s: bool = False, vocab_limit: int | None = None) -> torch.Tensor:
         """
         Greedy token per position from a hidden state through this model's LM head, for drafters
         that borrow the target's head (MTP, DFlash). Works in both layer-split and tensor-parallel
@@ -402,7 +402,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         EXL3_DRAFT2S set, a single-row step goes through the two-stage draft head (modules/draft2s.py),
         whose max probability is exported as params["draft_p"].
         The vocabulary is cropped to the unpadded size in both modes, so a zero-initialized
-        padding column can never win.
+        padding column can never win; vocab_limit (the tokenizer's piece count) crops further.
         """
         export = bool(params.get("export_draft_conf"))
         if self.loaded_tp:
@@ -435,7 +435,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                 params["draft_embedding"] = emb
             return ids
         logits = lm.forward(x, params)
-        logits = logits[..., :self.config.vocab_size]
+        logits = logits[..., :min(self.config.vocab_size, vocab_limit or self.config.vocab_size)]
         if params.get("export_draft_logits"):
             params["draft_logits"] = logits
         if flag == "probe":

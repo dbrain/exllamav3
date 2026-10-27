@@ -619,6 +619,8 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # verify of 5..8 rows (deep draft tier of spec_policy.TierRule): row split, one-launch fused MoE, one-launch 6-row dense GEMV;
              # bit-identical per row, rows <= 4 untouched. 0 = off.
              ("EXL3_VERIFY_ROW_SPLIT", "2"), ("EXL3_MOE_R8", "1"), ("EXL3_GEMV_R_RM6", "1"),
+             # 7..8 rows (4 sessions x 2 draft rows): one decode pass of the dense GEMV instead of two 4-row chunks, bit-identical. 0 = off.
+             ("EXL3_GEMV_R_WIDE8", "1"),
              # Fidelity first: int8 mixer weights with group scales (fn 128 along H*D, up 64
              # along rank) and, when <model_dir>/hc_gs_sidecar.safetensors exists, its GPTQ-rounded codes (decoded-token KLD 0.0504 ->
              # 0.0455, plain decode +0.5-0.8 ms). A missing file means group scales with plain rounding. EXL3_GR_GS=0 = per-row scales.
