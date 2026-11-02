@@ -3,6 +3,7 @@ from typing_extensions import override
 import os
 import torch
 from ..util.tensor import to2
+from ..util.device_copy import to_device
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from .hyperconnections import HyperConnection, hc_flush
@@ -157,9 +158,12 @@ class TransformerBlock(Module):
                     hc_post, hc_comb, y, normed = self.mlp_hc.mix_norm(x, params, self.mlp_norm, hc_pending)
                 finally:
                     params.pop("hc_pad_ok", None)
-                y = y.half()
                 if self.mlp_norm and not normed:
+                    # Normalize from the collapse's own precision (fp32 on the carry path, see
+                    # HyperConnection.mix_norm) rather than a half copy of it
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
+                else:
+                    y = y.half()
             else:
                 params["residual"] = x
                 if y_resid is not None:
@@ -272,9 +276,12 @@ class TransformerBlock(Module):
                     hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm, hc_pending)
                 finally:
                     params.pop("hc_pad_ok", None)
-                y = y.half()
                 if self.attn_norm and not normed:
+                    # Normalize from the collapse's own precision (fp32 on the carry path, see
+                    # HyperConnection.mix_norm) rather than a half copy of it
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+                else:
+                    y = y.half()
             elif fuse_in:
                 y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x)
             elif self.attn_norm:
@@ -289,8 +296,11 @@ class TransformerBlock(Module):
                 (not self.ablit or os.environ.get("EXL3_NC2_ABLIT_F16", "0") == "1")
             if pfe_half:
                 params["pfe_y_half"] = True
+            # Attention pinned to the split's attention device (Model.load attn_device): its fp16
+            # input and output are what crosses, the residual streams stay here
+            attn_remote = self.attn.device != self.device
             try:
-                y = self.attn.forward(y, params)
+                y = self.attn.forward(self.attn.prepare_for_device(y, params) if attn_remote else y, params)
             finally:
                 if pfe_half:
                     params.pop("pfe_y_half", None)
@@ -298,6 +308,8 @@ class TransformerBlock(Module):
                 # EXL3_PF_SKIP: kv_only -- attention wrote its K/V (and indexer) rows and the
                 # caller discards this block's output, so nothing below has an input to read
                 return None
+            if attn_remote:
+                y = to_device(y, self.device)
             if params.get("prefill") and not export_state:
                 return x
             if self.ablit:

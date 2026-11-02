@@ -1082,7 +1082,7 @@ void exl3_moe_gfx12_k3_prefill
     // counts (decode rows 2-5) the second is far tighter — at rows=2 it is 20
     // slots vs 514 — so take the smaller of the two; large-A prefill keeps the
     // old bound.
-    const int chunk_slots = std::min(
+    const int chunk_slots = (int) std::min<int64_t>(
         CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + experts, assignments);
     const int pcfg = moe_prefill_cfg();
     const int pcols = pcfg == 0 ? 32 : 64;          // COLS = WNT * 16 in exl3_gemv_kernel_body

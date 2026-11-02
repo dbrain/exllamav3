@@ -24,13 +24,14 @@ def _layer():
     m = object.__new__(ple.PLELayer)
     emb = r(B, S, E).half()
     m.ple_embedding = SimpleNamespace(forward = lambda *_a, **_k: emb)
-    proj = lambda w: SimpleNamespace(quant_type = "fp16", inner = SimpleNamespace(weight = w, bias = None))
+    proj = lambda w: SimpleNamespace(quant_type = "fp16", inner = SimpleNamespace(weight = w, bias = None, staged_weight = lambda: w))
     m.key_proj = proj(r(E, H * D, scale = E ** -0.5).half())
     m.value_proj = proj(r(E, D, scale = E ** -0.5).half())
     norm = lambda: SimpleNamespace(weight = r(H * D, scale = 0.3).half(), rms_norm_eps = 1e-6)
     m.norm_key, m.norm_query, m.norm_conv = norm(), norm(), norm()
     m.hc_mult, m.hidden_size = H, D
-    m.gate_scale, m.conv_dilation, m.conv_state_len = D ** -0.5, DIL, WIN
+    m.gate_scale, m.conv_dilation, m.conv_state_len, m.conv_kernel_size = D ** -0.5, DIL, WIN, KS
+    m.kv_proj = None
     m.conv_w = r(H * D, 1, KS, scale = 0.5).half()
     return m, r(B, S, H, D, scale = 2.0).float(), r(B, H * D, WIN).half()
 
