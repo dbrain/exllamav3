@@ -331,6 +331,8 @@ class DiskPageCache:
         # when the page lands (the writer thread queues the hash in _ready_states, the main thread writes),
         # dropped if the checkpoint leaves RAM before that
         self.state_candidates: dict[bytes, dict] = {}
+        # Set by the Generator: queues a page and the ancestors of it that are only in VRAM (see spill)
+        self.queue_chain = None
         self._ready_states = deque()
         self.min_state_distance = int(min_state_distance)
         self._deferred_release: dict[int, tuple] = {}     # id(stash) -> (stash, release fn)
@@ -1027,6 +1029,39 @@ class DiskPageCache:
         with self._lock:
             self.state_candidates[phash] = stashed
         return True
+
+
+    def spill(self, phash: bytes, stashed: dict, others: list) -> bool:
+        """
+        A checkpoint leaving the recurrent cache's RAM. At the end of its chain (no (key, position) in others
+        descends from it) it is written regardless of spacing, its pages queued first through queue_chain if
+        they are not on disk yet: a conversation resumes from there. Inside a chain, release_after_write
+        applies the spacing rule as before. Returns True if a write was queued.
+        """
+        if self.has_state(phash) or self.write_disabled:
+            return False
+        pos = stashed.get("position", 0)
+        if any(self._descends(k, p, phash, pos) for k, p in others):
+            return False
+        if phash not in self.pages and phash not in self.pending_pages and self.queue_chain is not None:
+            self.queue_chain(phash)
+        if phash not in self.pages and phash not in self.pending_pages:
+            return False
+        return self.write_state(phash, stashed, force = True)
+
+
+    def _descends(self, key: bytes, key_pos: int, anc: bytes, anc_pos: int) -> bool:
+        if key == anc or key_pos <= anc_pos:
+            return False
+        h = self.chain_prev(key)
+        steps = 0
+        limit = len(self.pages) + len(self.pending_pages) + (self.pagetable.max_pages if self.pagetable is not None else 0)
+        while h is not None and steps <= limit:
+            if h == anc:
+                return True
+            h = self.chain_prev(h)
+            steps += 1
+        return False
 
 
     def drain_ready_states(self):

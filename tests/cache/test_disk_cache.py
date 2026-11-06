@@ -20,28 +20,14 @@ import pytest
 import torch
 
 from exllamav3.cache.recurrent import host_pool
-from exllamav3.generator.cpu_cache import CPUPageCache
 from exllamav3.generator.disk_cache import DiskPageCache
 from exllamav3.tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
-from testlib.cache import FakeCacheLayer, page, phash, PAGE_SIZE
-
-NUM_PAGES = 8
-
+from testlib.cache import NUM_PAGES, build_disk_tiers as build, page, phash, PAGE_SIZE
 
 @pytest.fixture(autouse = True)
 def inference_mode():
     with torch.inference_mode():
         yield
-
-
-def build(slots, device, root, disk_size = 1 << 30, fingerprint = "test"):
-    tensor = torch.zeros((NUM_PAGES, 64), dtype = torch.float16, device = device)
-    cache_obj = SimpleNamespace(layers = {0: FakeCacheLayer([tensor, None])})
-    tier = CPUPageCache([cache_obj], slots * 4096)
-    # Checkpoint spacing off unless a test sets it: the small positions used here would otherwise be refused
-    disk = DiskPageCache(str(root), [cache_obj], tier, disk_size, fingerprint = fingerprint, min_state_distance = 0)
-    tier.attach_disk(disk)
-    return tier, disk, tensor
 
 
 def fill(tensor, page_index, value):

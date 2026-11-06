@@ -511,6 +511,7 @@ class Generator:
             self.recurrent_cache.pagetable = self.pagetable
             self.recurrent_cache.disk_tier = self.disk_page_cache
             if self.disk_page_cache is not None:
+                self.disk_page_cache.queue_chain = self._queue_chain_to_disk
                 # Which model and cache stash under each side of a PairedState: a tensor-parallel side's
                 # checkpoints are written and read by that model's ranks
                 self.disk_page_cache.recurrent_sides = {
@@ -1182,6 +1183,24 @@ class Generator:
             if consume:
                 pages.popleft()
         return queued, False
+
+
+    @torch.inference_mode()
+    def _queue_chain_to_disk(self, phash: bytes):
+        """
+        Queue the page phash and its ancestors that are only in VRAM, for a chain-end checkpoint leaving the
+        recurrent cache (DiskPageCache.spill). A page an active job references is left to write_behind, which
+        knows which of its pages a speculative rewind may still change
+        """
+        pt = self.pagetable
+        page = pt.get_live_page(phash)
+        if page is None or page.ref_count:
+            return
+        chain = []
+        while page is not None and self._page_needs_flush(page):
+            chain.append(page)
+            page = pt.get_live_page(page.prev_hash) if page.prev_hash is not None else None
+        self._queue_pages_to_disk(chain[::-1], None)
 
 
     @torch.inference_mode()

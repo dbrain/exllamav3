@@ -43,6 +43,9 @@ _env_int = lambda name, default: int(os.environ.get(name, default) or default)
 BLOCK_GRAPH_ENABLED = os.environ.get("EXL3_BLOCK_GRAPH", "0") == "1"
 BLOCK_GRAPH_WARMUPS = max(1, _env_int("EXL3_BLOCK_GRAPH_WARMUPS", 3))
 BLOCK_GRAPH_MAX_SLOTS = max(1, _env_int("EXL3_BLOCK_GRAPH_MAX_SLOTS", 4))
+# Multi-row steps (n-gram verify, 2..8 rows) get one key per row count, more than BLOCK_GRAPH_MAX_SLOTS: the
+# slots evict each other and re-capture constantly, so only rows <= this are captured
+BLOCK_GRAPH_MAX_Q = max(1, _env_int("EXL3_BLOCK_GRAPH_MAX_Q", 1))
 
 # Rows above the dense GEMV cap reconstruct+hgemm; still captureable, but the first bounded
 # implementation keeps the served decode envelope. Revisit after (B,Q) family measurements.
@@ -186,6 +189,9 @@ class BlockGraphRunner:
             return None
         if isinstance(attn, MLAttention) and BLOCK_GRAPH_MLA:
             return self._mla_key(x, params)
+        if x.shape[1] > BLOCK_GRAPH_MAX_Q and not isinstance(attn, MLAttention):
+            self.stats["declines"]["rows_q"] += 1
+            return None
         if not isinstance(attn, GatedDeltaNet) or attn.bc is not None:
             self.stats["declines"]["attn_type"] += 1
             return None

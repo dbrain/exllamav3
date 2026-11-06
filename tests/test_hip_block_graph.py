@@ -137,7 +137,7 @@ class TestDeclines:
         assert runner.stats["declines"]["tp"] == 1
 
     @staticmethod
-    def test_io_shape_and_filter_declines():
+    def test_io_shape_and_filter_declines(monkeypatch):
         device = torch.device("cuda", 0)
         runner = _runner(device)
         assert runner.slot_key(torch.zeros(1, 1, 8, device=device), {}) is None
@@ -150,6 +150,7 @@ class TestDeclines:
         runner.block.attn = _fake_attn(num_v_heads=8)
         assert runner.slot_key(_decode_input(device, rows=8), {}) is None
         assert runner.stats["declines"]["chunk_path"] == 1
+        monkeypatch.setattr(block_graph, "BLOCK_GRAPH_MAX_Q", 8)
         assert runner.slot_key(_decode_input(device, rows=7), _eligible_params()) is not None
         runner.block.device = torch.device("cuda", 1)
         assert runner.slot_key(_decode_input(device), {}) is None
@@ -182,6 +183,16 @@ class TestDeclines:
         state.exported = False
         assert runner.slot_key(x, {"recurrent_states": [state]}) is None
         assert runner.stats["declines"]["recurrent_slots"] == 1
+
+
+@pytest.mark.skipif(not (torch.version.hip and torch.cuda.is_available()), reason="requires a ROCm device")
+def test_multirow_step_declines_by_default():
+    # n-gram verify steps carry 2..8 rows, one graph key per row count: they would thrash the per-block slots
+    device = torch.device("cuda", 0)
+    runner = _runner(device)
+    assert block_graph.BLOCK_GRAPH_MAX_Q == 1
+    assert runner.slot_key(_decode_input(device, rows=4), _eligible_params()) is None
+    assert runner.stats["declines"]["rows_q"] == 1
 
 
 @pytest.mark.skipif(not _gfx12_available(), reason="requires a gfx12 device")

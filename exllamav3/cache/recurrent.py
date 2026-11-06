@@ -309,11 +309,13 @@ class RecurrentCache(OrderedDict):
         # Evict before stashing so the pool's peak occupancy is the cache limit, not the limit
         # plus the incoming checkpoint: the evicted buffers are what the new stash reuses
         state_size = state.checkpoint_size if state is not None else stashed["checkpoint_size"]
-        # A checkpoint larger than the whole budget (e.g. -rcs 0) is not stored at all, without evicting or
-        # stashing anything; a later restore misses and falls back to replay
-        if state_size > self.max_size:
+        # Without a disk tier, a checkpoint larger than the whole budget (e.g. -rcs 0) is not stored at all; a
+        # later restore misses and falls back to replay. With one, the budget may be below one checkpoint
+        # (disk-first): RAM keeps the entry being stored and evictions go to disk
+        if state_size > self.max_size and self.disk_tier is None:
             return
-        while self.update_total_size() + state_size > self.max_size:
+        incoming = (key, state.position if state is not None else stashed.get("position", 0))
+        while len(self) and self.update_total_size() + state_size > self.max_size:
             assert self.current_size >= 0, "Not enough space in cache for single state"
             pt = self.pagetable
 
@@ -338,6 +340,9 @@ class RecurrentCache(OrderedDict):
                         self.metrics["stash_evictions_live_kv"] += 1
 
             self.metrics["stash_evictions"] += 1
+            if self.disk_tier is not None:
+                others = [(k, v.get("position", 0)) for k, v in OrderedDict.items(self)] + [incoming]
+                self.disk_tier.spill(popped_key, popped, others)
             self._release(popped)
 
         if state is not None:
