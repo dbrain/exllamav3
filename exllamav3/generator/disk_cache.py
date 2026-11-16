@@ -716,6 +716,7 @@ class DiskPageCache:
             self.max_size = max(0, self.root_size - others)
             self._sibling_oldest = oldest
             self._sibling_bytes = others
+        return freed
 
 
     def _refresh_share(self):
@@ -1632,11 +1633,20 @@ class DiskPageCache:
                             pass
                         conn.execute(f"DELETE FROM {'pages' if k == 'page' else 'states'} WHERE phash = ?", (phash,))
                     elif kind == "reclaim":
+                        freed = 0
+                        with self._lock:
+                            sized = self.total_size
                         try:
-                            self._reclaim_siblings(*op[1:])
+                            freed = self._reclaim_siblings(*op[1:])
                         finally:
                             with self._lock:
                                 self._reclaim_pending = False
+                                # Writes admitted while the pass ran were sized against the pending reclaim
+                                # but not by it: take the rest before anything queued behind it (a flush)
+                                if freed and self.total_size > max(sized, self.max_size) and self._sibling_bytes:
+                                    self._reclaim_pending = True
+                                    with self._cv:
+                                        self._queue.appendleft(("reclaim", 0, op[2]))
                     elif kind == "refresh":
                         try:
                             self._refresh_share()
