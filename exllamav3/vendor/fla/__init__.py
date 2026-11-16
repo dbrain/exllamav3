@@ -112,7 +112,7 @@ def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, 
             try:
                 return chunk_gdn_hf(q, v, qn, kn, g, beta, scale, initial_state, output_final_state, ckpt=ckpt)
             except Exception as e:
-                print(f" -- EXL3_GDN_HF failed, Triton/HIP chain for the rest of the process: {e!r}", flush=True)
+                print(f" -- EXL3_GDN_HF failed, Triton/HIP chain for the rest of the process: {e}", flush=True)
         g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2)
         if os.environ.get("EXL3_GDN_FUSE", "0") == "1":
             from .gdn_fused import chunk_gdn_fused
