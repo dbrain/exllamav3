@@ -2561,6 +2561,20 @@ class Generator:
                     staged, rng_state = st
                 else:
                     spec = self._spec_verify(job, job_logits, draft_tokens, j, W)
+                typ = None
+                typ_relax = draft_tokens is not None and spec_sample.relax_allowed(self, draft_tokens, j) \
+                    and not (spec_sample.phase_answer_only() and spec_sample.in_think(self, job))
+                if draft_tokens is not None and spec is None and (spec_sample.typical_on() or spec_sample.PTAP) \
+                        and W > 1 and not self.dflash_draft:
+                    _tp = spec_sample.eligible(job)
+                    if _tp is not None:
+                        _dr = [int(draft_tokens[j, pi]) for pi in range(W - 1)]
+                        typ = (spec_sample.typical_rows(job_logits[0, :W - 1, :], _dr, _tp, spec_sample.TYP_EPS,
+                                                        spec_sample.TYP_DELTA), _dr)
+                        if spec_sample.PTAP:
+                            import json as _json
+                            with open(spec_sample.PTAP, "a") as _f:
+                                _f.write(_json.dumps({"src": "mtp", "p_draft": typ[0][0], "entropy": typ[0][1]}) + "\n")
                 for i in range(W):
                     positions_used = i + 1
                     token_logits = job_logits[:, i:i + 1, :]
@@ -2572,6 +2586,11 @@ class Generator:
                         next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                             token_logits,
                         )
+                    # EXL3_SPEC_TYPICAL: keep a draft the sampling law gives enough mass, in place of this draw
+                    if typ is not None and typ_relax and spec_sample.typical_on() and i < W - 1 and typ[0][2][i] and \
+                            int(next_token.view(-1)[0]) != typ[1][i] and not spec_sample.cd_armed(job) and \
+                            not spec_sample.rep_refused(job, typ[1][i]):
+                        next_token = torch.full_like(next_token, typ[1][i])
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
