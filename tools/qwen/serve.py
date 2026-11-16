@@ -592,9 +592,6 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # qsa_split_plan; EXL3_QSA_ROWINV=0 goes back), so verify keeps ONE launch and speculative == plain bitwise above the
              # QSA sparse threshold (2051 tokens). The per-row fallback is EXL3_VERIFY_QSA_PROJ=1 EXL3_VERIFY_QSA_ATTN=all.
              ("EXL3_VERIFY_QSA_PROJ", "0"), ("EXL3_VERIFY_QSA_ATTN", "0"), ("EXL3_QSA_ROWINV", "1"),
-             # checkpoint the decode state at the end of every answer, so the next chat turn only prefills
-             # the new message (without it an answer shorter than the 2048-token grid is prefilled again). 0 = off.
-             ("EXL3_ROLL_CKPT", "1"),
              # recurrent-state stashes (mid-prompt checkpoint, prompt-end tail) copy device -> pinned host without a host sync (a worker
              # thread settles them before any reader): the 72 per-layer .cpu() syncs of an 8K prompt drained the queue twice (idle 55-64 ms
              # of a 5.2 s prefill); bitwise (first-token + tail-resume logits equal, base vs on). 0 = the synchronous stash.

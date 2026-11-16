@@ -470,40 +470,34 @@ class Model_LSMixin(ABC):
             yield
 
 
-    def prefill_ls(
-        self,
-        x: torch.Tensor,
-        params: dict,
-    ):
-        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
-            h.begin_pass()
-        for module, instance, idx in self.fwd_modules:
-            params["layer_instance"] = instance
-            pf = (idx, instance) == self.last_kv_module_idx_instance
-            params["prefill"] = pf
-            x = module.prepare_for_device(x, params)
-            x = module.forward(x, params)
-            if x is None:
-                # EXL3_PF_SKIP: kv_only -- the last cache-writing module stopped after its K/V
-                # write, so there is no state left to carry into the tail modules
-                break
-            if pf:
-                break
-        del params["prefill"]
-        return None
+    @property
+    def last_kv_end(self) -> int:
+        """End of the modules a prefill runs, in fwd_modules"""
+        for i, (_, instance, idx) in enumerate(self.fwd_modules):
+            if (idx, instance) == self.last_kv_module_idx_instance:
+                return i + 1
+        return len(self.fwd_modules)
 
 
-    def forward_ls(
-        self,
-        x: torch.Tensor,
-        params: dict,
-    ):
-        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
-            h.begin_pass()
+    def run_section(self, x: torch.Tensor, params: dict, a: int, b: int, prefill: bool) -> torch.Tensor:
+        """Run fwd_modules[a:b] of a prefill, or of a forward"""
+        mods = self.fwd_modules
+        if prefill:
+            for module, instance, idx in mods[a : b]:
+                params["layer_instance"] = instance
+                params["prefill"] = (idx, instance) == self.last_kv_module_idx_instance
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+                if x is None:
+                    # EXL3_PF_SKIP: kv_only -- the last cache-writing module stopped after its K/V
+                    # write, so there is no state left to carry into the tail modules
+                    break
+            return x
+
         span = _FWD_SPAN and x.dim() >= 3 and x.shape[1] <= 8   # (batch, rows, ..): decode/verify only, not prefill chunks
         from ..modules.transformer import TransformerBlock
-        mods = self.fwd_modules
-        for i, (module, instance, idx) in enumerate(mods):
+        for i in range(a, b):
+            module, instance, idx = mods[i]
             params["layer_instance"] = instance
             if module.caps.get("logits_output"):
                 # EXL3_PF_SKIP: skip_logits -- the caller discards the logits (the MTP prompt
@@ -522,6 +516,29 @@ class Model_LSMixin(ABC):
                 type(module) is TransformerBlock and type(nxt) is TransformerBlock and nxt.device == module.device
             )
             x = module.forward(x, params)
+        return x
+
+
+    def prefill_ls(
+        self,
+        x: torch.Tensor,
+        params: dict,
+    ):
+        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
+            h.begin_pass()
+        self.run_section(x, params, 0, self.last_kv_end, True)
+        del params["prefill"]
+        return None
+
+
+    def forward_ls(
+        self,
+        x: torch.Tensor,
+        params: dict,
+    ):
+        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
+            h.begin_pass()
+        x = self.run_section(x, params, 0, len(self.fwd_modules), False)
         params.pop("resid_defer", None)
         pending = params.pop("resid_pending", None)
         if pending is not None:

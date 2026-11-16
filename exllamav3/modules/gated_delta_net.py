@@ -247,17 +247,29 @@ class GDNState:
         return 0
 
 
+    def stash_header(self):
+        # A speculative pass whose outcome was never settled has its committed state in the
+        # base row still, but its position already includes the provisional tokens
+        assert self.last_history == 0, "GDN stash: state has an unsettled speculative pass (rewind() first)"
+        return {
+            "position": self.position,
+            "checkpoint_size": self.checkpoint_size
+        }
+
+
+    def stash_layers(self, layers: dict, device: bool = False):
+        return {
+            k: l.stash(self.slot, self.position, self.parity, device) if isinstance(l, GDNLayerState)
+            else l.stash(self.slot, self.position)
+            for k, l in layers.items()
+        }
+
+
     def stash(self, async_: bool = False, pin_pool: dict = None, device: bool = False):
         """async_ (EXL3_NC2_ASYNC_STASH, via RecurrentCache.stash_async only): non-blocking D2H into pinned host tensors on the
         current stream plus one event in stashed["_ev"]; the cache syncs it and moves the copies to pageable memory
         (RecurrentCache._finish, worker thread) before any reader sees the entry."""
-        # A speculative pass whose outcome was never settled has its committed state in the
-        # base row still, but its position already includes the provisional tokens
-        assert self.last_history == 0, "GDN stash: state has an unsettled speculative pass (rewind() first)"
-        stashed = {
-            "position": self.position,
-            "checkpoint_size": self.checkpoint_size
-        }
+        stashed = self.stash_header()
         if not self.cache.model.loaded_tp:
             layers = self.cache.get_all_recurrent_layers()
             if async_ and all(isinstance(l, GDNLayerState) for l in layers.values()):
@@ -267,9 +279,7 @@ class GDNState:
                 ev.record()
                 stashed["_ev"] = ev
                 return stashed
-            for k, l in layers.items():
-                stashed[k] = l.stash(self.slot, self.position, self.parity, device) if isinstance(l, GDNLayerState) \
-                    else l.stash(self.slot, self.position)
+            stashed.update(self.stash_layers(layers, device))
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash_gdn,

@@ -92,3 +92,30 @@ def test_chain_end_whose_page_is_not_on_disk_is_queued_first(tiers):
     settle(disk)
     assert queued == [phash(6)]
     assert disk.has_state(phash(6))
+
+
+def test_rolling_checkpoint_is_adopted_below_one_entry(tiers):
+    tier, disk, rc = tiers
+    chain(tier, [1])
+    chain(tier, [10])
+    rc.adopt(phash(1), state(100))
+    assert phash(1) in rc
+    rc.put(phash(10), None, stashed = state(100))
+    settle(disk)
+    assert disk.has_state(phash(1))
+
+
+@pytest.mark.parametrize("disk_tier, max_size, rolls", [
+    (None, 0, False),
+    (None, 64, True),
+    ("disk", 0, True),
+])
+def test_rolling_checkpoint_runs_when_a_disk_tier_takes_what_ram_cannot(disk_tier, max_size, rolls):
+    from exllamav3.generator.job import Job
+    rc = RecurrentCache(SimpleNamespace(loaded_tp = False), max_size = max_size)
+    rc.disk_tier = disk_tier
+    job = SimpleNamespace(
+        recurrent_state = SimpleNamespace(stash_by_rollback = False, checkpoint_size = 64),
+        generator = SimpleNamespace(rolling_checkpoint = True, recurrent_cache = rc),
+    )
+    assert Job.rolls_checkpoint(job) == rolls

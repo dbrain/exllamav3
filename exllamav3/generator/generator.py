@@ -8,6 +8,7 @@ try:
 except Exception:                                                    # noqa: BLE001
     _moe_fused_check = None
 from ..model.model import Model
+from ..model.prefill_pipeline import PrefillPipeline
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
 from ..modules.gated_delta_net import GDNState
@@ -54,7 +55,6 @@ import threading
 from collections import deque
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
-from ..ext import exllamav3_ext as ext
 
 # EXL3_MTP_FUSE_CATCHUP: 0 = catch-up draft prefill after each accepted round (old path),
 # 1 = fold the catch-up rows into the next draft forward, 2 = same with the R-row union MoE path.
@@ -130,6 +130,8 @@ class Generator:
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
+        rolling_checkpoint: bool = True,
+        pipelined_prefill: bool = True,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
@@ -297,6 +299,17 @@ class Generator:
             Minimum number of tokens between recurrent checkpoints during prompt ingestion. Must be a
             multiple of the page size. Checkpoints land on the first chunk boundary at least this far past the
             previous one, so the interval need not be a multiple of the chunk size. Default is 32768 tokens
+
+        :param rolling_checkpoint:
+            Leave a checkpoint at the last page boundary of every job's output, so that a follow-up prompt
+            extending it replays less than a page instead of up to a checkpoint interval. States that can't
+            roll back in place keep one copy per active job, updated at every page and outside
+            recurrent_cache_size until the job ends. Ignored if model doesn't use recurrent states
+
+        :param pipelined_prefill:
+            With the model split across devices, let them work on different prefill chunks at once, each device
+            on its own thread (see PrefillPipeline). Ignored where a split can't: tensor parallel, CPU expert
+            offload, attention pinned to one device, a draft model on several devices or reading the target's cache
 
         :param kwargs:
         """
@@ -538,6 +551,22 @@ class Generator:
             "checkpoint interval must be a multiple of the page size (256)"
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval_pp = recurrent_checkpoint_interval_pp
+        self.rolling_checkpoint = rolling_checkpoint and self.recurrent_cache is not None
+
+        # One pipeline per model: a retired generator may not have been closed
+        previous = getattr(self.model, "pipeline", None)
+        if previous is not None:
+            previous.close()
+        self.pipeline = None
+        plan = PrefillPipeline.plan(self.model, cache, draft_model) if pipelined_prefill else None
+        if plan is not None:
+            on_idle = self.recurrent_cache.write_settled if self.recurrent_cache is not None else None
+            self.pipeline = PrefillPipeline(self.model, *plan, on_idle = on_idle)
+        self.model.pipeline = self.pipeline
+        if draft_model is not None:
+            draft_model.pipeline = self.pipeline
+        if self.recurrent_cache is not None:
+            self.recurrent_cache.pipeline = self.pipeline
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
@@ -803,6 +832,7 @@ class Generator:
         elif job in self.pending_jobs:
             self.pending_jobs.remove(job)
         elif job in self.active_jobs:
+            job.commit_recurrent_checkpoint()
             job.deallocate_pages()
             self.active_jobs.remove(job)
         if num_jobs and not self.num_remaining_jobs():
@@ -973,6 +1003,12 @@ class Generator:
         _ttrace_end("recurrent_checkpoint", _t0)
         _t0 = _ttrace_begin()
 
+        # Generation runs in the foreground, on devices and draft state the prefill pipeline has finished with
+        if self.pipeline is not None:
+            if self.pipeline.busy and any(job.is_prefill_done() for job in self.active_jobs):
+                self.pipeline.flush()
+            self.reap_pipeline_failures(results)
+
         # Generation with draft model, with the draft window trimmed to the row ceiling (draft_max_rows)
         draft_window = self.row_limited(self.num_draft_tokens) if self.draft_model else 0
         round_start = None
@@ -1049,6 +1085,13 @@ class Generator:
         RAM, in the tensor-parallel ranks too), the CPU page cache tier (cpu_cache_size of pinned memory),
         the pinned staging and draft buffers, and the filter thread pool.
         """
+        if self.pipeline is not None:
+            self.pipeline.close()
+            self.model.pipeline = None
+            if self.draft_model is not None:
+                self.draft_model.pipeline = None
+            self.recurrent_cache and setattr(self.recurrent_cache, "pipeline", None)
+            self.pipeline = None
         self.flush_deferred()
         if self.disk_page_cache is not None:
             # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away.
@@ -1225,6 +1268,9 @@ class Generator:
         budget = self.cpu_page_cache.max_slots // 4 - len(disk.pending_pages)
         if budget <= 0:
             return
+        # A sequence's position runs ahead of the devices while prefill chunks are in flight
+        if self.pipeline is not None:
+            self.pipeline.flush()
         pages = []
         for job in self.active_jobs:
             for seq in job.sequences:
@@ -1267,13 +1313,16 @@ class Generator:
             # jobs since the last one have left in VRAM
             self._flush_pass = None
             self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
+        if self.pipeline is not None:
+            self.pipeline.flush()
         if self.recurrent_cache is not None:
-            self.recurrent_cache.prune_stranded()
             # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
-            # is actually returned (the next stash reallocates once)
-            host_pool.release()
-            if self.model.loaded_tp:
-                self.model.tp_dispatch_all(mp_host_pool_release, ())
+            # is actually returned (the next stash reallocates once). Without pruning the pool holds
+            # about one checkpoint per job that just ended, which the next turn's stashes reuse
+            if self.recurrent_cache.prune_stranded():
+                host_pool.release()
+                if self.model.loaded_tp:
+                    self.model.tp_dispatch_all(mp_host_pool_release, ())
         self.pagetable.defrag()
         # Dynamic expert placement: apply any pending swap sweep now, between generations —
         # a placement change perturbs the logits slightly (same expert, different device
@@ -1371,6 +1420,7 @@ class Generator:
                 continue
             try:
                 job.maybe_stash_recurrent(self.recurrent_cache)
+                job.update_rolling_checkpoint()
             except Exception as e:
                 # Latch per job: this is called every iteration, so an unlatched warning would spam the
                 # log at decode rate for the life of the generation.
@@ -2590,7 +2640,7 @@ class Generator:
                     # sampled target token matches the draft token. A recurrent checkpoint boundary also stops
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
-                        cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+                        cp_boundary = batch_states is not None and job.is_stash_boundary()
                         if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
@@ -2786,6 +2836,12 @@ class Generator:
                     print(f" ## Warning: recurrent stash before requeue failed for job "
                           f"{getattr(job, 'serial_number', '?')} ({repr(e)}); the requeued "
                           f"job will re-prefill from an earlier checkpoint")
+            try:
+                job.commit_recurrent_checkpoint()
+            except Exception as e:
+                job.drop_rolling_checkpoint()
+                print(f" ## Warning: end-of-job recurrent checkpoint failed for job "
+                      f"{getattr(job, 'serial_number', '?')} ({repr(e)}); a follow-up replays from an earlier one")
             if _REPLY_FIRST and job not in requeuing_jobs:
                 self.deferred_jobs.append(job)   # released by flush_deferred() after the results are out
             else:
@@ -3222,6 +3278,12 @@ class Generator:
         if anchor is not None:
             anchor.score_keep_pages = False
             self.score_release_pages(anchor)
+    def reap_pipeline_failures(self, results: list):
+        """Fail the jobs whose work in the prefill pipeline raised, which only comes out once it has moved on"""
+        for job, error in self.pipeline.take_failures():
+            if job is not None:
+                self.reap_failed_job(job, error, results)
+            self.pipeline.forget_owner(job)
 
 
     def reap_failed_job(self, job, error, results: list):

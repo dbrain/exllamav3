@@ -39,6 +39,7 @@ def make_generator(jobs, shared_chunk_size = 2048, prefill_cooldown = 0):
     g.pending_jobs = []
     g.active_jobs = list(jobs)
     g.recurrent_cache = None
+    g.pipeline = None
     g.draft_model = None
     g.dflash_draft = False
     g.mtp_draft = False
@@ -161,7 +162,6 @@ def make_job(kv_position, prompt_len, last_checkpoint = None, cached_pages = 0, 
         ),
         last_recurrent_checkpoint_pos = last_checkpoint,
         cached_pages = cached_pages,
-        roll_ckpt = False,
         ckpt_interval_pp = 0,
     )
 
