@@ -1,5 +1,6 @@
-"""Loader for the QSA sparse prefill kernels: qsa_prefill.hip (one wave per (row, kv head)) and qsa_prefill_ds.hip (NW waves
-per (row, kv head), each owning HD / NW output dims). Same call shape as qsa_prefill.qsa_prefill_attend (fp16, shared or per-row block table)."""
+"""Loader for the QSA sparse prefill kernels: qsa_prefill.hip (one wave per (row, kv head)), qsa_prefill_ds.hip (NW waves per
+(row, kv head), each owning HD / NW output dims) and qsa_prefill_wmma.hip (4 rows per block over the union of their selections, WMMA).
+Same call shape as qsa_prefill.qsa_prefill_attend (fp16, shared or per-row block table)."""
 import ctypes, hashlib, os, re, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
@@ -7,6 +8,7 @@ from exllamav3.util.hip_lib import load_hip_runtime
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_DIR, "qsa_prefill.hip")
 _SRC_DS = os.path.join(_DIR, "qsa_prefill_ds.hip")
+_SRC_WMMA = os.path.join(_DIR, "qsa_prefill_wmma.hip")
 _state = {}
 # Default: qsa_prefill_ds.hip with 4 waves per (row, kv head), 6.5x the proven kernel on gfx1150 (the single-wave kernel spills
 # 120-360 VGPRs there); same max / mean error against an fp32 reference, not bit-identical (split score chain).
@@ -15,10 +17,24 @@ _state = {}
 # Reviewed rather than replayed (check_expanded.py is not in this tree): QG=0 reads q through the same IX_Q / Q_OK macros as QG=1
 # into an in-bounds sQ tile, VB only changes the STAGE batch size, and qsa_prefill_ds.hip uses the same IX_* clamps and *_OK guards.
 _REVIEWED = {(_SRC, "QG=0 VB=2"), (_SRC_DS, "NW=4")}
+# 4-row union WMMA kernel (Kyojin #224): its bounds are checked by tests/check_qsa_wmma_bounds.py, which replays the source's own
+# macros; NVGPR / WPE only change register allocation. gfx1150 needs NVGPR=256 WPE=4: Kyojin's gfx1151 default (192 / 8) spills
+# 42 VGPRs there and is 1.3x slower.
+_WMMA_DEFS = {"gfx1150": "NVGPR=256 WPE=4", "gfx1151": ""}
 
 def pf_variant():
     d = os.environ.get("EXL3_QSA_PF_DEFS")
     return (_SRC_DS, "NW=4") if d is None else (_SRC, d)
+
+def _arch():
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+def wmma_enabled() -> bool:
+    # read on every call: EXL3_HIP_ATTN_WMMA=0 / 1 forces it without a reload, unset = on where _WMMA_DEFS has a tuned build
+    v = os.environ.get("EXL3_HIP_ATTN_WMMA", "")
+    if v in ("0", "1"): return v == "1"
+    if "wmma_default" not in _state: _state["wmma_default"] = bool(torch.version.hip) and _arch() in _WMMA_DEFS
+    return _state["wmma_default"]
 
 def _threads(src_path, defs):
     if src_path != _SRC_DS: return 32
@@ -33,7 +49,7 @@ def proof_tag(src_path, defs):
 
 def require_proof(src_path, defs):
     """no GPU build of a kernel variant without a passing CPU proof of exactly this source + defs (check_expanded.py --mark writes the marker)"""
-    if (src_path, defs) in _REVIEWED: return
+    if (src_path, defs) in _REVIEWED or src_path == _SRC_WMMA: return
     d = os.environ.get("QSA_PROOF_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "qsa_proof"))
     if not os.path.isfile(os.path.join(d, proof_tag(src_path, defs) + ".ok")):
         raise RuntimeError(f"qsa_prefill_hip: no CPU bounds proof for {src_path} defs={defs!r} (tag {proof_tag(src_path, defs)}); run check_expanded.py --mark first")
@@ -68,13 +84,13 @@ def _load(src_path = None, defs = None):
     if src_path is None: src_path, defs = pf_variant()
     key = (src_path, defs)
     if key in _state: return _state[key]
-    cache = compile_hsaco(defs, torch.cuda.get_device_properties(0).gcnArchName.split(":")[0], src_path)
+    cache = compile_hsaco(defs, _arch(), src_path)
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
     if lib.hipModuleLoad(ctypes.byref(mod), cache.encode()) != 0: raise RuntimeError("qsa_prefill_hip: hipModuleLoad failed")
     fn = ctypes.c_void_p()
-    if lib.hipModuleGetFunction(ctypes.byref(fn), mod, b"qsa_pf") != 0: raise RuntimeError("qsa_prefill_hip: no function")
+    if lib.hipModuleGetFunction(ctypes.byref(fn), mod, b"qsa_pf_wmma" if src_path == _SRC_WMMA else b"qsa_pf") != 0: raise RuntimeError("qsa_prefill_hip: no function")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
     _state["lib"] = lib; _state[key] = fn; _state["mod", key] = mod
     return fn
@@ -100,4 +116,26 @@ def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = No
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
     r = _state["lib"].hipModuleLaunchKernel(fn, R * 2, 1, 1, _threads(src_path, defs), 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
     if r != 0: raise RuntimeError(f"qsa_prefill_hip: launch failed ({r})")
+    return out
+
+def qsa_prefill_wmma(q, k, v, indices, sm_scale, block_table, page_size, out = None, defs = None):
+    """Same contract as qsa_prefill_hip with a 1-D block table; fp16-rounding-level differences (softmax / accumulation order)."""
+    R, H, hd = q.shape
+    assert (H, hd, k.shape[1], page_size, indices.shape[1]) == (24, 256, 2, 256, 2080), "qsa_prefill_wmma: Qwen shape only"
+    assert q.dtype == k.dtype == v.dtype == torch.half and q.stride(2) == 1 and q.stride(1) == hd
+    assert k.stride(1) == hd and k.stride(2) == 1 and k.stride() == v.stride() and indices.is_contiguous() and indices.dtype == torch.int32
+    assert indices.shape[0] == R and R >= 1
+    assert q.stride(0) % 8 == 0 and q.data_ptr() % 16 == 0 and k.data_ptr() % 16 == 0 and v.data_ptr() % 16 == 0 and k.stride(0) % 8 == 0
+    assert indices.data_ptr() % 16 == 0 and block_table.dim() == 1 and block_table.is_contiguous() and block_table.dtype == torch.int32
+    if out is None: out = torch.empty((R, H, hd), dtype = torch.half, device = q.device)
+    assert out.stride(2) == 1 and out.stride(1) == hd and out.stride(0) % 8 == 0 and out.data_ptr() % 16 == 0
+    ntok = k.shape[0]
+    assert v.shape[0] == ntok
+    if defs is None: defs = _WMMA_DEFS.get(_arch(), "")
+    fn = _load(_SRC_WMMA, defs)
+    cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, k, v, block_table, indices, out)] + \
+            [ctypes.c_int(x) for x in (q.stride(0), out.stride(0), k.stride(0), ntok, block_table.shape[-1], R)] + [ctypes.c_float(sm_scale)]
+    params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
+    r = _state["lib"].hipModuleLaunchKernel(fn, ((R + 3) // 4) * 2, 1, 1, 256, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    if r != 0: raise RuntimeError(f"qsa_prefill_wmma: launch failed ({r})")
     return out

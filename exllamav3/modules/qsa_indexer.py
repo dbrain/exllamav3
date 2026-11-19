@@ -933,9 +933,11 @@ class QSAIndexer(Module):
         if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and qc is None and bsz == 1 and seq >= 64 and seq <= 4096 * 4
                 and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
                 and q_rows.dtype == torch.half and k_arg.dtype == torch.half and _pf_hip_ready()):
-            # one wave per (row, kv head) HIP kernel, bit-identical to the Triton pair (fp16 cache, prefill chunks only)
-            from .attention_fn.qsa_prefill_hip import qsa_prefill_hip
-            o = qsa_prefill_hip(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
+            # fp16 cache, prefill chunks only: the 4-row union WMMA kernel where tuned (live switch EXL3_HIP_ATTN_WMMA), else the
+            # per-(row, kv head) kernel
+            from .attention_fn.qsa_prefill_hip import qsa_prefill_hip, qsa_prefill_wmma, wmma_enabled
+            pf = qsa_prefill_wmma if wmma_enabled() else qsa_prefill_hip
+            o = pf(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
             return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
         if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and os.environ.get("EXL3_QSA_PF_DEQ", "1") == "1" and qc is not None
                 and qc[2] == 8 and qc[3] == 8 and bsz == 1 and seq >= 64 and seq <= 4096 * 4
